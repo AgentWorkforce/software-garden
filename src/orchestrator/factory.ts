@@ -195,6 +195,7 @@ import {
   canonicalTrajectorySessionRef,
   renderTrajectoryPointer,
   stripTrajectoryPointers,
+  type TrajectorySessionSource,
   type TrajectoryWorkUnitSurface,
 } from '../trajectory'
 import {
@@ -12556,7 +12557,12 @@ export class FactoryLoop implements Factory {
         repo,
         branch,
         title: `${issue.key}: ${issue.title}`,
-        body: githubPullRequestBody(issue, implementer.spec.preview, canonicalTrajectorySessionRef(implementer.sessionRef)),
+        body: githubPullRequestBody(
+          issue,
+          implementer.spec.preview,
+          canonicalTrajectorySessionRef(implementer.sessionRef),
+          trajectorySessionSourceForCapability(implementer.spec.capability),
+        ),
       })
       if (result.status === 'pushed') {
         this.#increment('sandboxPushesPublished')
@@ -12600,6 +12606,7 @@ export class FactoryLoop implements Factory {
   ): Promise<GithubPublishPullRequestResult | undefined> {
     const key = `${issueKey(record.issue)}:${implementer.spec.repo}`
     const trajectorySessionRef = canonicalTrajectorySessionRef(implementer.sessionRef)
+    const trajectorySessionSource = trajectorySessionSourceForCapability(implementer.spec.capability)
     const expectedHeadRef = implementer.spec.branch
     if (!expectedHeadRef) {
       throw new Error(`Refusing to publish ${record.issue.key}: implementer has no Factory-derived branch`)
@@ -12690,7 +12697,7 @@ export class FactoryLoop implements Factory {
       expectedHeadRef,
       baseRef,
       title: `${issue.key}: ${issue.title}`,
-      body: githubPullRequestBody(issue, implementer.spec.preview, trajectorySessionRef),
+      body: githubPullRequestBody(issue, implementer.spec.preview, trajectorySessionRef, trajectorySessionSource),
       ...(implementer.sessionRef ? { sessionRef: implementer.sessionRef } : {}),
     })
     const published = result.author
@@ -24637,6 +24644,7 @@ const githubPullRequestBody = (
   issue: LinearIssue,
   preview: PreviewReference | undefined,
   sessionRef: string | undefined,
+  sessionSource: TrajectorySessionSource | undefined,
 ): string => [
   stripTrajectoryPointers(issue.description),
   '',
@@ -24652,8 +24660,26 @@ const githubPullRequestBody = (
   renderTrajectoryPointer({
     ...trajectoryWorkUnitForIssue(issue),
     sessionRef,
+    ...(sessionSource ? { sessionSource } : {}),
   }),
 ].join('\n').trim()
+
+// The session ref alone cannot key a `session_links` row: that key is
+// `(org_id, source, session_id, …)`. The implementer's spawn capability is the
+// only place Factory knows which agent produced the session, so it is what the
+// pointer names. `workflow:run` runs no agent session and contributes no source.
+const trajectorySessionSourceForCapability = (
+  capability: Capability | undefined,
+): TrajectorySessionSource | undefined => {
+  switch (capability) {
+    case 'spawn:claude':
+      return 'claude'
+    case 'spawn:codex':
+      return 'codex'
+    default:
+      return undefined
+  }
+}
 
 const trajectoryWorkUnitForIssue = (
   issue: LinearIssue,

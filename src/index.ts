@@ -46,14 +46,18 @@ export type {
 } from './dispatch/templates'
 export {
   canonicalTrajectorySessionRef,
+  canonicalTrajectorySessionSource,
   MISSING_TRAJECTORY_SESSION_REF,
   renderTrajectoryPointer,
   stripTrajectoryPointers,
+  TRAJECTORY_SESSION_SOURCES,
   trajectoryPointerFromBody,
   trajectorySessionRefFromBody,
 } from './trajectory'
 export type {
+  ResolvedTrajectoryPointer,
   TrajectoryPointer,
+  TrajectorySessionSource,
   TrajectoryWorkUnitSurface,
 } from './trajectory'
 export * from './featuremap/index'
