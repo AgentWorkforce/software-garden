@@ -13,7 +13,7 @@ import { defineReviewAgent, gitHistory, prDiff } from '@agentworkforce/review-ki
  * catalog and lets a charter change take effect without duplicating it here.
  */
 export default defineReviewAgent({
-  repo: 'AgentWorkforce/factory',
+  repo: 'AgentWorkforce/software-garden',
   charter: '.agentworkforce/workforce/personas/maintainability.md',
   lens: 'maintainability',
 
