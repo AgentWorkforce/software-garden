@@ -108,7 +108,15 @@ export function trajectoryPointerFromBody(body: string): ResolvedTrajectoryPoint
     const workUnitId = match[1]
     const workUnitSurface = match[2] as TrajectoryWorkUnitSurface | undefined
     if (!sessionRef || !workUnitId || !workUnitSurface) continue
-    const sessionSource = canonicalTrajectorySessionSource(match[4])
+    const rawSessionSource = match[4]
+    const sessionSource = canonicalTrajectorySessionSource(rawSessionSource)
+    // A pointer that asserts a source we cannot validate is skipped, not
+    // silently downgraded to a source-less legacy pointer. Downgrading would
+    // hand the consuming lens a row keyed on a guess — the exact failure this
+    // key exists to prevent — and it would be indistinguishable from a genuine
+    // three-key pointer. An unparseable source skips the match, exactly as an
+    // unparseable session ref already does.
+    if (rawSessionSource !== undefined && !sessionSource) continue
     const pointer = { workUnitId, workUnitSurface, sessionRef, ...(sessionSource ? { sessionSource } : {}) }
     // The source is part of the identity: two pointers that agree on the
     // session but disagree on its source are still two answers, and the

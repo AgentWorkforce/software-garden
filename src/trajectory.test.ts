@@ -216,6 +216,26 @@ describe('trajectory pointer session source', () => {
     })
   })
 
+  // Review finding (cubic P2): a body carrying `session_source=agent-relay`
+  // used to parse as a source-LESS legacy pointer, which is indistinguishable
+  // from a genuine three-key pointer and hands the lens a row keyed on a guess.
+  it.each(['agent-relay', 'trajectories', 'chatgpt'])(
+    'rejects a pointer asserting the unsupported source %j rather than downgrading it to legacy',
+    (badSource) => {
+      const body = '<!-- trajectory: work_unit_id=AgentWorkforce/factory#420 work_unit_surface=github ' +
+        `session_ref=${sessionRef} session_source=${badSource} -->`
+
+      expect(trajectoryPointerFromBody(body)).toBeUndefined()
+    },
+  )
+
+  it('still strips a pointer it refuses to parse, so it cannot be inherited', () => {
+    const bad = '<!-- trajectory: work_unit_id=AgentWorkforce/factory#420 work_unit_surface=github ' +
+      `session_ref=${sessionRef} session_source=agent-relay -->`
+
+    expect(stripTrajectoryPointers(`body\n\n${bad}`)).toBe('body')
+  })
+
   it('refuses a body whose pointers agree on the session but disagree on its source', () => {
     const asClaude = renderTrajectoryPointer({
       workUnitId: 'AR-1',
