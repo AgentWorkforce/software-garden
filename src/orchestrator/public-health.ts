@@ -720,6 +720,11 @@ function publicOccupants(
   })
 }
 
+const candidateCounters = (value: Record<string, unknown>): Record<string, number> =>
+  Object.fromEntries(['candidateSweeps', 'noCandidateSweeps', 'candidatesFound', 'candidatesWithoutSlot']
+    .filter((key) => finiteNumber(value[key]) !== undefined)
+    .map((key) => [key, counter(value[key])]))
+
 /**
  * Batch occupancy, redacted (#303).
  *
@@ -747,6 +752,7 @@ function dispatchCapacityHealth(
       agentlessOccupants,
       occupiedOccupants,
     ),
+    ...candidateCounters({ ...status }),
     batchSize: counter(status.batchSize),
     active: counter(status.active),
     waiting,
@@ -1062,6 +1068,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
               capacityAgentlessOccupants,
               capacityOccupiedOccupants,
             ),
+            ...candidateCounters(capacity),
             batchSize: counter(capacity.batchSize),
             active: counter(capacity.active),
             waiting: counter(capacity.waiting),

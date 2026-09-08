@@ -11095,7 +11095,7 @@ describe('FactoryLoop', () => {
     const fleet = persistedPhase === 'retryable' ? new AckGapFleet() : new RemoteLifecycleFleetClient()
     const clock = new ManualClock()
     const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
-    const first = createFactory(config({ issueSource: 'github' }), {
+    const first = createFactory(config({ issueSource: 'github', dispatch: { agentlessHoldTimeoutMs: 30 * 60_000 } }), {
       mount,
       fleet,
       stateStore: persistedPhase === 'dispatching'
@@ -11130,7 +11130,7 @@ describe('FactoryLoop', () => {
       } else {
         mount.files.delete(dispatchPath)
       }
-      restarted = createFactory(config({ issueSource: 'github' }), {
+      restarted = createFactory(config({ issueSource: 'github', dispatch: { agentlessHoldTimeoutMs: 30 * 60_000 } }), {
         mount,
         fleet,
         stateStore: state(),
@@ -16377,7 +16377,7 @@ describe('FactoryLoop', () => {
         batchSize: 1,
         active: 1,
         waiting: 1,
-        agentlessHoldTimeoutMs: 30 * 60_000,
+        agentlessHoldTimeoutMs: 60_000,
       })
       expect(capacity?.longestWaitMs).toBeGreaterThan(0)
       expect(capacity?.occupants).toEqual([
@@ -36390,4 +36390,184 @@ describe('a dispatch-lifecycle save failure on the publish path must re-arm the 
       await rm(root, { recursive: true, force: true })
     }
   }, 20_000)
+})
+
+describe('work-item dispatch capacity (#491)', () => {
+  it('releases a completed item before notification cleanup and starts the next slot clock', async () => {
+    const written = Promise.withResolvers<void>()
+    const finishNotification = Promise.withResolvers<void>()
+    class PausedCompletionStore extends InMemoryStateStore {
+      override async saveDispatchLifecycle(...args: Parameters<InMemoryStateStore['saveDispatchLifecycle']>): Promise<boolean> {
+        const saved = await super.saveDispatchLifecycle(...args)
+        if (saved && args[5].issue.key === 'AR-491' && args[5].phase === 'writeback-applied') {
+          written.resolve()
+          await finishNotification.promise
+        }
+        return saved
+      }
+    }
+    const clock = new ManualClock()
+    const state = new PausedCompletionStore({ batchSize: 1 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const mount = new FakeMountClient({
+      [issuePath(491)]: issueFile(491),
+      [issuePath(492)]: issueFile(492),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, {
+      publishPullRequest: async (input) => ({ repo: input.repo, number: 491,
+        url: 'https://github.com/AgentWorkforce/pear/pull/491', headRef: input.headRef! }),
+      closePullRequest: async () => undefined,
+    })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount, fleet, stateStore: state, clock, triage: new StaticTriage(), probePrResolver: async () => undefined,
+    })
+    try {
+      const first = await factory.triageIssue(parseLinearIssue(issuePath(491), issueFile(491)))
+      const second = await factory.triageIssue(parseLinearIssue(issuePath(492), issueFile(492)))
+      await factory.dispatch(first)
+      expect(factory.status().dispatchCapacity.active).toBe(1)
+      clock.advance(10_000)
+      fleet.emitAgentExit('ar-491-impl-pear', 'exited')
+      await withDeadline(written.promise, 4_000, 'completion never reached confirmed writeback')
+      const finished = await state.getDispatchLifecycle('factory-test', dispatchIssueIdentity(first.issue))
+      expect(finished?.phase).toBe('writeback-applied')
+      expect(finished?.slotHeldSinceAtMs).toBeUndefined()
+      expect(factory.status().dispatchCapacity.active).toBe(0)
+      await factory.dispatch(second)
+      const occupant = factory.status().dispatchCapacity.occupants![0]!
+      expect(occupant.issue).toBe('AR-492')
+      expect(occupant.slotHeldForMs!).toBeLessThanOrEqual(occupant.heldForMs! + 60_000)
+      const next = await state.getDispatchLifecycle('factory-test', dispatchIssueIdentity(second.issue))
+      expect(next?.slotHeldSinceAtMs).toBe(10_000)
+      finishNotification.resolve()
+      await vi.waitFor(async () => expect((await state.getDispatchLifecycle('factory-test', dispatchIssueIdentity(first.issue)))?.phase).toBe('complete'))
+    } finally {
+      finishNotification.resolve()
+      await factory.stop()
+    }
+  })
+
+  it('frees the GitHub slot before awaiting the completion comment', async () => {
+    const commenting = Promise.withResolvers<void>()
+    const finishComment = Promise.withResolvers<void>()
+    class PausedCommentWriteback extends AcknowledgingGithubWriteback {
+      override async postComment(issue: LinearIssue, body: string): Promise<void> {
+        if (body.startsWith('Software Garden agents completed;')) {
+          commenting.resolve()
+          await finishComment.promise
+        }
+        await super.postComment(issue, body)
+      }
+    }
+    const path = githubIssuePath('AgentWorkforce', 'pear', 497)
+    const source = githubIssueFile(497, { state: 'open', labels: ['factory'] })
+    const state = new InMemoryStateStore({ batchSize: 1 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ batchSize: 1, issueSource: 'github' }), {
+      mount: new FakeMountClient({ [path]: source, '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' } }, {
+        publishPullRequest: async (input) => ({ repo: input.repo, number: 497,
+          url: 'https://github.com/AgentWorkforce/pear/pull/497', headRef: input.headRef! }),
+        closePullRequest: async () => undefined,
+      }),
+      fleet, stateStore: state, triage: new StaticTriage(),
+      githubWriteback: new PausedCommentWriteback(), probePrResolver: async () => undefined,
+    })
+    try {
+      const decision = await factory.triageIssue(parseGithubFactoryIssue(path, source))
+      await factory.dispatch(decision)
+      fleet.emitAgentExit('ar-497-impl-pear', 'exited')
+      await withDeadline(commenting.promise, 4_000, 'completion never reached its comment')
+      const lifecycle = await state.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
+      expect(lifecycle?.phase).toBe('writeback-applied')
+      expect(lifecycle?.slotHeldSinceAtMs).toBeUndefined()
+      expect(factory.status().dispatchCapacity.active).toBe(0)
+      finishComment.resolve()
+      await vi.waitFor(async () => expect((await state.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))?.phase).toBe('complete'))
+    } finally {
+      finishComment.resolve()
+      await factory.stop()
+    }
+  })
+
+  it('distinguishes empty discovery from candidates denied a slot before the first retry', async () => {
+    const empty = createFactory(config(), { mount: new FakeMountClient(), fleet: new FakeFleetClient(), triage: new StaticTriage() })
+    try {
+      expect(empty.status().dispatchCapacity.candidateSweeps).toBe(0)
+      await empty.runOnce()
+      expect(empty.status().dispatchCapacity).toMatchObject({
+        candidateSweeps: 1, noCandidateSweeps: 1, candidatesFound: 0, candidatesWithoutSlot: 0,
+      })
+    } finally { await empty.stop() }
+
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [issuePath(493)]: issueFile(493), [issuePath(494)]: issueFile(494) }),
+      fleet, stateStore: new InMemoryStateStore({ batchSize: 1 }), triage: new StaticTriage(),
+    })
+    try {
+      await factory.runOnce()
+      expect(factory.status().dispatchCapacity).toMatchObject({
+        candidateSweeps: 1, noCandidateSweeps: 0, candidatesFound: 2, candidatesWithoutSlot: 1,
+      })
+      expect(factory.status().counters.dispatchCandidatesWithoutSlot).toBe(1)
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-493-impl-pear', 'ar-493-review'])
+    } finally { await factory.stop() }
+  })
+
+  it('publishes candidates while triage has not yet enumerated them into the capacity queue', async () => {
+    const triaging = Promise.withResolvers<void>()
+    const continueTriage = Promise.withResolvers<void>()
+    class PausedTriage extends StaticTriage {
+      override async triage(issue: LinearIssue): Promise<TriageDecision> {
+        triaging.resolve()
+        await continueTriage.promise
+        return super.triage(issue)
+      }
+    }
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [issuePath(496)]: issueFile(496) }),
+      fleet: new RemoteLifecycleFleetClient(), triage: new PausedTriage(),
+      stateStore: new InMemoryStateStore({ batchSize: 1 }),
+    })
+    const sweep = factory.runOnce()
+    try {
+      await withDeadline(triaging.promise, 4_000, 'candidate never reached triage')
+      expect(factory.status().dispatchCapacity).toMatchObject({
+        waiting: 0, candidatesFound: 1, candidateSweeps: 1, noCandidateSweeps: 0, candidatesWithoutSlot: 0,
+      })
+    } finally {
+      continueTriage.resolve()
+      await sweep
+      await factory.stop()
+    }
+  })
+
+  it('reclaims a never-placed occupant after the default short grace, inside the former budget', async () => {
+    const clock = new ManualClock()
+    const state = new InMemoryStateStore({ batchSize: 1 })
+    const fleet = new RemoteLifecycleFleetClient()
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient(), fleet, stateStore: state, clock, triage: new StaticTriage(),
+    })
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(issuePath(495), issueFile(495)))
+      const key = dispatchIssueIdentity(decision.issue)
+      await state.claimDispatchLifecycle('factory-test', key, {
+        runId: 'agentless-grace', issue: decision.issue, decision, dryRun: false,
+        phase: 'running', agents: [], invocationIds: [], updatedAtMs: 0,
+      }, 'previous-owner', 0, 1)
+      clock.advance(59_000)
+      await factory.start({ mode: 'dispatch-owner' })
+      expect(factory.status().dispatchCapacity).toMatchObject({ active: 1, agentlessHoldTimeoutMs: 60_000 })
+      expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBeUndefined()
+      clock.advance(1_001)
+      await vi.waitFor(() => expect(factory.status().counters.agentlessSlotPastDeadlineReleases).toBe(1), { timeout: 4_000 })
+      expect(await state.getDispatchLifecycle('factory-test', key)).toMatchObject({
+        phase: 'abandoned', releaseReason: 'agentless-slot-past-deadline',
+      })
+      expect(factory.status().dispatchCapacity.active).toBe(0)
+      expect(fleet.spawns).toEqual([])
+      expect(fleet.releases).toEqual([])
+    } finally { await factory.stop() }
+  })
 })

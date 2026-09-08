@@ -169,16 +169,12 @@ const liveSubscriptionSchema = z.object({
 export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000
 
 /**
- * How long a lifecycle may occupy a batch slot without ever placing an agent.
- *
- * Much shorter than `agentHoldTimeoutMs` because the two bound different
- * things: that one bounds a team that is plausibly working, this one bounds a
- * row that definitionally is not — nothing but a placement can move it, and no
- * placement ever happened. It still has to clear the whole promote-to-spawn
- * window (clone, worktree prep, fleet spawn, roster adoption) with room to
- * spare, or the reaper races a dispatch that was about to succeed (#303).
+ * Grace for an admitted lifecycle to place its first agent. A reservation with
+ * no worker must give capacity back promptly; late spawn results are fenced
+ * and released by the dispatch abandonment path. Slow provisioning can opt
+ * into a longer grace explicitly.
  */
-export const DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS = 30 * 60_000
+export const DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS = 60_000
 
 /** Capacity wait past which a full batch stops reading as ordinary backpressure. */
 export const DEFAULT_CAPACITY_WAIT_WARN_MS = 30 * 60_000

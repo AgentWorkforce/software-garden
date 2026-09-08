@@ -215,3 +215,17 @@ const babysitter = (number: number, repo: string, ownedRepo: string): AgentSpec 
   repo,
   ownedPullRequest: { repo: ownedRepo, number },
 })
+
+describe('completed work-item capacity (#491)', () => {
+  it('admits the next item while confirmed writeback cleanup is pending', () => {
+    const batch = new BatchTracker(1)
+    const first = batch.start(dependencyDecision(491), false)!
+    first.lifecyclePhase = 'running'
+    expect(batch.canStart()).toBe(false)
+    first.lifecyclePhase = 'writeback-applied'
+    expect(batch.canStart()).toBe(true)
+    expect(batch.start(dependencyDecision(492), false)).toBeDefined()
+    expect(batch.getIssue(first.issue)).toBe(first)
+    expect(batch.canStart()).toBe(false)
+  })
+})
