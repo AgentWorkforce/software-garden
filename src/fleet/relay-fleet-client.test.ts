@@ -1298,6 +1298,96 @@ describe('RelayFleetClient', () => {
     expect(fleet.fleetConnectStatus().state).toBe('connected')
   })
 
+  // The completion route's attestation. The rendered task tells a worker to
+  // report through this action and NOT to DM or post, and the SDK stamps
+  // `session_ref` on sent messages only — never on `commands.invoke` — so
+  // without reading it here the documented flow carries no session at all.
+  it('carries a worker-attested session ref off the lifecycle invocation input', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-18-impl', status: 'online' }]
+    messaging.invocations.set('lifecycle-18', [{
+      invocationId: 'lifecycle-18',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-18-impl',
+      status: 'invoked',
+      input: {
+        kind: 'completed',
+        issueKey: 'AR-18',
+        role: 'implementer',
+        sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      },
+    }])
+    const fleet = createClient(messaging)
+    const signals: unknown[] = []
+    fleet.onAgentLifecycleSignal?.((signal) => { signals.push(signal) })
+    await fleet.spawn({ name: 'ar-18-impl', capability: 'spawn:codex' })
+    await flush()
+
+    messaging.emit('any', {
+      type: 'actionInvoked',
+      invocationId: 'lifecycle-18',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-18-impl',
+      handlerAgentId: 'controller-id',
+    })
+
+    await vi.waitFor(() => expect(messaging.completedInvocations).toHaveLength(1))
+    expect(signals).toEqual([{
+      name: 'ar-18-impl',
+      kind: 'completed',
+      issueKey: 'AR-18',
+      role: 'implementer',
+      sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      invocationId: 'lifecycle-18',
+    }])
+  })
+
+  // Agent names are deterministic and reused across respawns, so a message
+  // that predates the placement now holding the name describes a worker that
+  // no longer exists. Adopting its session would key the PR pointer on a dead
+  // generation. The message still gets delivered; only the claim is dropped.
+  it('drops an attested session from a message that predates the current placement', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const messages: AgentMessage[] = []
+    fleet.onAgentMessage((message) => messages.push(message))
+    await fleet.spawn({ name: 'ar-19-impl', capability: 'spawn:claude' })
+    await flush()
+
+    const spawnedAtMs = fleet.trackedAgents().get('ar-19-impl')?.spawnedAtMs ?? 0
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({
+        id: 'msg-stale',
+        text: 'from the previous generation',
+        from: { name: 'ar-19-impl' },
+        createdAt: new Date(spawnedAtMs - 60_000).toISOString(),
+        metadata: { session_ref: '00000000-1111-2222-3333-444444444444' },
+      }),
+    })
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({
+        id: 'msg-live',
+        text: 'from this one',
+        from: { name: 'ar-19-impl' },
+        createdAt: new Date(spawnedAtMs + 60_000).toISOString(),
+        metadata: { session_ref: '0190f75d-2915-4c9c-a31b-6354234eee29' },
+      }),
+    })
+
+    expect(messages).toEqual([
+      expect.objectContaining({ eventId: 'msg-stale', body: 'from the previous generation' }),
+      expect.objectContaining({
+        eventId: 'msg-live',
+        sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      }),
+    ])
+    expect(messages[0]).not.toHaveProperty('sessionRef')
+  })
+
   it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {
     const messaging = new FakeMessaging()
     messaging.meName = 'relay-controller-7'

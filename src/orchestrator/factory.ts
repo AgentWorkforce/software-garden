@@ -1329,6 +1329,8 @@ export class FactoryLoop implements Factory {
   #reconciledAgentExitsActive = 0
   readonly #reconciledAgentExitWaiters: Array<() => void> = []
   readonly #agentLifecycleSignalsInFlight = new Map<string, Promise<void>>()
+  /** In-flight attested-session adoptions, so exit handling can settle them. */
+  readonly #pendingSessionRefAdoptions = new Map<string, Promise<void>>()
   readonly #agentUsageInFlight = new Set<Promise<void>>()
   readonly #dispatchLifecyclePersistenceSerial = new Map<string, Promise<void>>()
   readonly #agentUsageGroups = new Set<string>()
@@ -6790,8 +6792,8 @@ export class FactoryLoop implements Factory {
         // Deliberately not awaited inside `#handleAgentMessage`: that path
         // installs the babysitter critical-section fence synchronously before
         // its first await, and an adoption read ahead of it would open a gap
-        // the fence exists to close.
-        void this.#adoptAttestedSessionRef(message)
+        // the fence exists to close. Exit handling awaits the adoption instead.
+        void this.#adoptAttestedSessionRef(message.from, message.sessionRef)
         void this.#handleAgentMessage(message)
       })
     }
@@ -12000,6 +12002,12 @@ export class FactoryLoop implements Factory {
       return
     }
 
+    // A worker's last act is often to attest and then exit, and the two arrive
+    // on separate fleet callbacks. Resume-versus-respawn below reads
+    // `tracked.sessionRef`, so settle any adoption already in flight for this
+    // agent before that read rather than racing it.
+    await this.#awaitPendingSessionRefAdoption(name)
+
     // Agent messages and exits are separate fleet callbacks. A needs-input DM
     // can therefore be followed by the instructed session exit before the
     // first durable state await completes. The message handler installs this
@@ -13821,6 +13829,12 @@ export class FactoryLoop implements Factory {
   async #handleAgentLifecycleSignal(signal: AgentLifecycleSignal): Promise<void> {
     if (this.#stopping) return
 
+    // The completion route's attestation, and the only one a worker following
+    // the rendered task actually emits: it is told to report through this
+    // action and NOT to DM or post to a shared channel. Adopt before the
+    // branches below, every one of which can end in a publish.
+    await this.#adoptAttestedSessionRef(signal.name, signal.sessionRef)
+
     if (signal.kind === 'blocked') {
       if (!signal.question?.trim()) {
         this.#increment('agentLifecycleSignalsIgnoredInvalid')
@@ -13873,7 +13887,7 @@ export class FactoryLoop implements Factory {
   }
 
   /**
-   * Record a worker's own attested session the first time it speaks.
+   * Record a worker's own attested session the first time it reports one.
    *
    * A remotely-placed spawn cannot supply this. The engine materializes the
    * `spawn` action's output from its fleet inventory record at completion
@@ -13883,27 +13897,73 @@ export class FactoryLoop implements Factory {
    * pointer on every PR that path opens renders `session_ref=missing`, and the
    * spawn still looks entirely healthy because `name` is present.
    *
+   * Both attestation routes land here: a message the worker sends, and the
+   * lifecycle action it is instructed to complete through. The action is the
+   * one that matters for a compliant worker, which is told not to DM or post.
+   *
    * Only fills a gap. A ref already on the record — a resumed lineage, or a
    * spawn result that did carry one, as the internal broker path does — is the
-   * one Factory chose to track, and a message must not move it.
+   * one Factory chose to track, and an attestation must not move it.
    *
-   * Runs as its own task off the inbound-message listener rather than inside
-   * `#handleAgentMessage`, which must reach its synchronous fence before any
-   * await. Nothing downstream reads the ref until the PR is published, so the
-   * two orderings are independent.
+   * The returned promise is retained per agent so exit handling can await it:
+   * `#handleAgentExit` branches on `tracked.sessionRef` to choose resume over
+   * a fresh respawn, and a message delivered just before an exit would
+   * otherwise race that read.
    */
-  async #adoptAttestedSessionRef(message: AgentMessage): Promise<void> {
-    const sessionRef = message.sessionRef?.trim()
-    if (!sessionRef) return
-    const record = (await this.#batch()).getIssueByAgent(message.from)
-    const tracked = record?.agents.get(message.from)
-    if (!tracked || tracked.sessionRef) return
+  #adoptAttestedSessionRef(name: string, attested: string | undefined): Promise<void> {
+    const sessionRef = attested?.trim()
+    if (!sessionRef) return Promise.resolve()
+    const pending = this.#pendingSessionRefAdoptions.get(name)
+    const adoption = (pending ?? Promise.resolve())
+      .then(() => this.#applyAttestedSessionRef(name, sessionRef))
+      .catch((error) => {
+        this.#logger.warn?.('[factory] attested session ref adoption failed', {
+          agent: name,
+          error: describeError(error).errorMessage,
+        })
+      })
+      .finally(() => {
+        if (this.#pendingSessionRefAdoptions.get(name) === adoption) {
+          this.#pendingSessionRefAdoptions.delete(name)
+        }
+      })
+    this.#pendingSessionRefAdoptions.set(name, adoption)
+    return adoption
+  }
+
+  async #applyAttestedSessionRef(name: string, sessionRef: string): Promise<void> {
+    const record = (await this.#batch()).getIssueByAgent(name)
+    const tracked = record?.agents.get(name)
+    if (!record || !tracked || tracked.sessionRef) return
     tracked.sessionRef = sessionRef
-    this.#increment('agentSessionRefsAdoptedFromMessage')
+    this.#increment('agentSessionRefsAdoptedFromAttestation')
     this.#logger.info?.('[factory] adopted a worker-attested session ref', {
-      agent: message.from,
-      ...(record ? { issue: record.issue.key } : {}),
+      agent: name,
+      issue: record.issue.key,
     })
+    // Checkpoint rather than wait for the next phase transition. A crash
+    // between here and that save would leave the durable row carrying no ref,
+    // and startup rebuilds the tracked agent from that row — so a worker that
+    // exited during the outage would publish `session_ref=missing` despite
+    // having already attested. Best-effort: a lost race for lifecycle
+    // ownership must not fail the adoption that already happened in memory.
+    if (record.lifecyclePhase && !isTerminalDispatchPhase(record.lifecyclePhase)) {
+      try {
+        await this.#saveDispatchLifecycle(record, record.lifecyclePhase)
+      } catch (error) {
+        this.#logger.warn?.('[factory] could not checkpoint an attested session ref', {
+          agent: name,
+          issue: record.issue.key,
+          error: describeError(error).errorMessage,
+        })
+      }
+    }
+  }
+
+  /** Settle any in-flight adoption for this agent before reading its ref. */
+  async #awaitPendingSessionRefAdoption(name: string): Promise<void> {
+    const pending = this.#pendingSessionRefAdoptions.get(name)
+    if (pending) await pending
   }
 
   async #handleAgentMessage(message: AgentMessage): Promise<void> {

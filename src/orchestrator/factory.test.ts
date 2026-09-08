@@ -21587,7 +21587,60 @@ describe('FactoryLoop', () => {
     // #493's source key is inert without this PR's id: it is emitted only
     // alongside a canonical ref, so an unadopted session would drop it too.
     expect(publishInputs[0]?.body).toContain('session_source=codex')
-    expect(factory.status().counters.agentSessionRefsAdoptedFromMessage).toBe(1)
+    expect(factory.status().counters.agentSessionRefsAdoptedFromAttestation).toBe(1)
+  })
+
+  // Messages and exits arrive on separate fleet callbacks, and a worker's last
+  // act is typically to attest and then exit. This covers that ordering with no
+  // flush in between — the exit is delivered in the same turn as the message.
+  //
+  // Honest scope: this does NOT prove the ordering guard in `#handleAgentExit`.
+  // The fake dispatches both callbacks synchronously and the exit path awaits
+  // several times before it reads `tracked.sessionRef`, so the adoption always
+  // wins here whether or not the guard is present — removing the guard leaves
+  // this test green. The guard is retained as cheap insurance for a real
+  // transport, where the interleaving is not fixed; this test only pins the
+  // end-to-end outcome for the attest-then-exit shape.
+  it('publishes the attested session when the exit follows the message immediately', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 98,
+          url: 'https://github.com/AgentWorkforce/pear/pull/98',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-98',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(98)]: issueFile(98),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const attestedSessionRef = '0190f75d-2915-4c9c-a31b-6354234eee29'
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(98), issueFile(98))))
+    fleet.emitAgentMessage({
+      from: 'ar-98-impl-pear',
+      target: 'general',
+      body: 'done, exiting',
+      sessionRef: attestedSessionRef,
+    })
+    fleet.emitAgentExit('ar-98-impl-pear', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(attestedSessionRef)
+    expect(publishInputs[0]?.body).not.toContain('session_ref=missing')
   })
 
   // An attested ref never displaces one Factory already tracks. A resumed
@@ -21633,7 +21686,62 @@ describe('FactoryLoop', () => {
     await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
     expect(publishInputs[0]?.sessionRef).toBe(spawnedSessionRef)
-    expect(factory.status().counters.agentSessionRefsAdoptedFromMessage ?? 0).toBe(0)
+    expect(factory.status().counters.agentSessionRefsAdoptedFromAttestation ?? 0).toBe(0)
+  })
+
+  // The completion route, which is the one a compliant worker actually uses:
+  // `lifecycleInstructions` tells it to report through `invoke_action` and
+  // explicitly NOT to DM or post to a shared channel, and the SDK stamps
+  // `session_ref` onto sent messages only — never onto `commands.invoke`. A
+  // worker that follows its task therefore emits no Factory-visible message at
+  // all, so an adoption that only watched messages would leave the documented
+  // flow publishing `session_ref=missing`.
+  it('adopts the attested session from the lifecycle completion signal', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 97,
+          url: 'https://github.com/AgentWorkforce/pear/pull/97',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-97',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(97)]: issueFile(97),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    // No setSessionRef and no message: exactly what a remote placement plus a
+    // template-compliant worker produce.
+    const attestedSessionRef = '0190f75d-2915-4c9c-a31b-6354234eee29'
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(97), issueFile(97))))
+    await fleet.emitAgentLifecycleSignal({
+      name: 'ar-97-impl-pear',
+      kind: 'completed',
+      issueKey: 'AR-97',
+      role: 'implementer',
+      sessionRef: attestedSessionRef,
+    })
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(attestedSessionRef)
+    expect(publishInputs[0]?.body).toContain(
+      `session_ref=${attestedSessionRef} session_source=codex -->`,
+    )
+    expect(publishInputs[0]?.body).not.toContain('session_ref=missing')
+    expect(factory.status().counters.agentSessionRefsAdoptedFromAttestation).toBe(1)
   })
 
   // The other half of the #67 follow-up, for CLOUD placement. A remote

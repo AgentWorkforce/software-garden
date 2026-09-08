@@ -229,6 +229,14 @@ export type AgentLifecycleSignal = {
   role?: AgentSpec['role']
   question?: string
   invocationId?: string
+  /**
+   * The sender's own attested Relay session, when the invocation carries one.
+   *
+   * The rendered task tells a worker to report through this action and NOT to
+   * DM or post to a shared channel, so for a compliant worker this — not
+   * `AgentMessage.sessionRef` — is the attestation Factory actually sees.
+   */
+  sessionRef?: string
 }
 /** Latest cumulative runtime totals for one spawned agent and model. */
 export type AgentUsage = {
