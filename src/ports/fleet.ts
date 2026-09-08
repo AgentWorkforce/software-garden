@@ -204,7 +204,24 @@ export class FleetDeliveryRejectedError extends Error {
   }
 }
 
-export type AgentMessage = { from: string; target: string; body: string; threadId?: string; eventId?: string }
+export type AgentMessage = {
+  from: string
+  target: string
+  body: string
+  threadId?: string
+  eventId?: string
+  /**
+   * The sender's own attested Relay session, when the transport carries one.
+   *
+   * A spawn placement cannot report this: the engine materializes the spawn
+   * action's result before the broker's `agent.register` frame delivers the
+   * worker's session, so `output.session_ref` is null on every fresh remote
+   * spawn. The worker's own traffic is the first place the id becomes
+   * readable — the broker stamps `RELAY_ATTEST_SESSION_ID` into the worker's
+   * environment and the Relay SDK carries it on each message it sends.
+   */
+  sessionRef?: string
+}
 export type AgentLifecycleSignal = {
   name: string
   kind: 'completed' | 'ready' | 'blocked'

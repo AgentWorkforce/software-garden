@@ -1677,12 +1677,22 @@ export class RelayFleetClient implements FleetClient {
     } else if (messageTarget?.kind === 'channel' && typeof messageTarget.channelName === 'string') {
       target = messageTarget.channelName
     }
+    // The sender's attested session, and the only place Factory can read one
+    // for a remotely-placed worker. `placement.spawn`'s completed invocation
+    // reports `session_ref: null` for every fresh spawn — the engine builds
+    // that output from its inventory record before the broker's
+    // `agent.register` frame carries the worker's session to it, and re-reading
+    // the invocation later never backfills it. The broker does stamp
+    // `RELAY_ATTEST_SESSION_ID` into the worker's environment, so the Relay SDK
+    // puts it on the worker's own messages, which is what this reads.
+    const sessionRef = readString(asRecord(message.metadata), 'session_ref', 'sessionRef')
     const agentMessage: AgentMessage = {
       from,
       target: target ?? fallbackTarget,
       body: message.text,
       ...(message.threadId || message.parentId ? { threadId: message.threadId ?? message.parentId } : {}),
       ...(message.id ? { eventId: message.id } : {}),
+      ...(sessionRef ? { sessionRef } : {}),
     }
     for (const listener of this.#agentMessageListeners) {
       listener(agentMessage)

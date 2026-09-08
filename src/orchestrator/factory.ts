@@ -6787,6 +6787,11 @@ export class FactoryLoop implements Factory {
     }
     if (!this.#offAgentMessage) {
       this.#offAgentMessage = this.#fleet.onAgentMessage?.((message) => {
+        // Deliberately not awaited inside `#handleAgentMessage`: that path
+        // installs the babysitter critical-section fence synchronously before
+        // its first await, and an adoption read ahead of it would open a gap
+        // the fence exists to close.
+        void this.#adoptAttestedSessionRef(message)
         void this.#handleAgentMessage(message)
       })
     }
@@ -13865,6 +13870,40 @@ export class FactoryLoop implements Factory {
     }
     this.#increment('agentLifecycleCompletionSignals')
     await this.#handleAgentExit(signal.name, 'completed')
+  }
+
+  /**
+   * Record a worker's own attested session the first time it speaks.
+   *
+   * A remotely-placed spawn cannot supply this. The engine materializes the
+   * `spawn` action's output from its fleet inventory record at completion
+   * time, which is before the broker's `agent.register` frame carries the
+   * worker's `session_ref` to it, so `output.session_ref` is null on every
+   * fresh remote spawn and never backfills. Without this the trajectory
+   * pointer on every PR that path opens renders `session_ref=missing`, and the
+   * spawn still looks entirely healthy because `name` is present.
+   *
+   * Only fills a gap. A ref already on the record — a resumed lineage, or a
+   * spawn result that did carry one, as the internal broker path does — is the
+   * one Factory chose to track, and a message must not move it.
+   *
+   * Runs as its own task off the inbound-message listener rather than inside
+   * `#handleAgentMessage`, which must reach its synchronous fence before any
+   * await. Nothing downstream reads the ref until the PR is published, so the
+   * two orderings are independent.
+   */
+  async #adoptAttestedSessionRef(message: AgentMessage): Promise<void> {
+    const sessionRef = message.sessionRef?.trim()
+    if (!sessionRef) return
+    const record = (await this.#batch()).getIssueByAgent(message.from)
+    const tracked = record?.agents.get(message.from)
+    if (!tracked || tracked.sessionRef) return
+    tracked.sessionRef = sessionRef
+    this.#increment('agentSessionRefsAdoptedFromMessage')
+    this.#logger.info?.('[factory] adopted a worker-attested session ref', {
+      agent: message.from,
+      ...(record ? { issue: record.issue.key } : {}),
+    })
   }
 
   async #handleAgentMessage(message: AgentMessage): Promise<void> {

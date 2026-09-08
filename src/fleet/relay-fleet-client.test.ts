@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { FleetSpawnNotCreatedError } from '../ports/fleet'
+import { FleetSpawnNotCreatedError, type AgentMessage } from '../ports/fleet'
 
 import { describeControlPlaneError } from './control-plane-circuit'
 import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, RelaySpawnAckTimeoutError, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
@@ -1203,6 +1203,55 @@ describe('RelayFleetClient', () => {
     expect(exits).toEqual([{ name: 'ar-1-impl', reason: 'offline' }])
     expect(messaging.connected).toBe(1)
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
+  })
+
+  // The producer half of the Session-as-Thread pointer. A placement spawn's
+  // completed invocation carries `session_ref: null` — captured from a real
+  // spawn, invocation inv_223040291642302464:
+  //
+  //   "output": { "agent_id": "223040362062057472", "name": "ws10-placement-probe",
+  //               "invocation_id": "inv_223040291642302464", "session_ref": null }
+  //
+  // The engine materializes that output from its fleet inventory record before
+  // the broker's `agent.register` frame delivers the worker's session, and a
+  // re-read minutes later still returns null. The worker's own messages are the
+  // first readable source: the broker stamps RELAY_ATTEST_SESSION_ID into its
+  // environment and the SDK carries it as `metadata.session_ref`.
+  it('surfaces a worker-attested session ref from inbound message metadata', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const messages: AgentMessage[] = []
+    fleet.onAgentMessage((message) => messages.push(message))
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:claude' })
+    await flush()
+
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({
+        id: 'msg-attested',
+        text: 'progress',
+        from: { name: 'ar-1-impl' },
+        metadata: { session_ref: '0190f75d-2915-4c9c-a31b-6354234eee29' },
+      }),
+    })
+    // A message with no attestation stays absent rather than becoming a blank.
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({ id: 'msg-bare', text: 'more', from: { name: 'ar-1-impl' } }),
+    })
+
+    expect(messages).toEqual([
+      {
+        from: 'ar-1-impl',
+        target: 'wf-factory',
+        body: 'progress',
+        eventId: 'msg-attested',
+        sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      },
+      { from: 'ar-1-impl', target: 'wf-factory', body: 'more', eventId: 'msg-bare' },
+    ])
   })
 
   it('lets a worker-side teammate client observe replies without claiming the Factory lifecycle action', async () => {
