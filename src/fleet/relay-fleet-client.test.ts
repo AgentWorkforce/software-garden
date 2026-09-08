@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { FleetSpawnNotCreatedError } from '../ports/fleet'
+import { FleetSpawnNotCreatedError, type AgentMessage } from '../ports/fleet'
 
 import { describeControlPlaneError } from './control-plane-circuit'
 import { FactoryAgentRegistrationError, MAX_REGISTRATION_ATTEMPTS, ReadOnlyFleetIdentityError, RelayFleetClient, RelaySpawnAckTimeoutError, type RelayClientFactoryOptions, type RelayClientLike } from './relay-fleet-client'
@@ -1205,6 +1205,55 @@ describe('RelayFleetClient', () => {
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
   })
 
+  // The producer half of the Session-as-Thread pointer. A placement spawn's
+  // completed invocation carries `session_ref: null` — captured from a real
+  // spawn, invocation inv_223040291642302464:
+  //
+  //   "output": { "agent_id": "223040362062057472", "name": "ws10-placement-probe",
+  //               "invocation_id": "inv_223040291642302464", "session_ref": null }
+  //
+  // The engine materializes that output from its fleet inventory record before
+  // the broker's `agent.register` frame delivers the worker's session, and a
+  // re-read minutes later still returns null. The worker's own messages are the
+  // first readable source: the broker stamps RELAY_ATTEST_SESSION_ID into its
+  // environment and the SDK carries it as `metadata.session_ref`.
+  it('surfaces a worker-attested session ref from inbound message metadata', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const messages: AgentMessage[] = []
+    fleet.onAgentMessage((message) => messages.push(message))
+    await fleet.spawn({ name: 'ar-1-impl', capability: 'spawn:claude' })
+    await flush()
+
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({
+        id: 'msg-attested',
+        text: 'progress',
+        from: { name: 'ar-1-impl' },
+        metadata: { session_ref: '0190f75d-2915-4c9c-a31b-6354234eee29' },
+      }),
+    })
+    // A message with no attestation stays absent rather than becoming a blank.
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({ id: 'msg-bare', text: 'more', from: { name: 'ar-1-impl' } }),
+    })
+
+    expect(messages).toEqual([
+      {
+        from: 'ar-1-impl',
+        target: 'wf-factory',
+        body: 'progress',
+        eventId: 'msg-attested',
+        sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      },
+      { from: 'ar-1-impl', target: 'wf-factory', body: 'more', eventId: 'msg-bare' },
+    ])
+  })
+
   it('lets a worker-side teammate client observe replies without claiming the Factory lifecycle action', async () => {
     const messaging = new FakeMessaging()
     messaging.connectEvent = { type: 'connected' }
@@ -1247,6 +1296,96 @@ describe('RelayFleetClient', () => {
     await ready
     expect(settled).toBe(true)
     expect(fleet.fleetConnectStatus().state).toBe('connected')
+  })
+
+  // The completion route's attestation. The rendered task tells a worker to
+  // report through this action and NOT to DM or post, and the SDK stamps
+  // `session_ref` on sent messages only — never on `commands.invoke` — so
+  // without reading it here the documented flow carries no session at all.
+  it('carries a worker-attested session ref off the lifecycle invocation input', async () => {
+    const messaging = new FakeMessaging()
+    messaging.agentRows = [{ name: 'ar-18-impl', status: 'online' }]
+    messaging.invocations.set('lifecycle-18', [{
+      invocationId: 'lifecycle-18',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-18-impl',
+      status: 'invoked',
+      input: {
+        kind: 'completed',
+        issueKey: 'AR-18',
+        role: 'implementer',
+        sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      },
+    }])
+    const fleet = createClient(messaging)
+    const signals: unknown[] = []
+    fleet.onAgentLifecycleSignal?.((signal) => { signals.push(signal) })
+    await fleet.spawn({ name: 'ar-18-impl', capability: 'spawn:codex' })
+    await flush()
+
+    messaging.emit('any', {
+      type: 'actionInvoked',
+      invocationId: 'lifecycle-18',
+      actionName: 'factory.lifecycle',
+      callerName: 'ar-18-impl',
+      handlerAgentId: 'controller-id',
+    })
+
+    await vi.waitFor(() => expect(messaging.completedInvocations).toHaveLength(1))
+    expect(signals).toEqual([{
+      name: 'ar-18-impl',
+      kind: 'completed',
+      issueKey: 'AR-18',
+      role: 'implementer',
+      sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      invocationId: 'lifecycle-18',
+    }])
+  })
+
+  // Agent names are deterministic and reused across respawns, so a message
+  // that predates the placement now holding the name describes a worker that
+  // no longer exists. Adopting its session would key the PR pointer on a dead
+  // generation. The message still gets delivered; only the claim is dropped.
+  it('drops an attested session from a message that predates the current placement', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging)
+    const messages: AgentMessage[] = []
+    fleet.onAgentMessage((message) => messages.push(message))
+    await fleet.spawn({ name: 'ar-19-impl', capability: 'spawn:claude' })
+    await flush()
+
+    const spawnedAtMs = fleet.trackedAgents().get('ar-19-impl')?.spawnedAtMs ?? 0
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({
+        id: 'msg-stale',
+        text: 'from the previous generation',
+        from: { name: 'ar-19-impl' },
+        createdAt: new Date(spawnedAtMs - 60_000).toISOString(),
+        metadata: { session_ref: '00000000-1111-2222-3333-444444444444' },
+      }),
+    })
+    messaging.emit('any', {
+      type: 'messageCreated',
+      channel: 'wf-factory',
+      message: relayMessage({
+        id: 'msg-live',
+        text: 'from this one',
+        from: { name: 'ar-19-impl' },
+        createdAt: new Date(spawnedAtMs + 60_000).toISOString(),
+        metadata: { session_ref: '0190f75d-2915-4c9c-a31b-6354234eee29' },
+      }),
+    })
+
+    expect(messages).toEqual([
+      expect.objectContaining({ eventId: 'msg-stale', body: 'from the previous generation' }),
+      expect.objectContaining({
+        eventId: 'msg-live',
+        sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+      }),
+    ])
+    expect(messages[0]).not.toHaveProperty('sessionRef')
   })
 
   it('routes durable lifecycle actions through the authenticated identity when factory and broker are absent', async () => {

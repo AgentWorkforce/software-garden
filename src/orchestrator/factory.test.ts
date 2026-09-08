@@ -21518,6 +21518,232 @@ describe('FactoryLoop', () => {
     expect(publishInputs[0]?.body).not.toContain('session_source=codex')
   })
 
+  // The producer-side half of the Session-as-Thread pointer. A remotely-placed
+  // spawn reports no session at all: `placement.spawn`'s completed invocation
+  // carries `session_ref: null`, because the engine builds that output from its
+  // fleet inventory record before the broker's `agent.register` frame delivers
+  // the worker's session — and re-reading the invocation never backfills it.
+  // Captured from a real spawn (invocation inv_223040291642302464):
+  //
+  //   "output": { "agent_id": "223040362062057472",
+  //               "name": "ws10-placement-probe",
+  //               "invocation_id": "inv_223040291642302464",
+  //               "session_ref": null }
+  //
+  // while the node's own broker reported sessionId
+  // 0190f75d-2915-4c9c-a31b-6354234eee29 for that same agent at that moment.
+  // So the fleet result legitimately has no ref (this fake supplies none, which
+  // is the real condition), and the worker's own attested id — stamped into its
+  // environment as RELAY_ATTEST_SESSION_ID and carried on the messages it sends
+  // — is the first thing Factory can read. Before that was adopted, every PR
+  // this path opened rendered `session_ref=missing`.
+  it('renders the pointer from a worker-attested session when the spawn result carries none', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 95,
+          url: 'https://github.com/AgentWorkforce/pear/pull/95',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-95',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(95)]: issueFile(95),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    // Deliberately NO setSessionRef: this is what a remote placement returns.
+    const attestedSessionRef = '0190f75d-2915-4c9c-a31b-6354234eee29'
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(95), issueFile(95))))
+    // The implementer speaks once. Its message carries the attested session.
+    fleet.emitAgentMessage({
+      from: 'ar-95-impl-pear',
+      target: 'general',
+      body: 'starting on AR-95',
+      sessionRef: attestedSessionRef,
+    })
+    await flush()
+    fleet.emitAgentExit('ar-95-impl-pear', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(attestedSessionRef)
+    expect(publishInputs[0]?.body).toContain(
+      `<!-- trajectory: work_unit_id=factory:uuid-95 work_unit_surface=factory ` +
+      `session_ref=${attestedSessionRef} session_source=codex -->`,
+    )
+    expect(publishInputs[0]?.body).not.toContain('session_ref=missing')
+    // #493's source key is inert without this PR's id: it is emitted only
+    // alongside a canonical ref, so an unadopted session would drop it too.
+    expect(publishInputs[0]?.body).toContain('session_source=codex')
+    expect(factory.status().counters.agentSessionRefsAdoptedFromAttestation).toBe(1)
+  })
+
+  // Messages and exits arrive on separate fleet callbacks, and a worker's last
+  // act is typically to attest and then exit. This covers that ordering with no
+  // flush in between — the exit is delivered in the same turn as the message.
+  //
+  // Honest scope: this does NOT prove the ordering guard in `#handleAgentExit`.
+  // The fake dispatches both callbacks synchronously and the exit path awaits
+  // several times before it reads `tracked.sessionRef`, so the adoption always
+  // wins here whether or not the guard is present — removing the guard leaves
+  // this test green. The guard is retained as cheap insurance for a real
+  // transport, where the interleaving is not fixed; this test only pins the
+  // end-to-end outcome for the attest-then-exit shape.
+  it('publishes the attested session when the exit follows the message immediately', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 98,
+          url: 'https://github.com/AgentWorkforce/pear/pull/98',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-98',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(98)]: issueFile(98),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const attestedSessionRef = '0190f75d-2915-4c9c-a31b-6354234eee29'
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(98), issueFile(98))))
+    fleet.emitAgentMessage({
+      from: 'ar-98-impl-pear',
+      target: 'general',
+      body: 'done, exiting',
+      sessionRef: attestedSessionRef,
+    })
+    fleet.emitAgentExit('ar-98-impl-pear', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(attestedSessionRef)
+    expect(publishInputs[0]?.body).not.toContain('session_ref=missing')
+  })
+
+  // An attested ref never displaces one Factory already tracks. A resumed
+  // lineage is the ref Factory chose; a message must not move it.
+  it('keeps a tracked session ref when a worker attests a different one', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 96,
+          url: 'https://github.com/AgentWorkforce/pear/pull/96',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-96',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(96)]: issueFile(96),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const spawnedSessionRef = 'bef97682-12f8-44a8-ba14-5ef533ac5d00'
+    fleet.setSessionRef('ar-96-impl-pear', spawnedSessionRef)
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(96), issueFile(96))))
+    fleet.emitAgentMessage({
+      from: 'ar-96-impl-pear',
+      target: 'general',
+      body: 'starting on AR-96',
+      sessionRef: '0190f75d-2915-4c9c-a31b-6354234eee29',
+    })
+    await flush()
+    fleet.emitAgentExit('ar-96-impl-pear', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(spawnedSessionRef)
+    expect(factory.status().counters.agentSessionRefsAdoptedFromAttestation ?? 0).toBe(0)
+  })
+
+  // The completion route, which is the one a compliant worker actually uses:
+  // `lifecycleInstructions` tells it to report through `invoke_action` and
+  // explicitly NOT to DM or post to a shared channel, and the SDK stamps
+  // `session_ref` onto sent messages only — never onto `commands.invoke`. A
+  // worker that follows its task therefore emits no Factory-visible message at
+  // all, so an adoption that only watched messages would leave the documented
+  // flow publishing `session_ref=missing`.
+  it('adopts the attested session from the lifecycle completion signal', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 97,
+          url: 'https://github.com/AgentWorkforce/pear/pull/97',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-97',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(97)]: issueFile(97),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    // No setSessionRef and no message: exactly what a remote placement plus a
+    // template-compliant worker produce.
+    const attestedSessionRef = '0190f75d-2915-4c9c-a31b-6354234eee29'
+    const factory = createFactory(config(), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(97), issueFile(97))))
+    await fleet.emitAgentLifecycleSignal({
+      name: 'ar-97-impl-pear',
+      kind: 'completed',
+      issueKey: 'AR-97',
+      role: 'implementer',
+      sessionRef: attestedSessionRef,
+    })
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(publishInputs[0]?.sessionRef).toBe(attestedSessionRef)
+    expect(publishInputs[0]?.body).toContain(
+      `session_ref=${attestedSessionRef} session_source=codex -->`,
+    )
+    expect(publishInputs[0]?.body).not.toContain('session_ref=missing')
+    expect(factory.status().counters.agentSessionRefsAdoptedFromAttestation).toBe(1)
+  })
+
   // The other half of the #67 follow-up, for CLOUD placement. A remote
   // implementer's commits live inside its Daytona sandbox and have never
   // reached GitHub — the box holds no push credential by design — so the

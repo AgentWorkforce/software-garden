@@ -1677,12 +1677,31 @@ export class RelayFleetClient implements FleetClient {
     } else if (messageTarget?.kind === 'channel' && typeof messageTarget.channelName === 'string') {
       target = messageTarget.channelName
     }
+    // The sender's attested session, and the only place Factory can read one
+    // for a remotely-placed worker. `placement.spawn`'s completed invocation
+    // reports `session_ref: null` for every fresh spawn — the engine builds
+    // that output from its inventory record before the broker's
+    // `agent.register` frame carries the worker's session to it, and re-reading
+    // the invocation later never backfills it. The broker does stamp
+    // `RELAY_ATTEST_SESSION_ID` into the worker's environment, so the Relay SDK
+    // puts it on the worker's own messages, which is what this reads.
+    //
+    // Agent names are deterministic and reused across respawns, so a message
+    // that predates the placement now holding this name belongs to a previous
+    // worker and names a session that is not the live one. Forwarding it would
+    // let a dead generation's id become the pointer for its successor. Only the
+    // attestation is dropped; the message itself is still a real message and is
+    // delivered either way. A worker cannot speak before it boots, so the gap
+    // between `spawnedAtMs` and a genuine first message is far wider than any
+    // engine/local clock skew this comparison could suffer from.
+    const sessionRef = attestedSessionRef(message, this.#tracked.get(from)?.spawnedAtMs)
     const agentMessage: AgentMessage = {
       from,
       target: target ?? fallbackTarget,
       body: message.text,
       ...(message.threadId || message.parentId ? { threadId: message.threadId ?? message.parentId } : {}),
       ...(message.id ? { eventId: message.id } : {}),
+      ...(sessionRef ? { sessionRef } : {}),
     }
     for (const listener of this.#agentMessageListeners) {
       listener(agentMessage)
@@ -1889,6 +1908,11 @@ function lifecycleSignalFromInvocation(
   const issueKey = readString(input, 'issueKey', 'issue_key')
   const role = readString(input, 'role')
   const question = readString(input, 'question')
+  // The completion path's own attestation. A worker following the rendered task
+  // reports through this action and is told NOT to DM or post to a channel, so
+  // the message-borne attestation never fires for it — reading the ref here is
+  // what makes the documented flow carry a session at all.
+  const sessionRef = readString(input, 'sessionRef', 'session_ref')
   if (
     !name ||
     !issueKey ||
@@ -1906,8 +1930,24 @@ function lifecycleSignalFromInvocation(
     issueKey,
     role: role as NonNullable<AgentLifecycleSignal['role']>,
     ...(question ? { question } : {}),
+    ...(sessionRef ? { sessionRef } : {}),
     invocationId,
   }
+}
+
+/**
+ * The session a message attests, or nothing when it cannot be trusted to
+ * describe the placement currently holding the sender's name.
+ */
+function attestedSessionRef(message: RelayMessage, spawnedAtMs: number | undefined): string | undefined {
+  const sessionRef = readString(asRecord(message.metadata), 'session_ref', 'sessionRef')
+  if (!sessionRef) return undefined
+  if (spawnedAtMs === undefined) return sessionRef
+  const createdAtMs = message.createdAt ? Date.parse(message.createdAt) : Number.NaN
+  // An unparsable timestamp proves nothing either way; keep the attestation
+  // rather than discard a live worker's session over a missing field.
+  if (Number.isNaN(createdAtMs)) return sessionRef
+  return createdAtMs < spawnedAtMs ? undefined : sessionRef
 }
 
 function lifecycleUsageFromInvocation(

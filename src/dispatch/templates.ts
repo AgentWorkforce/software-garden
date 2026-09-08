@@ -406,6 +406,10 @@ function lifecycleInstructions(
   }
   return [
     `Call Agent Relay \`invoke_action\` exactly once with action name ${JSON.stringify(input.lifecycleActionName)} and input ${JSON.stringify({ kind, issueKey: input.issue.key, role: input.role })}.`,
+    // The spawn placement never learns this session, so the completion
+    // invocation is where a compliant worker hands it over: the instructions
+    // above forbid the DM/channel post that would otherwise carry it.
+    'Add a `sessionRef` key to that input whose value is your `RELAY_ATTEST_SESSION_ID` environment variable, verbatim. It records which session did this work so the pull request can link back to it. Omit the key entirely if that variable is unset; never invent, guess, or reuse another agent\'s value.',
     'The accepted action invocation is Software Garden\'s durable control signal. Do not replace it with a DM or shared-channel post, including #general.',
     'After Relay accepts the action invocation, report the final outcome and output `/exit` on its own line so the task-exit lifecycle closes cleanly.',
   ]

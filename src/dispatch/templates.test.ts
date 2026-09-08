@@ -30,6 +30,26 @@ const issue = {
 }
 
 describe('renderAgentTask', () => {
+  // The spawn placement never learns the worker's session (the engine builds
+  // the spawn action's output before the broker reports one), and this task
+  // forbids the DM/channel post that could otherwise carry it — so the
+  // completion invocation is the only place a compliant worker can hand it
+  // over. Asserted here so the instruction cannot be dropped silently.
+  it('asks the worker to attest its session on the lifecycle invocation', () => {
+    const task = renderAgentTask({
+      issue,
+      route: { repo: 'pear', clonePath: '/work/pear' },
+      role: 'implementer',
+      config: baseConfig,
+      reviewerName: 'ar-123-review',
+      agentName: 'ar-123-impl-pear',
+      lifecycleActionName: 'factory.lifecycle',
+    })
+
+    expect(task).toContain('Add a `sessionRef` key to that input whose value is your `RELAY_ATTEST_SESSION_ID` environment variable, verbatim.')
+    expect(task).toContain('Omit the key entirely if that variable is unset; never invent, guess, or reuse another agent\'s value.')
+  })
+
   it('renders the required implementer clauses for a single-repo route', () => {
     const task = renderAgentTask({
       issue,
