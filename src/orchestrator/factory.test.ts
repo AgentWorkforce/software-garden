@@ -20594,8 +20594,14 @@ describe('FactoryLoop', () => {
       body: expect.stringContaining('Live preview: https://factory-node.tailnet.ts.net:10052/'),
       sessionRef,
     }])
+    // The pointer names the session AND the agent that produced it: a
+    // `session_links` row is keyed on `(org_id, source, session_id, …)`, so a
+    // bare ref cannot be written without guessing the source. The source is
+    // read off the implementer's own spawn capability, asserted here so the
+    // literal below cannot drift away from the agent that actually ran.
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-52-impl-pear')?.capability).toBe('spawn:codex')
     expect(publishInputs[0]?.body).toContain(
-      `<!-- trajectory: work_unit_id=AR-52 work_unit_surface=linear session_ref=${sessionRef} -->`,
+      `<!-- trajectory: work_unit_id=AR-52 work_unit_surface=linear session_ref=${sessionRef} session_source=codex -->`,
     )
     expect(publishInputs[0]?.body).not.toContain('relay session replay')
     expect(publishInputs[0]?.body).not.toMatch(/retained-since|never-prune|replay available/iu)
@@ -21467,6 +21473,49 @@ describe('FactoryLoop', () => {
     expect(fleet.releases.map((release) => release.name)).toEqual(
       expect.arrayContaining(['ar-92-impl-pear', 'ar-92-review']),
     )
+  })
+
+  // The pointer's source is not a constant: it names whichever agent produced
+  // the session. The codex path is covered by the mount-publish test above;
+  // this is the claude implementer, so a mapping hardcoded to one CLI fails.
+  it('names the implementer CLI as the trajectory session source', async () => {
+    const publishInputs: GithubPublishPullRequestInput[] = []
+    const githubWrite: GithubConnectionWrite = {
+      publishPullRequest: async (input) => {
+        publishInputs.push(input)
+        return {
+          repo: input.repo,
+          number: 94,
+          url: 'https://github.com/AgentWorkforce/pear/pull/94',
+          headRef: input.headRef ?? input.expectedHeadRef!,
+          headSha: 'sha-94',
+        }
+      },
+      closePullRequest: async () => undefined,
+    }
+    const mount = new FakeMountClient({
+      [issuePath(94)]: issueFile(94),
+      '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+    }, githubWrite)
+    const fleet = new FakeFleetClient()
+    const sessionRef = '0198b179-c6c2-7e63-9177-4ef52f56c192'
+    fleet.setSessionRef('ar-94-impl-pear', sessionRef)
+    const factory = createFactory(config({ agentCapabilities: { implementer: 'spawn:claude' } }), {
+      mount,
+      fleet,
+      triage: new StaticTriage(),
+      probePrResolver: async () => undefined,
+    })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(94), issueFile(94))))
+    fleet.emitAgentExit('ar-94-impl-pear', 'crash')
+    await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
+
+    expect(fleet.spawns.find((spawn) => spawn.name === 'ar-94-impl-pear')?.capability).toBe('spawn:claude')
+    expect(publishInputs[0]?.body).toContain(
+      `<!-- trajectory: work_unit_id=factory:uuid-94 work_unit_surface=factory session_ref=${sessionRef} session_source=claude -->`,
+    )
+    expect(publishInputs[0]?.body).not.toContain('session_source=codex')
   })
 
   // The other half of the #67 follow-up, for CLOUD placement. A remote
