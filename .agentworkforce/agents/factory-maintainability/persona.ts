@@ -9,7 +9,7 @@ import { defineReviewPersona } from '@agentworkforce/review-kit';
  * the review. Pull hydration remains tied to the exact delivered event.
  */
 const persona = defineReviewPersona({
-  repo: 'AgentWorkforce/factory',
+  repo: 'AgentWorkforce/software-garden',
   lens: 'maintainability',
 
   // Preserve a repository-qualified deployment identity in a workspace that
@@ -34,7 +34,7 @@ export default {
     github: {
       ...persona.integrations.github,
       relayfileMount: {
-        requiredReadPaths: ['/github/repos/AgentWorkforce/factory/issues/**'],
+        requiredReadPaths: ['/github/repos/AgentWorkforce/software-garden/issues/**'],
         writeOnlyPaths: [],
       },
     },

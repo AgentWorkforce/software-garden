@@ -901,7 +901,7 @@ npx vitest run \
   .agentworkforce/agents/factory-maintainability/persona.test.ts
 ```
 
-Assert the source and compiled persona both identify `AgentWorkforce/factory`,
+Assert the source and compiled persona both identify `AgentWorkforce/software-garden`,
 request full PR history, disable checkout writeback, and mount only the Factory
 issue-comment tree. The handler must subscribe only to opened and synchronized
 Factory PRs, with both the exact pull and issue companion paths retained. The

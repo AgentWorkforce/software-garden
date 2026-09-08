@@ -29,7 +29,7 @@ type CompiledPersona = {
 };
 
 const agentworkforceRoot = new URL('../../', import.meta.url);
-const expectedAuthority = '/github/repos/AgentWorkforce/factory/issues/**';
+const expectedAuthority = '/github/repos/AgentWorkforce/software-garden/issues/**';
 
 function githubMount(value: typeof persona): RelayfileMount {
   const integrations = value.integrations as Record<
@@ -51,7 +51,7 @@ describe('factory maintainability reviewer contract', () => {
   it('is repository-qualified, read-only, and backed by full git history', () => {
     expect(persona.id).toBe('factory-maintainability');
     expect(persona.integrations.github.scope).toEqual({
-      repo: 'AgentWorkforce/factory',
+      repo: 'AgentWorkforce/software-garden',
     });
     expect(persona.capabilities.pullRequest).toEqual({
       enabled: true,
@@ -67,7 +67,7 @@ describe('factory maintainability reviewer contract', () => {
       Array<{ on: string; paths?: string[] }>
     >;
     const expectedPaths = [
-      '/github/repos/AgentWorkforce/factory/pulls/**',
+      '/github/repos/AgentWorkforce/software-garden/pulls/**',
       expectedAuthority,
     ];
 
@@ -85,7 +85,7 @@ describe('factory maintainability reviewer contract', () => {
     });
 
     const reviewPath =
-      '/github/repos/AgentWorkforce/factory/issues/180/comments/review-maintainability-deadbeef.json';
+      '/github/repos/AgentWorkforce/software-garden/issues/180/comments/review-maintainability-deadbeef.json';
     expect(terminalTreeContains(expectedAuthority, reviewPath)).toBe(true);
     expect(new Set([...mount.requiredReadPaths, ...mount.writeOnlyPaths]).size).toBe(1);
   });
@@ -107,7 +107,7 @@ describe('factory maintainability reviewer contract', () => {
     expect(charter).not.toContain('HoopSheet');
     expect(compiled.id).toBe('factory-maintainability');
     expect(compiled.integrations.github.scope).toEqual({
-      repo: 'AgentWorkforce/factory',
+      repo: 'AgentWorkforce/software-garden',
     });
     expect(compiled.integrations.github.relayfileMount).toEqual({
       requiredReadPaths: [expectedAuthority],
