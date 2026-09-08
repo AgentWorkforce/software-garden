@@ -231,9 +231,9 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   Per-call bounds can be far tighter precisely because that cold-mirror cost is spread across
   thousands of calls rather than concentrated in one.
 
-  A `stalled` state that never turns into a rising `consecutiveFailures` means either the process is
-  not running the loop at all, or it predates #351 — on a current build a hung call fails within
-  `relayfileOperationTimeoutMs`.
+  A `stalled` sweep can still have a low `consecutiveFailures` count: individual calls may
+  return while the full pass remains in flight. The stalled state already clears `ok`; health
+  consumers need not wait for a per-call timeout or the whole-sweep deadline to increment failures.
 
 - **`treeReads` / `emptyTreeReads`** — the case a timeout cannot catch. A mount that starts serving
   *empty* trees instead of hanging raises no timeout, no failure and no `lastError`: the sweep
@@ -277,7 +277,8 @@ of a merge by at most the remaining cache lifetime plus the next sweep. Closed d
 resolve directly from their current issue state.
 
 Authenticated counters `dependencyPrProbeCacheHits`, `dependencyPrProbeCacheMisses`, and
-`dependencyPrProbeCacheInvalidations` describe cache activity. `probePrMountReads` counts actual
+`dependencyPrProbeCacheInvalidations` describe cache activity. `dependencyPrProbeCacheSkippedErrors`
+counts failed lookups whose negative answers were not retained. `probePrMountReads` counts actual
 PR records read: repeated unresolved-dependency sweeps should increase hits without increasing
 that read count. The first lookup and expired or invalidated lookups can still fall back to a full walk.
 
