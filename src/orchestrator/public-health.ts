@@ -879,21 +879,12 @@ export function publicHealthFromHeartbeat(
       eventListener.state !== 'polling'
   })
 
-  // Deliberate split (#295, deliverable 2).
-  //
-  // `ok` answers "is this process alive", because that is the question the
-  // platform asks: the container ping endpoint is `/healthz`, and a non-200
-  // there recycles the container. Recycling a wedged Factory destroys the
-  // in-memory evidence of the wedge and restarts the cold-start hydration
-  // that #36 measured at 61 minutes, so a dispatch-gating degradation must
-  // not be able to reach into container lifecycle.
-  //
-  // `status` is the amber a liveness bit cannot express. No platform reads
-  // it, so a monitor can alert on `status !== "ok"` — or on
-  // `degradedSubsystems` being non-empty — and get the signal that was
-  // missing during the outage, with no restart-loop risk.
-  const ok = !stale && loopStatus !== 'stopping' && loopStatus !== 'unknown'
-  const status = !ok ? 'unknown' : degradedSubsystems.length > 0 ? 'degraded' : 'ok'
+  // Discovery is essential: propagate the existing state machine's stall
+  // verdict even when a hung pass cannot return to increment failure counters.
+  // Other transient subsystem degradations retain their existing semantics.
+  const alive = !stale && loopStatus !== 'stopping' && loopStatus !== 'unknown'
+  const ok = alive && readinessReconcile?.state !== 'stalled'
+  const status = !alive ? 'unknown' : degradedSubsystems.length > 0 ? 'degraded' : 'ok'
   const reason = stale
     ? 'heartbeat stale'
     : loopStatus === 'stopping'
@@ -985,15 +976,18 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   // underneath `status: 'ok'` and an empty `degradedSubsystems` — the same
   // stays-green failure this change exists to close, reappearing one layer up,
   // where every documented consumer actually reads it.
-  const degradedSubsystems = capacityWedged && !recordDegraded.includes('dispatchCapacity')
-    ? DISPATCH_GATING_SUBSYSTEMS.filter((name) => recordDegraded.includes(name) || name === 'dispatchCapacity')
-    : recordDegraded
-  const status = capacityWedged
+  const discoveryStalled = readiness?.state === 'stalled'
+  const degradedSubsystems = DISPATCH_GATING_SUBSYSTEMS.filter((name) =>
+    recordDegraded.includes(name) ||
+    (capacityWedged && name === 'dispatchCapacity') ||
+    (discoveryStalled && name === 'readinessReconcile'),
+  )
+  const status = capacityWedged || discoveryStalled
     ? 'degraded' as const
     : enumValue(record.status, ['ok', 'degraded'] as const)
   return {
     schemaVersion: finiteNumber(record.schemaVersion) ?? FACTORY_PUBLIC_HEALTH_SCHEMA_VERSION,
-    ok: record.ok === true,
+    ok: record.ok === true && !discoveryStalled,
     status,
     stale: record.stale === true,
     ...optionalTimestamp('updatedAtMs', record.updatedAtMs),

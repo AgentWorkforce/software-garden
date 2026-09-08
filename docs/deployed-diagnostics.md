@@ -100,7 +100,7 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   // Identity, not health (#446). It rides here because `health` is the one
   // part of the heartbeat the container passes through to /healthz verbatim.
   "build": { "version": "0.1.86", "commit": "23e97ca…4979" },
-  "ok": true,                       // process liveness — see below
+  "ok": false,                      // stalled discovery is unhealthy
   "status": "degraded",             // the amber
   "stale": false,
   "updatedAtMs": 1787229155805,
@@ -256,22 +256,30 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   empty — masking the fault. So a sweep whose roots all came from the discovery cache reports
   `treeReads: 0`, which claims nothing in either direction.
 
-### Why `ok` stays `true` while `status` goes amber
+### How discovery health reaches `ok`
 
-`/healthz` is the Cloudflare **Container ping endpoint** (`pingEndpoint = 'localhost/healthz'` in the
-Worker). A non-200 there is a liveness verdict the platform acts on: it recycles the container. That
-would destroy the in-memory evidence of the wedge and restart the cold-start hydration — turning a
-diagnosable degradation into a restart loop that also erases its own cause.
+`ok` requires a live process and discovery that is not `stalled`. The existing readiness state
+machine supplies that verdict; a hung sweep need not return or increment `consecutiveFailures`
+first. A fresh heartbeat, free dispatch capacity, or zero waiting issues cannot override it.
+`status` remains `degraded` so the known stall retains its diagnosis. When discovery recovers,
+`ok` becomes true again. Other transient subsystem degradations retain their existing semantics.
 
-So the two questions are split:
+The container must propagate `heartbeat.health.ok` to its own `/healthz` verdict and HTTP status.
+Live container preflight must also avoid running a complete discovery workload before starting the
+loop: `status` verifies the host/backend, while the live loop performs discovery and reports progress.
 
-- `ok` — *is this process alive?* Unchanged semantics, safe to keep driving the ping and the HTTP
-  status code.
-- `status` (`ok` / `degraded` / `unknown`) and `degradedSubsystems` — *is dispatch gated?* No platform
-  reads these, so a monitor can alert on `status != "ok"` with no lifecycle side effect.
+### Dependency PR lookup cache
 
-A liveness endpoint that cannot go amber is not much of a signal — this one goes amber in a field
-that cannot restart the box.
+An open dependency with no merged PR retains its negative PR lookup for 30 minutes across sweeps.
+PR change events invalidate cached dependencies for that repository, and a changed issue snapshot
+also requires a fresh lookup. Cache hits do not extend expiry, so missed events can delay recognition
+of a merge by at most the remaining cache lifetime plus the next sweep. Closed dependencies still
+resolve directly from their current issue state.
+
+Authenticated counters `dependencyPrProbeCacheHits`, `dependencyPrProbeCacheMisses`, and
+`dependencyPrProbeCacheInvalidations` describe cache activity. `probePrMountReads` counts actual
+PR records read: repeated unresolved-dependency sweeps should increase hits without increasing
+that read count. The first lookup and expired or invalidated lookups can still fall back to a full walk.
 
 ## What never crosses
 

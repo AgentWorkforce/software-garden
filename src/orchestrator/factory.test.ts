@@ -4113,6 +4113,117 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it.each(['absent', 'open'])('reuses an %s dependency PR probe across sweeps and expires it without events', async (prState) => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
+    const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 936)
+    const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
+    const mount = new CountingListTreeMount({
+      [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [dependentPath]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
+      ...Object.fromEntries(Array.from({ length: 1500 }, (_, index) => [
+        `/github/repos/AgentWorkforce/pear/pulls/by-id/${index + 10000}.json`,
+        prFile(index + 10000, { title: 'Unrelated change', body: '', headRef: 'unrelated' }),
+      ])),
+      ...(prState === 'open' ? { [pullPath]: prFile(9000, { body: 'Fixes #935', state: 'open' }) } : {}),
+    })
+    const clock = new ManualClock()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, clock, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      expect((await factory.runOnce()).dispatched).toEqual([])
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
+      const pullReads = () => factory.status().counters.probePrMountReads ?? 0
+      const pullLists = () => mount.listTreePrefixes.filter((path) => path.includes('/pulls/')).length
+      const initialReads = pullReads()
+      const initialLists = pullLists()
+      expect(initialReads).toBeGreaterThanOrEqual(1500)
+      for (let sweep = 0; sweep < 3; sweep += 1) {
+        clock.advance(5 * 60_000)
+        const report = await factory.runOnce()
+        expect(report.dispatched).toEqual([])
+        expect(report.skipped).toContainEqual(expect.objectContaining({ code: 'parked-dependency' }))
+      }
+      expect(pullReads()).toBe(initialReads)
+      expect(pullLists()).toBe(initialLists)
+      expect(factory.status().counters.dependencyPrProbeCacheHits).toBeGreaterThanOrEqual(3)
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
+
+      // No webhook: expiration still observes the new merged PR. Hits above
+      // must not extend the original deadline indefinitely.
+      mount.files.set(pullPath, { content: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }) })
+      clock.advance(15 * 60_000)
+      expect((await factory.runOnce()).dispatched.map((result) => result.issue.key)).toContain('936')
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(2)
+      expect(factory.status().parked).toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it.each(['read', 'list'])('does not retain a failed dependency PR %s as a negative lookup', async (operation) => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
+    const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 936)
+    const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
+    class FailingProbeMount extends FakeMountClient {
+      fail = true
+      override async readFile(path: string) {
+        if (operation === 'read' && path === pullPath && this.fail) throw new Error('PR read unavailable')
+        return super.readFile(path)
+      }
+      override async listTree(prefix: string) {
+        if (operation === 'list' && prefix.includes('/pulls/') && this.fail) throw new Error('PR listing unavailable')
+        return super.listTree(prefix)
+      }
+    }
+    const mount = new FailingProbeMount({
+      [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [dependentPath]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
+      [pullPath]: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }),
+    })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    try {
+      expect((await factory.runOnce()).dispatched).toEqual([])
+      expect(factory.status().counters.dependencyPrProbeCacheSkippedErrors).toBe(1)
+      mount.fail = false
+      expect((await factory.runOnce()).dispatched.map((result) => result.issue.key)).toContain('936')
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(2)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('invalidates negative dependency probes when a PR change arrives', async () => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
+    const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 936)
+    const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
+    const mount = new FakeMountClient({
+      [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [dependentPath]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
+    })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      expect(factory.status().parked).toHaveLength(1)
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
+      mount.files.set(pullPath, { content: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }) })
+      mount.emit({ id: 'dependency-pr-merged', path: pullPath, type: 'file.updated' })
+      await vi.waitFor(() => expect(factory.status().counters.dependencyPrProbeCacheInvalidations).toBe(1))
+      await factory.runOnce()
+      expect(factory.status().parked).toEqual([])
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(2)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('shares missing-blocker tree scans across one discovery pass', async () => {
     const firstPath = githubIssuePath('AgentWorkforce', 'pear', 37)
     const secondPath = githubIssuePath('AgentWorkforce', 'pear', 38)
@@ -17436,7 +17547,7 @@ describe('FactoryLoop', () => {
         await vi.waitFor(async () => {
           const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
           expect(heartbeat?.health).toMatchObject({
-            ok: true,
+            ok: false,
             status: 'degraded',
             degradedSubsystems: ['readinessReconcile'],
             readinessReconcile: { state: 'stalled', consecutiveFailures: 0 },

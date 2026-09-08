@@ -391,6 +391,9 @@ const COMPLETION_SWEEP_INTERVAL_MS = 15_000
 const COMPLETION_SWEEP_BATCH_SIZE = 2
 const PREVIEW_SWEEP_INTERVAL_MS = 60_000
 const PROBE_PR_RESOLVED_CACHE_MS = 60_000
+// Negative dependency lookups survive ordinary sweeps. PR events invalidate
+// them immediately; expiry bounds staleness when event delivery is unavailable.
+const DEPENDENCY_PR_PROBE_CACHE_MS = 30 * 60_000
 const PUBLISHED_PR_CONFIRM_ATTEMPTS = 20
 const PUBLISHED_PR_CONFIRM_DELAY_MS = 100
 const SLACK_REPLY_EVENTS_LIMIT = 100
@@ -1070,10 +1073,8 @@ export class FactoryLoop implements Factory {
   // owner/repo#number identity. GitHub-native records outrank Linear mirrors.
   readonly #dependencyIssues = new Map<string, { issue: LinearIssue; rank: number }>()
   readonly #terminalDependencyIdentities = new Set<string>()
-  /** Sweep-scoped memo of `#dependencyIsTerminalOrMerged`'s mount walk, including
-   * the negative answer that `#terminalDependencyIdentities` cannot hold. Cleared
-   * with it at the top of every sweep. */
-  readonly #dependencyPrProbes = new Map<string, boolean>()
+  readonly #dependencyPrProbes = new Map<string, { expiresAtMs: number; issueSignature: string }>()
+  #dependencyPrProbeGeneration = 0
   readonly #dependencyParkNotices = new Map<string, string>()
   #dependencyGithubPathsByIdentity?: Map<string, string>
   #dependencyLinearTreeLoaded = false
@@ -1870,6 +1871,7 @@ export class FactoryLoop implements Factory {
         return
       }
       if (isGithubPullFilePath(path)) {
+        this.#invalidateDependencyPrProbes(path)
         void this.#handlePrChange(path)
         return
       }
@@ -3009,6 +3011,7 @@ export class FactoryLoop implements Factory {
 
   async #handlePreparedLiveChange(path: string): Promise<void> {
     if (isGithubPullFilePath(path)) {
+      this.#invalidateDependencyPrProbes(path)
       await this.#handlePrChange(path)
       return
     }
@@ -3967,7 +3970,9 @@ export class FactoryLoop implements Factory {
       // current provider snapshots (or merged PR metadata) so a reopened issue
       // cannot remain permanently resolved after an earlier close event.
       this.#terminalDependencyIdentities.clear()
-      this.#dependencyPrProbes.clear()
+      for (const [identity, probe] of this.#dependencyPrProbes) {
+        if (probe.expiresAtMs <= startedAtMs) this.#dependencyPrProbes.delete(identity)
+      }
       this.#dependencyGithubPathsByIdentity = undefined
       this.#dependencyLinearTreeLoaded = false
       const issueSource = await this.#issueSource()
@@ -10483,16 +10488,19 @@ export class FactoryLoop implements Factory {
     if (!issue) return false
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     if (!repo) return false
-    // This specialized probe does not go through `#resolveIssuePr`, so it never
-    // saw that method's cache, and `#terminalDependencyIdentities` only ever
-    // memoises the TRUE answer. A dependency that is not merged was
-    // therefore re-walked in full for every issue declaring it, on every sweep;
-    // several issues blocked on one dependency multiplied a single tree walk by
-    // the number of blocked issues. Memoise the negative answer too, on exactly
-    // the lifetime of the terminal set beside it: cleared at the top of each
-    // sweep, so a PR that merges between sweeps is still observed.
+    // Reusing a negative answer is safe only for the same issue snapshot.
+    // A PR change invalidates the repository below, and the expiry covers
+    // polling-only callers or missed events. Never extend expiry on a hit.
+    const issueSignature = stableHash(JSON.stringify(issue))
     const memoized = this.#dependencyPrProbes.get(identity)
-    if (memoized !== undefined) return memoized
+    if (memoized && memoized.expiresAtMs > this.#clock.now() && memoized.issueSignature === issueSignature) {
+      this.#increment('dependencyPrProbeCacheHits')
+      return false
+    }
+    this.#dependencyPrProbes.delete(identity)
+    const generation = this.#dependencyPrProbeGeneration
+    let lookupFailed = false
+    this.#increment('dependencyPrProbeCacheMisses')
     const pullRequest = await resolveIssuePrFromMount(
       this.#mount,
       this.#config,
@@ -10502,10 +10510,21 @@ export class FactoryLoop implements Factory {
         repo,
       },
       (prefix) => this.#listRelayfileTree(prefix, 'dependency PR probe resolution'),
-      this.#probeMountWalkProgress('[factory] dependency PR probe mount read progress', issue),
+      {
+        ...this.#probeMountWalkProgress('[factory] dependency PR probe mount read progress', issue),
+        onLookupError: () => { lookupFailed = true },
+      },
     )
     if (normalizePrState(pullRequest?.state) !== 'MERGED') {
-      this.#dependencyPrProbes.set(identity, false)
+      if (lookupFailed) this.#increment('dependencyPrProbeCacheSkippedErrors')
+      // An event received during the walk must not be overwritten by its
+      // older negative result when the walk eventually settles.
+      if (!lookupFailed && generation === this.#dependencyPrProbeGeneration) {
+        this.#dependencyPrProbes.set(identity, {
+          expiresAtMs: this.#clock.now() + DEPENDENCY_PR_PROBE_CACHE_MS,
+          issueSignature,
+        })
+      }
       return false
     }
     this.#terminalDependencyIdentities.add(identity)
@@ -17083,6 +17102,20 @@ export class FactoryLoop implements Factory {
     this.#logger.warn?.('[factory] babysitter could not read PR snapshot', detail)
   }
 
+  #invalidateDependencyPrProbes(path: string): void {
+    const repoParts = githubRepoPathParts(path)
+    if (repoParts) {
+      const prefix = `${repoParts.owner}/${repoParts.repo}#`.toLowerCase()
+      this.#dependencyPrProbeGeneration += 1
+      for (const identity of this.#dependencyPrProbes.keys()) {
+        if (identity.startsWith(prefix)) {
+          this.#dependencyPrProbes.delete(identity)
+          this.#increment('dependencyPrProbeCacheInvalidations')
+        }
+      }
+    }
+  }
+
   async #handlePrChange(path: string): Promise<void> {
     const parts = githubPullPathParts(path)
     if (!parts) {
@@ -23154,6 +23187,7 @@ const PROBE_PR_INDEX_FALLBACK_COUNTERS: Record<PullIndexFallbackReason, string> 
 }
 
 type ProbeMountWalkObserver = {
+  onLookupError?: () => void
   onRead?: (progress: { read: number; total: number; path: string }) => void
   onIndexFallback?: (repo: string, reason: PullIndexFallbackReason) => void
   onIndexHit?: (repo: string, prNumber: number) => void
@@ -23388,7 +23422,7 @@ const resolveProbePrFromPullIndex = async (
   const path = walk.find((candidatePath) => githubPullPathParts(candidatePath)?.number === best.number)
   if (!path) return { reason: 'index-disagreed' }
 
-  const pr = await readProbePrCandidate(mount, path)
+  const pr = await readProbePrCandidate(mount, path, observer.onLookupError)
   observer.onRead?.({ read: 1, total: 1, path })
   if (!pr) return { reason: 'index-disagreed' }
   if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') return { reason: 'index-disagreed' }
@@ -23431,6 +23465,7 @@ export const resolveIssuePrFromMount = async (
         for (const path of await listTree(root)) paths.add(path)
       } catch (error) {
         if (isPassWideRelayfileFault(error)) throw error
+        observer.onLookupError?.()
         listErrors.push(error)
       }
     }
@@ -23490,7 +23525,7 @@ export const resolveIssuePrFromMount = async (
 
     let read = 0
     for (const path of walk) {
-      const pr = await readProbePrCandidate(mount, path)
+      const pr = await readProbePrCandidate(mount, path, observer.onLookupError)
       read += 1
       observer.onRead?.({ read, total: walk.length, path })
       if (opts.openOnly && normalizePrState(pr?.state) !== 'OPEN') continue
@@ -23605,6 +23640,7 @@ const githubPullRoots = (repo: string): string[] => {
 const readProbePrCandidate = async (
   mount: MountClient,
   path: string,
+  onLookupError?: () => void,
 ): Promise<{
   number: number
   title: string
@@ -23640,6 +23676,7 @@ const readProbePrCandidate = async (
       url: stringValue(payload.url) ?? stringValue(payload.html_url),
     }
   } catch {
+    onLookupError?.()
     return undefined
   }
 }

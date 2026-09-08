@@ -596,13 +596,13 @@ describe('publicHealthFromHeartbeat (#295)', () => {
   // The observed 2026-08-20 case: every state string reads green while the
   // sweep that started at 11:16:35Z has neither completed nor failed. The
   // relative order of the two timestamps is the entire signal.
-  it('derives stalled from lastStarted > lastCompleted past the stall threshold', () => {
+  it.each([0, 1])('clears ok for stalled discovery with %i completed failures', (consecutiveFailures) => {
     const startedAtMs = BOOT_MS - 77 * 60_000
     const health = publicHealthFromHeartbeat(
       heartbeat({
         readinessReconcile: {
-          state: 'healthy',
-          consecutiveFailures: 0,
+          state: consecutiveFailures ? 'retrying' : 'healthy',
+          consecutiveFailures,
           failureThreshold: 3,
           intervalMs: 60_000,
           lastStartedAtMs: startedAtMs,
@@ -617,8 +617,42 @@ describe('publicHealthFromHeartbeat (#295)', () => {
       inFlightMs: 77 * 60_000,
       missedPasses: 77,
     })
+    expect(health.ok).toBe(false)
     expect(health.status).toBe('degraded')
+    expect(normalizePublicHealth(health)?.ok).toBe(false)
     expect(health.degradedSubsystems).toEqual(['readinessReconcile'])
+  })
+
+  it('normalizes a legacy stalled record without preserving its contradictory ok bit', () => {
+    expect(normalizePublicHealth({
+      ok: true,
+      status: 'ok',
+      stale: false,
+      degradedSubsystems: [],
+      readinessReconcile: { state: 'stalled', consecutiveFailures: 1, failureThreshold: 3 },
+    })).toMatchObject({
+      ok: false,
+      status: 'degraded',
+      degradedSubsystems: ['readinessReconcile'],
+    })
+  })
+
+  it('restores ok when discovery completes after a stall', () => {
+    const snapshot = heartbeat({
+      readinessReconcile: {
+        state: 'retrying', consecutiveFailures: 1, failureThreshold: 3,
+        intervalMs: 60_000, lastStartedAtMs: BOOT_MS - 77 * 60_000,
+        lastCompletedAtMs: BOOT_MS - 78 * 60_000,
+      },
+    })
+    expect(publicHealthFromHeartbeat(snapshot, { nowMs: BOOT_MS }).ok).toBe(false)
+    snapshot.readinessReconcile = {
+      ...snapshot.readinessReconcile!, state: 'healthy', consecutiveFailures: 0,
+      lastCompletedAtMs: BOOT_MS,
+    }
+    expect(publicHealthFromHeartbeat(snapshot, { nowMs: BOOT_MS })).toMatchObject({
+      ok: true, status: 'ok', degradedSubsystems: [],
+    })
   })
 
   it('does not call a pass in flight for less than the stall threshold stalled', () => {
