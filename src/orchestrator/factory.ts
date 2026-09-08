@@ -15427,6 +15427,18 @@ export class FactoryLoop implements Factory {
     request: GithubHumanInputRequest,
   ): Promise<void> {
     this.#increment('githubAgentQuestionsReceived')
+    // A worker can post its question and exit before the remaining spawn
+    // acknowledgements or the dispatch claim return. Let dispatch finish
+    // owning those mutations before snapshotting/releasing the team; otherwise
+    // its late acknowledgements can resurrect a parked record and overwrite
+    // waiting-for-human with running. The per-issue comment queue also keeps
+    // an answer behind this question while the exit replay waits for it.
+    const dispatchClaim = this.#postSpawnDispatchClaimFences.get(dispatchLifecycleKey(watch.issue))
+    if (dispatchClaim && !await dispatchClaim.settled) {
+      // Leave the comment unprocessed so recovery can replay it. Returning
+      // normally would acknowledge and permanently discard the question.
+      throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
+    }
     const record = (await this.#batch()).getIssue(watch.issue)
     if (!record || record.dryRun || request.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {
       this.#increment('githubAgentQuestionsIgnoredNoInFlight')

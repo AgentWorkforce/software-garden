@@ -26468,6 +26468,116 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it.each([
+    ['local', 'impl'], ['local', 'review'], ['remote', 'impl'], ['remote', 'review'],
+  ] as const)('parks a question before the %s %s spawn acknowledgement and wakes the entire team on answer', async (locality, blockedRole) => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 490)
+    const issue = githubIssueFile(490, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = locality === 'remote' ? new RemoteLifecycleFleetClient() : new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet, stateStore, githubWriteback, triage: new StaticTriage(),
+    })
+    const spawn = fleet.spawn.bind(fleet)
+    let releaseSpawn!: () => void
+    const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve })
+    let spawnStarted!: () => void
+    const spawnStarting = new Promise<void>((resolve) => { spawnStarted = resolve })
+    vi.spyOn(fleet, 'spawn').mockImplementation(async (input) => {
+      const result = await spawn(input)
+      if (input.name === `ar-490-${blockedRole}-pear` && fleet.spawns.length <= 2) {
+        spawnStarted()
+        await spawnGate
+      }
+      return result
+    })
+
+    const dispatch = factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    try {
+      await spawnStarting
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 490, 94901, {
+        body: '### Software Garden human input request\nAgent: ar-490-impl-pear\nIssue: 490\nQuestion: Which retry helper should I use?',
+        author: { login: 'garden-operator', type: 'User' },
+        author_association: 'MEMBER',
+      })
+      fleet.emitAgentExit('ar-490-impl-pear', 'completed')
+      await flush()
+      await flush()
+      // Dispatch still owns placements and its provider claim. Parking cannot
+      // snapshot a partial team or race that claim back into in-progress.
+      expect(fleet.releases).toEqual([])
+      releaseSpawn()
+      await dispatch
+      mount.files.set(path, { content: githubIssueFile(490, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+      await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+      expect(factory.status().inFlight).toEqual([])
+      expect(fleet.releases).toEqual([
+        { name: 'ar-490-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-490-review-pear', reason: 'waiting-for-human' },
+      ])
+      expect((await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]).toMatchObject({
+        questionSource: 'github', parkedAtMs: expect.any(Number),
+      })
+      if (locality === 'remote') {
+        expect((await stateStore.listDispatchLifecycles('factory-test'))[0]?.[1]?.phase).toBe('waiting-for-human')
+      }
+      const spawnCount = fleet.spawns.length
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 490, 94902, {
+        body: 'Use the shared retry helper.', author: { login: 'reporter' },
+      })
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+      const restarted = fleet.spawns.slice(spawnCount)
+      expect(restarted.map(({ name }) => name).sort()).toEqual(['ar-490-impl-pear', 'ar-490-review-pear'])
+      for (const agent of restarted) {
+        expect(agent.task).toContain('Which retry helper should I use?')
+        expect(agent.task).toContain('Use the shared retry helper.')
+      }
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    } finally {
+      releaseSpawn()
+      await dispatch.catch(() => undefined)
+      await factory.stop()
+    }
+  })
+
+  it('leaves an early question replayable when its dispatch fails', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 491)
+    const issue = githubIssueFile(491, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet, stateStore, triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    let rejectSpawn!: (error: Error) => void
+    const spawnGate = new Promise<SpawnResult>((_resolve, reject) => { rejectSpawn = reject })
+    vi.spyOn(fleet, 'spawn').mockImplementation(() => spawnGate)
+    const dispatch = factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    const rejected = expect(dispatch).rejects.toThrow('placement acknowledgement failed')
+    try {
+      await vi.waitFor(() => expect(fleet.spawn).toHaveBeenCalledOnce())
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 491, 94911, {
+        body: '### Software Garden human input request\nAgent: ar-491-impl-pear\nIssue: 491\nQuestion: Which helper?',
+        author: { login: 'factory-agent[bot]', type: 'Bot' },
+      })
+      await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsReceived).toBe(1))
+      rejectSpawn(new Error('placement acknowledgement failed'))
+      await rejected
+      await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBe(1))
+      const watch = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+      expect(watch).toBeDefined()
+      expect(watch?.processedCommentIds).not.toContain('94911')
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    } finally {
+      rejectSpawn(new Error('placement acknowledgement failed'))
+      await dispatch.catch(() => undefined)
+      await factory.stop()
+    }
+  })
+
   it('detects a durable source-issue question and returns the answer only through fresh spawn tasks', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 59)
     const issue = githubIssueFile(59, { labels: ['factory'], author: 'reporter' })
