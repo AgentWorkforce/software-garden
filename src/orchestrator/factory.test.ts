@@ -36514,6 +36514,65 @@ describe('work-item dispatch capacity (#491)', () => {
     } finally { await factory.stop() }
   })
 
+  it.each(['shed', 'missing', 'malformed', 'failed'] as const)(
+    'reports incomplete candidate reads separately when a read is %s', async (failure) => {
+      const path = issuePath(498)
+      const mount = new FakeMountClient({ [path]: issueFile(498) })
+      const readFile = mount.readFile.bind(mount)
+      let failRead = true
+      vi.spyOn(mount, 'readFile').mockImplementation(async (candidate) => {
+        if (candidate === path && failRead) {
+          if (failure === 'shed') throw Object.assign(new Error('workspace durable object is busy'), {
+            status: 429, details: { reason: 'inflight_limit', retryAfterSeconds: 1 },
+          })
+          if (failure === 'missing') throw Object.assign(new Error('file not found'), { status: 404 })
+          if (failure === 'failed') throw new Error('issue read failed')
+          return { content: '{invalid json' }
+        }
+        return readFile(candidate)
+      })
+      const factory = createFactory(config(), {
+        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), clock: new ManualClock(),
+      })
+      try {
+        if (failure === 'shed') await expect(factory.runOnce()).rejects.toThrow('workspace durable object is busy')
+        else await factory.runOnce()
+        expect(factory.status().dispatchCapacity).toMatchObject({
+          candidateSweeps: 0, incompleteCandidateSweeps: 1, noCandidateSweeps: 0, candidatesFound: 0,
+        })
+        expect(factory.status().counters.dispatchIncompleteCandidateSweeps).toBe(1)
+        // A subsequent fully read, non-ready issue is an honest empty result.
+        failRead = false
+        mount.files.set(path, { content: issueFile(498, done) })
+        await factory.runOnce()
+        expect(factory.status().dispatchCapacity).toMatchObject({
+          candidateSweeps: 1, incompleteCandidateSweeps: 1, noCandidateSweeps: 1, candidatesFound: 0,
+        })
+      } finally { await factory.stop() }
+    },
+  )
+
+  it('keeps successfully read candidates when a sibling read is shed', async () => {
+    const mount = new FakeMountClient({ [issuePath(498)]: issueFile(498), [issuePath(499)]: issueFile(499) })
+    const readFile = mount.readFile.bind(mount)
+    vi.spyOn(mount, 'readFile').mockImplementation(async (path) => {
+      if (path === issuePath(499)) throw Object.assign(new Error('workspace durable object is busy'), {
+        status: 429, details: { reason: 'inflight_limit', retryAfterSeconds: 1 },
+      })
+      return readFile(path)
+    })
+    const factory = createFactory(config(), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), clock: new ManualClock(),
+    })
+    try {
+      const result = await factory.runOnce()
+      expect(result.dispatched.map(({ issue }) => issue.key)).toContain('AR-498')
+      expect(factory.status().dispatchCapacity).toMatchObject({
+        candidateSweeps: 0, incompleteCandidateSweeps: 1, noCandidateSweeps: 0, candidatesFound: 1,
+      })
+    } finally { await factory.stop() }
+  })
+
   it('publishes candidates while triage has not yet enumerated them into the capacity queue', async () => {
     const triaging = Promise.withResolvers<void>()
     const continueTriage = Promise.withResolvers<void>()

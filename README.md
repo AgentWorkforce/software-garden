@@ -825,7 +825,11 @@ three measure discovery of ready, in-scope work; the last counts capacity-denied
 admissions, including direct/event dispatch, without counting retry polls.
 Compare counter deltas: no-candidate sweeps indicate empty discovery, while
 capacity denials indicate work blocked on slots even before `waiting` updates.
-Zero candidate sweeps means discovery has not completed a measurement yet.
+`incompleteCandidateSweeps` counts sweeps with any shed, missing, malformed, or
+failed candidate read, including sweeps aborted during a read. Those sweeps do
+not increment `candidateSweeps` or `noCandidateSweeps`; successfully read
+candidates still contribute to `candidatesFound` and can dispatch. Zero
+candidate sweeps means discovery has not completed a full measurement yet.
 
 ### Recover names created before dispatch identity proofs
 

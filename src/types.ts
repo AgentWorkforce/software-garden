@@ -557,7 +557,9 @@ export interface FactoryDispatchSlotOccupant {
 export interface FactoryDispatchCapacityStatus {
   /** Cumulative completed candidate enumerations; zero means not measured yet. */
   candidateSweeps?: number
-  /** Cumulative enumerations with no ready, in-scope, dispatchable candidates. */
+  /** Cumulative sweeps with at least one unreadable candidate path. */
+  incompleteCandidateSweeps?: number
+  /** Cumulative fully read enumerations with no ready, in-scope, dispatchable candidates. */
   noCandidateSweeps?: number
   /** Cumulative ready candidates observed, including repeats across sweeps. */
   candidatesFound?: number
@@ -591,7 +593,9 @@ export interface FactoryDispatchCapacityStatus {
 export interface FactoryPublicDispatchCapacityHealth {
   /** Cumulative completed candidate enumerations; zero means not measured yet. */
   candidateSweeps?: number
-  /** Cumulative enumerations with no ready, in-scope, dispatchable candidates. */
+  /** Cumulative sweeps with at least one unreadable candidate path. */
+  incompleteCandidateSweeps?: number
+  /** Cumulative fully read enumerations with no ready, in-scope, dispatchable candidates. */
   noCandidateSweeps?: number
   /** Cumulative ready candidates observed, including repeats across sweeps. */
   candidatesFound?: number

@@ -58,7 +58,7 @@ describe('dispatch capacity health (#303)', () => {
   })
 
   it('publishes candidate observations independently of the retry queue (#491)', () => {
-    const observations = { candidateSweeps: 3, noCandidateSweeps: 1, candidatesFound: 4, candidatesWithoutSlot: 2 }
+    const observations = { incompleteCandidateSweeps: 2, candidateSweeps: 3, noCandidateSweeps: 1, candidatesFound: 4, candidatesWithoutSlot: 2 }
     const health = publicHealthFromHeartbeat(capacity({
       ...observations, waiting: 0, occupants: [], longestWaitMs: undefined,
     }), { nowMs: BOOT_MS })

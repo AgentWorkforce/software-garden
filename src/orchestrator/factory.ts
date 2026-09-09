@@ -4015,6 +4015,7 @@ export class FactoryLoop implements Factory {
       let readyIssueReads = 0
 
       let candidateCount = 0
+      let candidateReadsIncomplete = false
       const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
         // A between-await check, worth exactly what #368 said such a check is
@@ -4054,6 +4055,14 @@ export class FactoryLoop implements Factory {
             reason: perItemDispatchSkipReason(error),
             code: 'read-failed',
           })
+        } finally {
+          // Shed, missing, malformed, and failed reads cannot establish that
+          // discovery is empty. Count the sweep once, even if the fuse aborts
+          // it, while retaining candidates successfully read from other paths.
+          if (!issue && !candidateReadsIncomplete) {
+            candidateReadsIncomplete = true
+            this.#increment('dispatchIncompleteCandidateSweeps')
+          }
         }
         readyIssueReads += 1
         // Relayfile served this work unit's read: the dependency is shedding
@@ -4090,7 +4099,7 @@ export class FactoryLoop implements Factory {
         }
         await this.#refreshLiveHeartbeatIfDue()
       }
-      if (!this.#discoverySweepDiscoveryFailed) {
+      if (!this.#discoverySweepDiscoveryFailed && !candidateReadsIncomplete) {
         this.#increment('dispatchCandidateSweeps')
         if (candidateCount === 0) this.#increment('dispatchNoCandidateSweeps')
       }
@@ -8204,6 +8213,7 @@ export class FactoryLoop implements Factory {
       waiting: waits.length,
       candidateSweeps: this.#counters.dispatchCandidateSweeps ?? 0,
       noCandidateSweeps: this.#counters.dispatchNoCandidateSweeps ?? 0,
+      incompleteCandidateSweeps: this.#counters.dispatchIncompleteCandidateSweeps ?? 0,
       candidatesFound: this.#counters.dispatchCandidatesFound ?? 0,
       candidatesWithoutSlot: this.#counters.dispatchCandidatesWithoutSlot ?? 0,
       waitWarnMs: this.#config.dispatch.capacityWaitWarnMs,

@@ -721,7 +721,7 @@ function publicOccupants(
 }
 
 const candidateCounters = (value: Record<string, unknown>): Record<string, number> =>
-  Object.fromEntries(['candidateSweeps', 'noCandidateSweeps', 'candidatesFound', 'candidatesWithoutSlot']
+  Object.fromEntries(['candidateSweeps', 'incompleteCandidateSweeps', 'noCandidateSweeps', 'candidatesFound', 'candidatesWithoutSlot']
     .filter((key) => finiteNumber(value[key]) !== undefined)
     .map((key) => [key, counter(value[key])]))
 
