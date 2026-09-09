@@ -100,7 +100,7 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   // Identity, not health (#446). It rides here because `health` is the one
   // part of the heartbeat the container passes through to /healthz verbatim.
   "build": { "version": "0.1.86", "commit": "23e97ca…4979" },
-  "ok": true,                       // process liveness — see below
+  "ok": false,                      // stalled discovery is unhealthy
   "status": "degraded",             // the amber
   "stale": false,
   "updatedAtMs": 1787229155805,
@@ -231,9 +231,9 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   Per-call bounds can be far tighter precisely because that cold-mirror cost is spread across
   thousands of calls rather than concentrated in one.
 
-  A `stalled` state that never turns into a rising `consecutiveFailures` means either the process is
-  not running the loop at all, or it predates #351 — on a current build a hung call fails within
-  `relayfileOperationTimeoutMs`.
+  A `stalled` sweep can still have a low `consecutiveFailures` count: individual calls may
+  return while the full pass remains in flight. The stalled state already clears `ok`; health
+  consumers need not wait for a per-call timeout or the whole-sweep deadline to increment failures.
 
 - **`treeReads` / `emptyTreeReads`** — the case a timeout cannot catch. A mount that starts serving
   *empty* trees instead of hanging raises no timeout, no failure and no `lastError`: the sweep
@@ -256,22 +256,42 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
   empty — masking the fault. So a sweep whose roots all came from the discovery cache reports
   `treeReads: 0`, which claims nothing in either direction.
 
-### Why `ok` stays `true` while `status` goes amber
+### How discovery health reaches `ok`
 
-`/healthz` is the Cloudflare **Container ping endpoint** (`pingEndpoint = 'localhost/healthz'` in the
-Worker). A non-200 there is a liveness verdict the platform acts on: it recycles the container. That
-would destroy the in-memory evidence of the wedge and restart the cold-start hydration — turning a
-diagnosable degradation into a restart loop that also erases its own cause.
+Startup and periodic sweep failures retain their cause in authenticated
+`readinessReconcile.lastError` and its persisted heartbeat record. Rejections with no message
+record `Discovery sweep failed without an error message`; a successful periodic pass clears the
+previous error. The public health block exposes only `lastErrorClass`, so reading `lastError`
+from that redacted block does not establish whether the authenticated cause was recorded.
 
-So the two questions are split:
+`ok` requires a live process and discovery that is not `stalled`. The existing readiness state
+machine supplies that verdict; a hung sweep need not return or increment `consecutiveFailures`
+first. A fresh heartbeat, free dispatch capacity, or zero waiting issues cannot override it.
+`status` remains `degraded` so the known stall retains its diagnosis. When discovery recovers,
+`ok` becomes true again. Other transient subsystem degradations retain their existing semantics.
 
-- `ok` — *is this process alive?* Unchanged semantics, safe to keep driving the ping and the HTTP
-  status code.
-- `status` (`ok` / `degraded` / `unknown`) and `degradedSubsystems` — *is dispatch gated?* No platform
-  reads these, so a monitor can alert on `status != "ok"` with no lifecycle side effect.
+The container must expose `heartbeat.health.ok` as discovery readiness. It must keep automatic
+restart decisions on a separate process-liveness signal, such as `checkFactoryLoopLiveness`:
+a legitimate cold-mirror hydration can exceed the stall interval. Wiring discovery readiness
+directly to a recycling ping endpoint would restart that work before it can finish and discard
+its in-memory diagnostics. Container consumers must separate those signals before rollout.
+Live container preflight must also avoid running a complete discovery workload before starting the
+loop: `status` verifies the host/backend, while the live loop performs discovery and reports progress.
 
-A liveness endpoint that cannot go amber is not much of a signal — this one goes amber in a field
-that cannot restart the box.
+### Dependency PR lookup cache
+
+An open dependency with no merged PR retains its negative PR lookup for 30 minutes across sweeps.
+PR change events invalidate cached dependencies for that repository, and changed PR-matching inputs
+(repository, issue key, or legacy branch identity) require a fresh lookup. Timestamp, comment, and
+reaction updates retain the cached answer. Cache hits do not extend expiry, so missed events can delay recognition
+of a merge by at most the remaining cache lifetime plus the next sweep. Closed dependencies still
+resolve directly from their current issue state.
+
+Authenticated counters `dependencyPrProbeCacheHits`, `dependencyPrProbeCacheMisses`, and
+`dependencyPrProbeCacheInvalidations` describe cache activity. `dependencyPrProbeCacheSkippedErrors`
+counts failed lookups whose negative answers were not retained. `probePrMountReads` counts actual
+PR records read: repeated unresolved-dependency sweeps should increase hits without increasing
+that read count. The first lookup and expired or invalidated lookups can still fall back to a full walk.
 
 ## What never crosses
 

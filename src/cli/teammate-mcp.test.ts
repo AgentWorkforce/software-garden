@@ -1,12 +1,20 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { FakeFleetClient } from '../testing/fakes'
 import { createFactoryTeammateMcpServer } from './teammate-mcp'
 
 describe('Factory teammate MCP', () => {
+  afterEach(() => vi.restoreAllMocks())
+
   it('exposes discover and bounded ask to the spawned worker through its injected MCP server', async () => {
+    // Relay augments successful tool results with an authenticated inbox fetch,
+    // even with skipBootstrap and an injected fleet. Keep that boundary local.
+    const inboxFetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({
+      ok: true,
+      data: { unreadChannels: [], mentions: [], unreadDms: [], recentReactions: [] },
+    }), { headers: { 'content-type': 'application/json' } }))
     const fleet = new FakeFleetClient()
     fleet.teammates.push({
       name: 'infra-agent',
@@ -72,13 +80,17 @@ describe('Factory teammate MCP', () => {
         to: 'infra-agent',
         text: 'Why is the deployment stuck?',
       })])
+      expect(inboxFetch).toHaveBeenCalledTimes(2)
+      for (const [url, init] of inboxFetch.mock.calls) {
+        expect(new URL(String(url)).pathname).toBe('/v1/inbox')
+        expect(new Headers(init?.headers).get('authorization')).toBe('Bearer at_live_test')
+      }
     } finally {
       await client.close()
       await server.close()
     }
-  // The MCP handshake registers the whole tool surface, which is CPU-bound:
-  // ~400ms quiet, but measured at 3.5s under CPU oversubscription. Vitest's
-  // 5s default leaves no headroom on a loaded CI runner.
+    // Preserve headroom for the full MCP handshake on a loaded CI runner;
+    // inbox HTTP requests are isolated above rather than covered by this budget.
   }, 15_000)
 })
 

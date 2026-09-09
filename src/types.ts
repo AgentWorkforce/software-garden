@@ -731,10 +731,10 @@ export interface FactoryPublicBuildIdentity {
 /**
  * The unauthenticated health record (#295).
  *
- * `ok` is process liveness — the question the container ping endpoint asks,
- * and the only one whose answer may recycle a container. `status` is the
- * amber: dispatch-gating degradation that an operator or monitor must see,
- * carried where no platform will act on it.
+ * `ok` requires a live process and discovery that is not stalled. `status`
+ * also exposes transient dispatch-gating degradations to operators.
+ * This is readiness, not an automatic restart predicate: use the separate
+ * `checkFactoryLoopLiveness` signal for process liveness during hydration.
  */
 export interface FactoryPublicHealth {
   schemaVersion: number
