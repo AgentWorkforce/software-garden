@@ -15335,12 +15335,32 @@ export class FactoryLoop implements Factory {
       ? parseGithubHumanInputRequest(comment.body)
       : undefined
     if (request) {
-      await this.#handleGithubAgentQuestionComment(watch, comment, request)
+      try {
+        await this.#handleGithubAgentQuestionComment(watch, comment, request)
+      } catch (error) {
+        if (error instanceof PostSpawnDispatchWaitRejectedError) {
+          watch.deferredQuestionCommentIds = [...new Set([
+            ...(watch.deferredQuestionCommentIds ?? []), normalizedCommentId,
+          ])]
+          await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+        }
+        throw error
+      }
+      watch.deferredQuestionCommentIds = watch.deferredQuestionCommentIds?.filter((id) => id !== normalizedCommentId)
+      if (!watch.deferredQuestionCommentIds?.length) delete watch.deferredQuestionCommentIds
       processedCommentIds.add(normalizedCommentId)
       watch.processedCommentIds = [...processedCommentIds]
       watch.lastSeenCommentId = String(Math.max(commentId, githubCommentNumericId(watch.lastSeenCommentId)))
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
       return
+    }
+
+    // A rejected question has not created its pending clarification yet.
+    // Keep later replies unprocessed so chronological replay can first park
+    // the recovered team, then apply the answer. Persisting the marker also
+    // preserves this ordering across watcher re-arm and process restart.
+    if (watch.deferredQuestionCommentIds?.some((id) => githubCommentNumericId(id) < commentId)) {
+      throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
     }
 
     const reply = githubCorrelatedReply(comment.body)
@@ -15464,7 +15484,8 @@ export class FactoryLoop implements Factory {
       throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
     }
     const record = (await this.#batch()).getIssue(watch.issue)
-    if (record && this.#questionRejectedDispatches.has(record)) {
+    if ((record && this.#questionRejectedDispatches.has(record))
+      || (!record && watch.deferredQuestionCommentIds?.includes(comment.commentId))) {
       throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
     }
     if (!record || record.dryRun || request.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {

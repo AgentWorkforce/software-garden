@@ -1119,7 +1119,7 @@ describe('FileStateStore', () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-'))
     try {
       const watchStatePath = join(root, 'github-watches.json')
-      const watch = githubWatch(55)
+      const watch = { ...githubWatch(55), deferredQuestionCommentIds: ['9001'] }
       const first = new FileStateStore({ batchSize: 2, watchStatePath })
       await first.setGithubIssueCommentWatch('workspace-1', 'agentworkforce/factory#55', watch)
 

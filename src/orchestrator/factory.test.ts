@@ -26589,7 +26589,8 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('leaves an early question replayable when its dispatch fails', async () => {
+  it.each(['before failure', 'during backoff', 'after retry'] as const)(
+    'replays a rejected question and an answer arriving %s', async (answerTiming) => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 491)
     const issue = githubIssueFile(491, { labels: ['factory'], author: 'reporter' })
     const mount = new FakeMountClient({ [path]: issue })
@@ -26612,31 +26613,41 @@ describe('FactoryLoop', () => {
         author: { login: 'factory-agent[bot]', type: 'Bot' },
       })
       await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsReceived).toBe(1))
+      const answer = () => emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 491, 94912, {
+        body: 'Use the shared helper.', author: { login: 'reporter' },
+      })
+      if (answerTiming === 'before failure') answer()
       rejectSpawn(new Error('placement acknowledgement failed'))
       await rejected
-      await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBe(1))
+      await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBeGreaterThanOrEqual(1))
       const watch = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
       expect(watch).toBeDefined()
       expect(watch?.processedCommentIds).not.toContain('94911')
       expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
 
+      if (answerTiming === 'during backoff') answer()
+      if (answerTiming !== 'after retry') {
+        await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBe(2))
+        const deferred = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+        expect(deferred?.processedCommentIds).not.toContain('94912')
+      }
       clock.advance(60_000)
       vi.mocked(fleet.spawn).mockRestore()
       await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+      mount.files.set(path, { content: githubIssueFile(491, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
       // Retry must replay the persisted question without another comment or
       // agent-exit event. Its later human answer then has a pending question.
       await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
-      expect(factory.status().inFlight).toEqual([])
+      if (answerTiming === 'after retry') expect(factory.status().inFlight).toEqual([])
       expect(fleet.releases).toEqual([
         { name: 'ar-491-impl-pear', reason: 'waiting-for-human' },
         { name: 'ar-491-review-pear', reason: 'waiting-for-human' },
       ])
-      mount.files.set(path, { content: githubIssueFile(491, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
-      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 491, 94912, {
-        body: 'Use the shared helper.', author: { login: 'reporter' },
-      })
+      if (answerTiming === 'after retry') answer()
       await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
       expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+      const replayed = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+      expect(replayed?.processedCommentIds).toEqual(expect.arrayContaining(['94911', '94912']))
     } finally {
       rejectSpawn(new Error('placement acknowledgement failed'))
       await dispatch.catch(() => undefined)
