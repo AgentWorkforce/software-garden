@@ -870,6 +870,23 @@ describe('publicHealthFromHeartbeat (#295)', () => {
     expect(health.fleetControlPlane).toMatchObject({ state: 'closed' })
   })
 
+  it.each(['roster-fresh', 'roster-stale-but-usable', 'no-roster'] as const)(
+    'publishes %s and bounded roster age through health normalization', (rosterState) => {
+      const health = publicHealthFromHeartbeat(heartbeat({
+        fleetControlPlane: {
+          state: rosterState === 'no-roster' ? 'open' : 'closed',
+          consecutiveFailures: 0, timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000,
+          rosterState, rosterAgeMs: 60_000, rosterCacheTtlMs: 300_000,
+          lastError: 'private transport detail',
+        },
+      }), { nowMs: BOOT_MS })
+      expect(health.fleetControlPlane).toMatchObject({ rosterState, rosterAgeMs: 60_000, rosterCacheTtlMs: 300_000 })
+      expect(normalizePublicHealth(health)?.fleetControlPlane).toEqual(health.fleetControlPlane)
+      expect(JSON.stringify(health)).not.toContain('private transport detail')
+      expect(health.degradedSubsystems.includes('fleetControlPlane')).toBe(rosterState === 'no-roster')
+    },
+  )
+
   // Review follow-up on #300 (P2, cubic). A zero cadence made every in-flight
   // pass instantly stalled and `missedPasses` Infinity, which JSON renders as
   // null — a broken record about a working sweep.

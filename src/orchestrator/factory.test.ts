@@ -140,6 +140,62 @@ describe('fleet control-plane admission', () => {
     }
   }
 
+  it.each(['local', 'remote'] as const)('keeps %s dispatch running through a slow roster and publishes stale versus unavailable', async (locality) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    try {
+      const mount = new FakeMountClient()
+      class RosterFleet extends FakeFleetClient {
+        override readonly placementLocality = locality
+        override async spawn(input: SpawnInput): Promise<SpawnResult> {
+          return { ...await super.spawn(input), node: input.node, locality }
+        }
+        // Registration must still prove the newly placed identity; cached
+        // pre-spawn absence cannot answer that separate question.
+        async isAgentRegistered(input: { name: string; node: string }): Promise<boolean> {
+          return this.spawns.some((spawn) => spawn.name === input.name && spawn.node === input.node)
+        }
+        override async roster(): Promise<RosterEntry> {
+          return { agents: [], nodes: [{ name: 'cached-node', live: true, capabilities: ['spawn:codex', 'spawn:claude'] }] }
+        }
+      }
+      const fleet = new RosterFleet()
+      const read = vi.spyOn(fleet, 'roster')
+      const warn = vi.fn()
+      const factory = createFactory(config({
+        fleetHealth: { rosterTimeoutMs: 100, rosterCacheTtlMs: 1_000, failureThreshold: 1 },
+      }), { mount, fleet, triage: new StaticTriage(), logger: { warn } })
+      await factory.runOnce()
+      expect(factory.status().fleetControlPlane).toMatchObject({ rosterState: 'roster-fresh', rosterAgeMs: 0 })
+      expect(factory.status().counters.fleetRosterFresh).toBe(1)
+
+      mount.files.set(issuePath(993), { content: issueFile(993) })
+      read.mockImplementation(() => new Promise(() => undefined))
+      const sweep = factory.runOnce()
+      await vi.advanceTimersByTimeAsync(100)
+      const report = await sweep
+      expect(report.dispatched).toHaveLength(1)
+      expect(fleet.spawns.length).toBeGreaterThan(0)
+      if (locality === 'remote') expect(fleet.spawns.every((spawn) => spawn.node === 'cached-node')).toBe(true)
+      expect(factory.status().fleetControlPlane).toMatchObject({
+        state: 'closed', rosterState: 'roster-stale-but-usable', rosterAgeMs: 100, rosterCacheTtlMs: 1_000,
+      })
+      expect(factory.status().counters.fleetRosterStaleButUsable).toBeGreaterThan(0)
+      expect(warn).toHaveBeenCalledWith('[factory] dispatch using stale fleet roster', expect.objectContaining({ rosterAgeMs: 100 }))
+
+      const spawned = fleet.spawns.length
+      vi.setSystemTime(11_000)
+      const stopped = expect(factory.runOnce()).rejects.toThrow('fleet control plane is unavailable')
+      await vi.advanceTimersByTimeAsync(100)
+      await stopped
+      expect(fleet.spawns).toHaveLength(spawned)
+      expect(factory.status().fleetControlPlane).toMatchObject({ state: 'open', rosterState: 'no-roster', rosterAgeMs: 1_100 })
+      expect(factory.status().counters.fleetRosterUnavailable).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('fails closed at the default boundary before discovery and opens after two stalls', async () => {
     vi.useFakeTimers()
     try {
@@ -6710,7 +6766,7 @@ describe('FactoryLoop', () => {
       const factory = createFactory(config({
         issueSource: 'github',
         batchSize: 4,
-        fleetHealth: { rosterTimeoutMs: 1_000, failureThreshold: 1, resetTimeoutMs: 60_000 },
+        fleetHealth: { rosterTimeoutMs: 1_000, rosterCacheTtlMs: 0, failureThreshold: 1, resetTimeoutMs: 60_000 },
       }), {
         mount,
         fleet,
@@ -6748,7 +6804,7 @@ describe('FactoryLoop', () => {
       const factory = createFactory(config({
         issueSource: 'github',
         batchSize: 4,
-        fleetHealth: { rosterTimeoutMs: 1_000, failureThreshold: 1, resetTimeoutMs: 60_000 },
+        fleetHealth: { rosterTimeoutMs: 1_000, rosterCacheTtlMs: 0, failureThreshold: 1, resetTimeoutMs: 60_000 },
       }), {
         mount: new FakeMountClient({
           [blockedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
@@ -29240,7 +29296,7 @@ describe('FactoryLoop PR babysitter', () => {
       else vi.spyOn(fleet, 'spawn').mockRejectedValueOnce(new FleetSpawnNotCreatedError(new Error('temporary spawn preflight failure')))
       return claim
     })
-    const factory = createFactory(babysitterConfig(), {
+    const factory = createFactory(babysitterConfig({ fleetHealth: { rosterCacheTtlMs: 0 } }), {
       mount, fleet, stateStore, triage: new StaticTriage(),
       probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 401 }),
     })

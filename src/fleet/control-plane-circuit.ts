@@ -1,6 +1,7 @@
 import type { FleetClient, RosterEntry, SpawnInput, SpawnResult } from '../ports/fleet'
 
 export const DEFAULT_FLEET_ROSTER_TIMEOUT_MS = 5_000
+export const DEFAULT_FLEET_ROSTER_CACHE_TTL_MS = 5 * 60_000
 export const DEFAULT_FLEET_CONTROL_FAILURE_THRESHOLD = 2
 export const DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS = 60_000
 /**
@@ -12,6 +13,7 @@ export const DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS = 60_000
 export const DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS = 15_000
 
 export type FleetControlPlaneState = 'closed' | 'open' | 'half-open'
+export type FleetRosterState = 'roster-fresh' | 'roster-stale-but-usable' | 'no-roster'
 
 export interface FleetControlPlaneStatus {
   state: FleetControlPlaneState
@@ -22,12 +24,17 @@ export interface FleetControlPlaneStatus {
   lastFailureAtMs?: number
   retryAtMs?: number
   lastError?: string
+  /** Optional when reading heartbeats produced before roster caching. */
+  rosterState?: FleetRosterState
+  rosterAgeMs?: number
+  rosterCacheTtlMs?: number
 }
 
 export interface FleetControlPlaneCircuitOptions {
   timeoutMs: number
   failureThreshold: number
   resetTimeoutMs: number
+  rosterCacheTtlMs?: number
   now?: () => number
 }
 
@@ -62,6 +69,9 @@ export class FleetControlPlaneCircuit {
   readonly #failureThreshold: number
   readonly #resetTimeoutMs: number
   readonly #now: () => number
+  readonly #rosterCacheTtlMs: number
+  #cachedRoster?: { entry: RosterEntry; atMs: number }
+  #rosterRefreshAfterMs?: number
   #consecutiveFailures = 0
   #lastFailureAtMs?: number
   #retryAtMs?: number
@@ -77,6 +87,7 @@ export class FleetControlPlaneCircuit {
     this.#failureThreshold = options.failureThreshold
     this.#resetTimeoutMs = options.resetTimeoutMs
     this.#now = options.now ?? Date.now
+    this.#rosterCacheTtlMs = options.rosterCacheTtlMs ?? DEFAULT_FLEET_ROSTER_CACHE_TTL_MS
   }
 
   /** Returns the current admission state without performing broker I/O. */
@@ -92,6 +103,10 @@ export class FleetControlPlaneCircuit {
       timeoutMs: this.#timeoutMs,
       failureThreshold: this.#failureThreshold,
       resetTimeoutMs: this.#resetTimeoutMs,
+      rosterState: !this.#usableRoster() ? 'no-roster'
+        : this.#rosterRefreshAfterMs !== undefined ? 'roster-stale-but-usable' : 'roster-fresh',
+      rosterCacheTtlMs: this.#rosterCacheTtlMs,
+      ...(this.#cachedRoster ? { rosterAgeMs: Math.max(0, this.#now() - this.#cachedRoster.atMs) } : {}),
       ...(this.#lastFailureAtMs === undefined ? {} : { lastFailureAtMs: this.#lastFailureAtMs }),
       ...(this.#retryAtMs === undefined ? {} : { retryAtMs: this.#retryAtMs }),
       ...(this.#lastError === undefined ? {} : { lastError: this.#lastError }),
@@ -99,17 +114,22 @@ export class FleetControlPlaneCircuit {
   }
 
   /** Runs or joins one bounded roster request, recording only its outcome. */
-  async probe(roster: () => Promise<RosterEntry>): Promise<RosterEntry> {
+  async probe(roster: () => Promise<RosterEntry>, options: { allowStale?: boolean } = {}): Promise<RosterEntry> {
     const status = this.status()
     if (status.state === 'open') {
       throw new FleetControlPlaneCircuitOpenError(status.retryAtMs!)
     }
+    // Dispatch may reuse a failed read's snapshot during the refresh cooldown.
+    // Authoritative reads (cleanup, exit reconciliation) always reach the probe.
+    const cached = this.#usableRoster()
+    if (options.allowStale && status.state === 'closed' && cached &&
+      this.#rosterRefreshAfterMs !== undefined && this.#now() < this.#rosterRefreshAfterMs) return cached
     // A probe that began before the circuit opened cannot recover the newer
     // generation. Once cooldown reaches half-open, start one recovery probe
     // instead of joining that stale request.
     if (this.#probeInFlight && (
       status.state !== 'half-open' || this.#probeOpenGeneration === this.#openGeneration
-    )) return this.#probeInFlight
+    )) return this.#withFallback(this.#probeInFlight, options.allowStale)
 
     const openGeneration = this.#openGeneration
     const probe = withTimeout(roster, this.#timeoutMs)
@@ -118,7 +138,10 @@ export class FleetControlPlaneCircuit {
         // cannot describe the health of the generation that recovered after
         // it. In particular, never let that stale settlement reopen a circuit
         // after the fresh half-open probe has already succeeded.
-        if (openGeneration === this.#openGeneration) this.recordFailure(error)
+        if (openGeneration === this.#openGeneration) {
+          this.#rosterRefreshAfterMs = this.#now() + this.#resetTimeoutMs
+          this.recordFailure(error, { roster: true })
+        }
         // The failure that trips the threshold IS the open transition, but the
         // transport error it arrives as says nothing about that. Callers that
         // saw only the original error could not tell "one roster request
@@ -146,6 +169,8 @@ export class FleetControlPlaneCircuit {
           )
         }
         this.#recordSuccess()
+        this.#cachedRoster = { entry: result, atMs: this.#now() }
+        this.#rosterRefreshAfterMs = undefined
         return result
       })
       .finally(() => {
@@ -156,7 +181,24 @@ export class FleetControlPlaneCircuit {
       })
     this.#probeInFlight = probe
     this.#probeOpenGeneration = openGeneration
-    return probe
+    return this.#withFallback(probe, options.allowStale)
+  }
+
+  #usableRoster(): RosterEntry | undefined {
+    return this.#cachedRoster && this.#now() - this.#cachedRoster.atMs < this.#rosterCacheTtlMs
+      ? this.#cachedRoster.entry : undefined
+  }
+
+  async #withFallback(probe: Promise<RosterEntry>, allowStale = false): Promise<RosterEntry> {
+    const generation = this.#openGeneration
+    try {
+      return await probe
+    } catch (error) {
+      const cached = this.#usableRoster()
+      if (allowStale && cached && generation === this.#openGeneration &&
+        !(error instanceof FleetControlPlaneCircuitOpenError) && this.status().state === 'closed') return cached
+      throw error
+    }
   }
 
   /** Rejects mutations until an open or half-open circuit has recovered. */
@@ -166,12 +208,15 @@ export class FleetControlPlaneCircuit {
     throw new FleetControlPlaneCircuitOpenError(status.retryAtMs ?? this.#now(), status.state)
   }
 
-  recordFailure(error: unknown): void {
+  recordFailure(error: unknown, options: { roster?: boolean } = {}): void {
     const now = this.#now()
     const wasOpen = this.#retryAtMs !== undefined && now < this.#retryAtMs
     this.#lastFailureAtMs = now
     this.#lastError = describeControlPlaneError(error)
     if (wasOpen) return
+    // A read failure degrades roster freshness, not mutation availability.
+    // Mutation transport failures retain the existing circuit semantics.
+    if (options.roster && this.#usableRoster()) return
     this.#consecutiveFailures += 1
     if (this.#consecutiveFailures >= this.#failureThreshold) {
       this.#retryAtMs = now + this.#resetTimeoutMs
@@ -208,8 +253,8 @@ export function guardFleetControlPlane(
     return result
   }
 
-  const probeRoster = (recordAdmissionEvidence: boolean): Promise<RosterEntry> =>
-    circuit.probe(() => fleet.roster())
+  const probeRoster = (recordAdmissionEvidence: boolean, allowStale = false): Promise<RosterEntry> =>
+    circuit.probe(() => fleet.roster(), { allowStale })
       .then((result) => recordAdmissionEvidence ? recordSuccessfulEvidence(result) : result)
       .catch((error: unknown) => {
         // A newer failed read supersedes any older success even when it is the
@@ -219,6 +264,7 @@ export function guardFleetControlPlane(
       })
 
   const hasFreshAdmissionEvidence = (): boolean =>
+    circuit.status().rosterState !== 'no-roster' &&
     lastSuccessfulEvidenceAtMs !== undefined &&
     now() - lastSuccessfulEvidenceAtMs <= admissionLeaseMs
 
@@ -232,7 +278,7 @@ export function guardFleetControlPlane(
     // half-open must run the recovery probe even if older evidence exists.
     const admissionState = circuit.status().state
     if (admissionState === 'open') circuit.assertMutationAllowed()
-    if (admissionState === 'half-open' || !hasFreshAdmissionEvidence()) await probeRoster(true)
+    if (admissionState === 'half-open' || !hasFreshAdmissionEvidence()) await probeRoster(true, true)
     circuit.assertMutationAllowed()
     try {
       return recordSuccessfulEvidence(await operation())
@@ -248,7 +294,7 @@ export function guardFleetControlPlane(
   return new Proxy(fleet, {
     get(target, property) {
       if (property === 'roster') {
-        return (): Promise<RosterEntry> => probeRoster(false)
+        return (options?: { allowStale?: boolean }): Promise<RosterEntry> => probeRoster(false, options?.allowStale)
       }
       if (property === 'spawn') {
         return (input: SpawnInput): Promise<SpawnResult> => guardedMutation(() => target.spawn(input))

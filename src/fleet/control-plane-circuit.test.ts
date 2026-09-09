@@ -7,6 +7,7 @@ import {
   DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS,
   DEFAULT_FLEET_CONTROL_RESET_TIMEOUT_MS,
   DEFAULT_FLEET_ROSTER_TIMEOUT_MS,
+  DEFAULT_FLEET_ROSTER_CACHE_TTL_MS,
   FleetControlPlaneCircuit,
   FleetControlPlaneCircuitOpenError,
   guardFleetControlPlane,
@@ -18,6 +19,116 @@ const roster: RosterEntry = { agents: [], nodes: [] }
 describe('FleetControlPlaneCircuit', () => {
   afterEach(() => {
     vi.useRealTimers()
+  })
+
+  it('dispatches through a slow roster, publishes stale age, and stops at cache expiry', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const fleet = new FakeFleetClient()
+    let resolveLate: (value: RosterEntry) => void = () => undefined
+    const read = vi.spyOn(fleet, 'roster').mockResolvedValueOnce(roster)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveLate = resolve }))
+      .mockRejectedValue(new Error('broker unavailable'))
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000 })
+    const guarded = guardFleetControlPlane(fleet, circuit, { admissionLeaseMs: 0 })
+    expect(circuit.status()).toMatchObject({ rosterState: 'no-roster', rosterCacheTtlMs: DEFAULT_FLEET_ROSTER_CACHE_TTL_MS })
+    expect(circuit.status().rosterAgeMs).toBeUndefined()
+
+    await guarded.spawn({ name: 'first', capability: 'spawn:codex' })
+    expect(circuit.status()).toMatchObject({ rosterState: 'roster-fresh', rosterAgeMs: 0 })
+    await vi.advanceTimersByTimeAsync(1)
+    const spawning = guarded.spawn({ name: 'stale', capability: 'spawn:codex' })
+    await vi.advanceTimersByTimeAsync(100)
+    await spawning
+    expect(fleet.spawns.map((entry) => entry.name)).toEqual(['first', 'stale'])
+    expect(circuit.status()).toMatchObject({ state: 'closed', rosterState: 'roster-stale-but-usable', rosterAgeMs: 101 })
+
+    // Neither an abandoned transport result nor a successful placement renews
+    // the roster timestamp. Only a successful bounded roster read can do that.
+    resolveLate({ agents: [{ name: 'late' }], nodes: [] })
+    await vi.advanceTimersByTimeAsync(1)
+    await guarded.resume({ name: 'resumed', sessionRef: 'session' })
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(circuit.status()).toMatchObject({ rosterState: 'roster-stale-but-usable', rosterAgeMs: 102 })
+
+    vi.setSystemTime(1_000 + DEFAULT_FLEET_ROSTER_CACHE_TTL_MS)
+    expect(circuit.status()).toMatchObject({ rosterState: 'no-roster', rosterAgeMs: DEFAULT_FLEET_ROSTER_CACHE_TTL_MS })
+    await expect(guarded.spawn({ name: 'expired', capability: 'spawn:codex' }))
+      .rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+    expect(fleet.spawns).toHaveLength(2)
+    expect(circuit.status()).toMatchObject({ state: 'open', rosterState: 'no-roster', consecutiveFailures: 1 })
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    read.mockResolvedValue(roster)
+    await guarded.spawn({ name: 'recovered', capability: 'spawn:codex' })
+    expect(circuit.status()).toMatchObject({ state: 'closed', rosterState: 'roster-fresh', rosterAgeMs: 0 })
+  })
+
+  it('coalesces strict and stale-allowed reads without giving cleanup stale absence', async () => {
+    vi.useFakeTimers()
+    const fleet = new FakeFleetClient()
+    const read = vi.spyOn(fleet, 'roster').mockResolvedValueOnce(roster)
+      .mockImplementation(() => new Promise(() => undefined))
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000 })
+    const guarded = guardFleetControlPlane(fleet, circuit)
+    await guarded.roster()
+    const strict = expect(guarded.roster()).rejects.toMatchObject({ name: 'TimeoutError' })
+    const admission = guarded.roster({ allowStale: true })
+    await vi.advanceTimersByTimeAsync(100)
+    await strict
+    await expect(admission).resolves.toEqual(roster)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(circuit.status()).toMatchObject({ state: 'closed', rosterState: 'roster-stale-but-usable' })
+  })
+
+  it('rechecks TTL at failed probe settlement and does not renew stale snapshots on retries', async () => {
+    vi.useFakeTimers()
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 10, rosterCacheTtlMs: 200 })
+    await circuit.probe(async () => roster)
+    await expect(circuit.probe(async () => { throw new Error('failed') }, { allowStale: true })).resolves.toEqual(roster)
+    await vi.advanceTimersByTimeAsync(150)
+    const expired = expect(circuit.probe(() => new Promise(() => undefined), { allowStale: true }))
+      .rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+    await vi.advanceTimersByTimeAsync(100)
+    await expired
+    expect(circuit.status()).toMatchObject({ state: 'open', rosterState: 'no-roster', rosterAgeMs: 250 })
+  })
+
+  it('refreshes after the stale cooldown and can disable fallback with a zero TTL', async () => {
+    vi.useFakeTimers()
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000 })
+    const read = vi.fn().mockResolvedValueOnce(roster).mockRejectedValueOnce(new Error('failed')).mockResolvedValue(roster)
+    await circuit.probe(read, { allowStale: true })
+    await circuit.probe(read, { allowStale: true })
+    await circuit.probe(read, { allowStale: true })
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(circuit.status().rosterState).toBe('roster-stale-but-usable')
+    await vi.advanceTimersByTimeAsync(1_000)
+    await circuit.probe(read, { allowStale: true })
+    expect(read).toHaveBeenCalledTimes(3)
+    expect(circuit.status()).toMatchObject({ rosterState: 'roster-fresh', rosterAgeMs: 0 })
+
+    const disabled = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000, rosterCacheTtlMs: 0 })
+    await disabled.probe(async () => roster)
+    await expect(disabled.probe(async () => { throw new Error('failed') }, { allowStale: true }))
+      .rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+    expect(disabled.status()).toMatchObject({ state: 'open', rosterState: 'no-roster' })
+  })
+
+  it('does not let a placement lease bypass an expired roster', async () => {
+    vi.useFakeTimers()
+    const fleet = new FakeFleetClient()
+    const read = vi.spyOn(fleet, 'roster').mockResolvedValueOnce(roster).mockRejectedValue(new Error('failed'))
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000, rosterCacheTtlMs: 200 })
+    const guarded = guardFleetControlPlane(fleet, circuit, { admissionLeaseMs: 1_000 })
+    await guarded.spawn({ name: 'first', capability: 'spawn:codex' })
+    await vi.advanceTimersByTimeAsync(199)
+    await guarded.spawn({ name: 'second', capability: 'spawn:codex' })
+    await vi.advanceTimersByTimeAsync(1)
+    await expect(guarded.resume({ sessionRef: 'session' })).rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(fleet.resumes).toEqual([])
+    expect(circuit.status()).toMatchObject({ state: 'open', rosterState: 'no-roster', rosterAgeMs: 200 })
   })
 
   it('MUST FIRE: two 5s roster timeouts open for 60s and only a successful half-open probe closes', async () => {
@@ -88,7 +199,7 @@ describe('FleetControlPlaneCircuit', () => {
     const isolatedFailure = expect(isolated).rejects.toMatchObject({ name: 'TimeoutError' })
     await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
     await isolatedFailure
-    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 1 })
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0, rosterState: 'roster-stale-but-usable' })
 
     await expect(circuit.probe(async () => roster)).resolves.toEqual(roster)
     expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
@@ -261,15 +372,16 @@ describe('FleetControlPlaneCircuit', () => {
     expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0 })
 
     // The lease is deliberately finite. Once it expires, the very same next
-    // mutation must run its own roster admission and surface the stalled read.
+    // mutation must run its own roster admission, falling back to the cache.
     vi.useFakeTimers()
     now += DEFAULT_FLEET_CONTROL_ADMISSION_LEASE_MS + 1
     const expired = guarded.spawn({ name: 'later-worker', capability: 'spawn:codex' })
-    const expiredFailure = expect(expired).rejects.toMatchObject({ name: 'TimeoutError' })
+    const expiredResult = expect(expired).resolves.toMatchObject({ name: 'later-worker' })
     await vi.advanceTimersByTimeAsync(DEFAULT_FLEET_ROSTER_TIMEOUT_MS)
-    await expiredFailure
+    await expiredResult
     expect(rosterProbe).toHaveBeenCalledTimes(2)
-    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['implementer', 'reviewer'])
+    expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['implementer', 'reviewer', 'later-worker'])
+    expect(circuit.status()).toMatchObject({ state: 'closed', rosterState: 'roster-stale-but-usable' })
   })
 
   it('invalidates recent admission evidence when a direct roster read fails', async () => {
@@ -283,10 +395,10 @@ describe('FleetControlPlaneCircuit', () => {
 
     await expect(guarded.spawn({ name: 'first-worker', capability: 'spawn:codex' })).resolves.toBeDefined()
     await expect(guarded.roster()).rejects.toThrow('broker unavailable')
-    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 1 })
+    expect(circuit.status()).toMatchObject({ state: 'closed', consecutiveFailures: 0, rosterState: 'roster-stale-but-usable' })
 
     await expect(guarded.spawn({ name: 'second-worker', capability: 'spawn:codex' })).resolves.toBeDefined()
-    expect(rosterProbe).toHaveBeenCalledTimes(3)
+    expect(rosterProbe).toHaveBeenCalledTimes(2)
     expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['first-worker', 'second-worker'])
   })
 

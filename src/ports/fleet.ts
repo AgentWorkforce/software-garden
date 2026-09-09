@@ -308,7 +308,8 @@ export interface FleetClient {
     task?: string
   }): Promise<SpawnResult>
   release(name: string, reason?: string): Promise<void>
-  roster(): Promise<RosterEntry>
+  /** Only dispatch admission may opt into a bounded stale snapshot. */
+  roster(options?: { allowStale?: boolean }): Promise<RosterEntry>
   /** One bounded-poll sample proving a spawned remote identity is broker-visible on its expected host. */
   isAgentRegistered?(input: {
     name: string

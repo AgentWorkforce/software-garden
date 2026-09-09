@@ -701,6 +701,9 @@ export interface FactoryPublicFleetConnectHealth {
 
 export interface FactoryPublicFleetControlPlaneHealth {
   state: FleetControlPlaneStatus['state'] | 'unknown'
+  rosterState?: FleetControlPlaneStatus['rosterState'] | 'unknown'
+  rosterAgeMs?: number
+  rosterCacheTtlMs?: number
   consecutiveFailures: number
   failureThreshold: number
   lastFailureAtMs?: number
