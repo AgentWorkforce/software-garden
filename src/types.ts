@@ -733,6 +733,8 @@ export interface FactoryPublicBuildIdentity {
  *
  * `ok` requires a live process and discovery that is not stalled. `status`
  * also exposes transient dispatch-gating degradations to operators.
+ * This is readiness, not an automatic restart predicate: use the separate
+ * `checkFactoryLoopLiveness` signal for process liveness during hydration.
  */
 export interface FactoryPublicHealth {
   schemaVersion: number

@@ -4141,6 +4141,16 @@ describe('FactoryLoop', () => {
       expect(initialReads).toBeGreaterThanOrEqual(1500)
       for (let sweep = 0; sweep < 3; sweep += 1) {
         clock.advance(5 * 60_000)
+        // Mirror refreshes often change metadata without changing any input
+        // to PR matching. Those writes must not defeat cross-sweep caching.
+        const refreshed = githubIssueFile(935, {
+          labels: ['reference-only'],
+          updatedAt: new Date(clock.now()).toISOString(),
+        })
+        mount.files.set(blockerPath, { content: {
+          ...refreshed,
+          payload: { ...refreshed.payload, comments: sweep + 1, reactions: { total_count: sweep + 1 } },
+        } })
         const report = await factory.runOnce()
         expect(report.dispatched).toEqual([])
         expect(report.skipped).toContainEqual(expect.objectContaining({ code: 'parked-dependency' }))
@@ -17568,6 +17578,12 @@ describe('FactoryLoop', () => {
             readinessReconcile: { state: 'stalled', consecutiveFailures: 0 },
           })
           expect(heartbeat?.health?.readinessReconcile?.missedPasses ?? 0).toBeGreaterThanOrEqual(10)
+          // Readiness can be false while the process remains alive. Container
+          // restart probes must use this signal so hydration can finish.
+          expect(checkFactoryLoopLiveness(heartbeat, { nowMs: heartbeat!.updatedAtMs })).toMatchObject({
+            ok: true,
+            stale: false,
+          })
         }, { timeout: 3_000 })
       } finally {
         mount.releasePeriodic()

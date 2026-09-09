@@ -10483,10 +10483,13 @@ export class FactoryLoop implements Factory {
     if (!issue) return false
     const repo = dependencyRepoForIssue(issue, undefined, this.#config)
     if (!repo) return false
-    // Reusing a negative answer is safe only for the same issue snapshot.
+    // Match exactly the issue inputs used by issuePrMatchScore (including
+    // legacy branch matching), plus the resolved repository. Provider timestamps,
+    // comments and reactions cannot change PR association and must not force
+    // another full walk on every mirror refresh.
     // A PR change invalidates the repository below, and the expiry covers
     // polling-only callers or missed events. Never extend expiry on a hit.
-    const issueSignature = stableHash(JSON.stringify(issue))
+    const issueSignature = JSON.stringify([repo.toLowerCase(), issue.key, githubIssuePathParts(issue.path)?.number])
     const memoized = this.#dependencyPrProbes.get(identity)
     if (memoized && memoized.expiresAtMs > this.#clock.now() && memoized.issueSignature === issueSignature) {
       this.#increment('dependencyPrProbeCacheHits')

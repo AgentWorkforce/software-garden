@@ -270,15 +270,20 @@ first. A fresh heartbeat, free dispatch capacity, or zero waiting issues cannot 
 `status` remains `degraded` so the known stall retains its diagnosis. When discovery recovers,
 `ok` becomes true again. Other transient subsystem degradations retain their existing semantics.
 
-The container must propagate `heartbeat.health.ok` to its own `/healthz` verdict and HTTP status.
+The container must expose `heartbeat.health.ok` as discovery readiness. It must keep automatic
+restart decisions on a separate process-liveness signal, such as `checkFactoryLoopLiveness`:
+a legitimate cold-mirror hydration can exceed the stall interval. Wiring discovery readiness
+directly to a recycling ping endpoint would restart that work before it can finish and discard
+its in-memory diagnostics. Container consumers must separate those signals before rollout.
 Live container preflight must also avoid running a complete discovery workload before starting the
 loop: `status` verifies the host/backend, while the live loop performs discovery and reports progress.
 
 ### Dependency PR lookup cache
 
 An open dependency with no merged PR retains its negative PR lookup for 30 minutes across sweeps.
-PR change events invalidate cached dependencies for that repository, and a changed issue snapshot
-also requires a fresh lookup. Cache hits do not extend expiry, so missed events can delay recognition
+PR change events invalidate cached dependencies for that repository, and changed PR-matching inputs
+(repository, issue key, or legacy branch identity) require a fresh lookup. Timestamp, comment, and
+reaction updates retain the cached answer. Cache hits do not extend expiry, so missed events can delay recognition
 of a merge by at most the remaining cache lifetime plus the next sweep. Closed dependencies still
 resolve directly from their current issue state.
 
