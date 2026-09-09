@@ -26468,6 +26468,193 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it.each([
+    ['local', 'impl'], ['local', 'review'], ['remote', 'impl'], ['remote', 'review'],
+  ] as const)('parks a question before the %s %s spawn acknowledgement and wakes the entire team on answer', async (locality, blockedRole) => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 490)
+    const issue = githubIssueFile(490, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = locality === 'remote' ? new RemoteLifecycleFleetClient() : new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const githubWriteback = new RecordingGithubWriteback()
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet, stateStore, githubWriteback, triage: new StaticTriage(),
+    })
+    const spawn = fleet.spawn.bind(fleet)
+    let releaseSpawn!: () => void
+    const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve })
+    let spawnStarted!: () => void
+    const spawnStarting = new Promise<void>((resolve) => { spawnStarted = resolve })
+    vi.spyOn(fleet, 'spawn').mockImplementation(async (input) => {
+      const result = await spawn(input)
+      if (input.name === `ar-490-${blockedRole}-pear` && fleet.spawns.length <= 2) {
+        spawnStarted()
+        await spawnGate
+      }
+      return result
+    })
+
+    const dispatch = factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    try {
+      await spawnStarting
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 490, 94901, {
+        body: '### Software Garden human input request\nAgent: ar-490-impl-pear\nIssue: 490\nQuestion: Which retry helper should I use?',
+        author: { login: 'garden-operator', type: 'User' },
+        author_association: 'MEMBER',
+      })
+      fleet.emitAgentExit('ar-490-impl-pear', 'completed')
+      await flush()
+      await flush()
+      // Dispatch still owns placements and its provider claim. Parking cannot
+      // snapshot a partial team or race that claim back into in-progress.
+      expect(fleet.releases).toEqual([])
+      releaseSpawn()
+      await dispatch
+      mount.files.set(path, { content: githubIssueFile(490, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+      await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+      expect(factory.status().inFlight).toEqual([])
+      expect(fleet.releases).toEqual([
+        { name: 'ar-490-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-490-review-pear', reason: 'waiting-for-human' },
+      ])
+      expect((await stateStore.listWaitingClarifications('factory-test'))[0]?.[1]).toMatchObject({
+        questionSource: 'github', parkedAtMs: expect.any(Number),
+      })
+      if (locality === 'remote') {
+        expect((await stateStore.listDispatchLifecycles('factory-test'))[0]?.[1]?.phase).toBe('waiting-for-human')
+      }
+      const spawnCount = fleet.spawns.length
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 490, 94902, {
+        body: 'Use the shared retry helper.', author: { login: 'reporter' },
+      })
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+      const restarted = fleet.spawns.slice(spawnCount)
+      expect(restarted.map(({ name }) => name).sort()).toEqual(['ar-490-impl-pear', 'ar-490-review-pear'])
+      for (const agent of restarted) {
+        expect(agent.task).toContain('Which retry helper should I use?')
+        expect(agent.task).toContain('Use the shared retry helper.')
+      }
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+    } finally {
+      releaseSpawn()
+      await dispatch.catch(() => undefined)
+      await factory.stop()
+    }
+  })
+
+  it('leaves a question arriving during failed-dispatch cleanup replayable', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 492)
+    const issue = githubIssueFile(492, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet, stateStore, triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    const cleanupEntered = Promise.withResolvers<void>()
+    const finishCleanup = Promise.withResolvers<void>()
+    const recordFailure = stateStore.recordFailureHandoff.bind(stateStore)
+    vi.spyOn(stateStore, 'recordFailureHandoff').mockImplementation(async (...args) => {
+      cleanupEntered.resolve()
+      await finishCleanup.promise
+      return recordFailure(...args)
+    })
+    const spawn = fleet.spawn.bind(fleet)
+    vi.spyOn(fleet, 'spawn').mockImplementation(async (input) => {
+      if (input.name.includes('-review')) throw new Error('reviewer placement failed')
+      return spawn(input)
+    })
+    const dispatch = factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    const rejected = expect(dispatch).rejects.toThrow('reviewer placement failed')
+    try {
+      await cleanupEntered.promise
+      // The claim fence has settled false, but the failed record still owns
+      // its implementer while cleanup is paused before batch.abandon.
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 492, 94921, {
+        body: '### Software Garden human input request\nAgent: ar-492-impl-pear\nIssue: 492\nQuestion: Which helper?',
+        author: { login: 'factory-agent[bot]', type: 'Bot' },
+      })
+      await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBe(1))
+      expect(factory.status().counters.githubAgentQuestionsDetected ?? 0).toBe(0)
+      expect(fleet.releases).toEqual([])
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+      const watch = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+      expect(watch).toBeDefined()
+      expect(watch?.processedCommentIds).not.toContain('94921')
+    } finally {
+      finishCleanup.resolve()
+      await rejected
+      await factory.stop()
+    }
+  })
+
+  it.each(['before failure', 'during backoff', 'after retry'] as const)(
+    'replays a rejected question and an answer arriving %s', async (answerTiming) => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 491)
+    const issue = githubIssueFile(491, { labels: ['factory'], author: 'reporter' })
+    const mount = new FakeMountClient({ [path]: issue })
+    const fleet = new FakeFleetClient()
+    const clock = new ManualClock()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet, stateStore, clock, triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+    })
+    let rejectSpawn!: (error: Error) => void
+    const spawnGate = new Promise<SpawnResult>((_resolve, reject) => { rejectSpawn = reject })
+    vi.spyOn(fleet, 'spawn').mockImplementation(() => spawnGate)
+    const dispatch = factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+    const rejected = expect(dispatch).rejects.toThrow('placement acknowledgement failed')
+    try {
+      await vi.waitFor(() => expect(fleet.spawn).toHaveBeenCalledOnce())
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 491, 94911, {
+        body: '### Software Garden human input request\nAgent: ar-491-impl-pear\nIssue: 491\nQuestion: Which helper?',
+        author: { login: 'factory-agent[bot]', type: 'Bot' },
+      })
+      await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsReceived).toBe(1))
+      const answer = () => emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 491, 94912, {
+        body: 'Use the shared helper.', author: { login: 'reporter' },
+      })
+      if (answerTiming === 'before failure') answer()
+      rejectSpawn(new Error('placement acknowledgement failed'))
+      await rejected
+      await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBeGreaterThanOrEqual(1))
+      const watch = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+      expect(watch).toBeDefined()
+      expect(watch?.processedCommentIds).not.toContain('94911')
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+
+      if (answerTiming === 'during backoff') answer()
+      if (answerTiming !== 'after retry') {
+        await vi.waitFor(() => expect(factory.status().counters.githubIssueCommentReplyErrors).toBe(2))
+        const deferred = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+        expect(deferred?.processedCommentIds).not.toContain('94912')
+      }
+      clock.advance(60_000)
+      vi.mocked(fleet.spawn).mockRestore()
+      await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+      mount.files.set(path, { content: githubIssueFile(491, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+      // Retry must replay the persisted question without another comment or
+      // agent-exit event. Its later human answer then has a pending question.
+      await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+      if (answerTiming === 'after retry') expect(factory.status().inFlight).toEqual([])
+      expect(fleet.releases).toEqual([
+        { name: 'ar-491-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-491-review-pear', reason: 'waiting-for-human' },
+      ])
+      if (answerTiming === 'after retry') answer()
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+      const replayed = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
+      expect(replayed?.processedCommentIds).toEqual(expect.arrayContaining(['94911', '94912']))
+    } finally {
+      rejectSpawn(new Error('placement acknowledgement failed'))
+      await dispatch.catch(() => undefined)
+      await factory.stop()
+    }
+  })
+
   it('detects a durable source-issue question and returns the answer only through fresh spawn tasks', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 59)
     const issue = githubIssueFile(59, { labels: ['factory'], author: 'reporter' })

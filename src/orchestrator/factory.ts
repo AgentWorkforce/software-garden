@@ -1313,6 +1313,10 @@ export class FactoryLoop implements Factory {
   // write boundary. A completion arriving first makes dispatch wait and
   // re-read; one arriving after claim entry waits for the claim to finish.
   readonly #postSpawnDispatchClaimFences = new Map<string, PostSpawnDispatchClaimFence>()
+  // A settled fence leaves the map before failed-dispatch cleanup releases
+  // its record. Remember rejection on that record so later questions cannot
+  // park it in the cleanup window; a fresh dispatch gets a fresh record.
+  readonly #questionRejectedDispatches = new WeakSet<InFlightIssue>()
   // Shutdown must not lose a local placement merely because a rejected
   // provider claim unwinds before #releaseInFlightAgents snapshots the batch.
   // The capture set makes both interleavings explicit: the dispatch catch may
@@ -6036,7 +6040,6 @@ export class FactoryLoop implements Factory {
     // exact shape of #303, reached through the fresh dispatch path instead of
     // the durable one (#303 review, CodeRabbit).
     this.#scheduleHeldAgentDeadline(record)
-    if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     // These waits belong to the durable work unit, not the ingestion surface.
@@ -6081,6 +6084,7 @@ export class FactoryLoop implements Factory {
         if (postSpawnDispatchClaimSettled) return
         postSpawnDispatchClaimSettled = true
         postSpawnDispatchClaimFence.accepted = accepted
+        if (!accepted) this.#questionRejectedDispatches.add(record)
         resolvePostSpawnDispatchClaim(accepted)
         if (this.#postSpawnDispatchClaimFences.get(postSpawnKey) === postSpawnDispatchClaimFence) {
           this.#postSpawnDispatchClaimFences.delete(postSpawnKey)
@@ -6098,6 +6102,7 @@ export class FactoryLoop implements Factory {
     let rejectDispatchClaim: (() => Promise<never>) | undefined
     try {
       if (!dryRun) {
+        await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
         const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || !this.#isIssueReady(issue)) {
           throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
@@ -6243,6 +6248,20 @@ export class FactoryLoop implements Factory {
       settlePostSpawnIssueObservation(true)
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: dispatchDecision.issue, result })
+      if (!dryRun) {
+        const source = githubIssueSourceRef(liveIssue)
+        if (source) {
+          // Replay questions rejected by a prior attempt even when its watcher
+          // stayed subscribed. Do not await: an answer in this same comment
+          // queue can itself be waiting for this dispatch to return.
+          void this.#replayGithubIssueComments(githubIssueSourceKey(source)).catch((error) => {
+            this.#increment('githubIssueCommentReplyErrors')
+            this.#logger.warn?.('[factory] failed to replay GitHub questions after dispatch', {
+              issue: record.issue, error,
+            })
+          })
+        }
+      }
       return result
     } catch (caughtError) {
       // Stop/deadline may reject the fence while any awaited provider or
@@ -15048,7 +15067,9 @@ export class FactoryLoop implements Factory {
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, normalizedWatch)
       return
     }
-    await this.#watchGithubIssueComments(watch)
+    // Dispatch installed its fence before subscribing. Replay after a
+    // successful claim, when all agents exist and can safely be parked.
+    await this.#watchGithubIssueComments(watch, { replay: false })
     if (!this.#githubIssueCommentWatchStates.has(key)) {
       throw new Error(`Unable to watch source GitHub issue comments for ${record.issue.key}`)
     }
@@ -15066,13 +15087,16 @@ export class FactoryLoop implements Factory {
     return waiting?.questionSource === 'github' && waiting.agents.some(({ name }) => name === agentName)
   }
 
-  async #watchGithubIssueComments(watch: GithubIssueCommentWatchState): Promise<boolean> {
+  async #watchGithubIssueComments(
+    watch: GithubIssueCommentWatchState,
+    opts: { replay?: boolean } = {},
+  ): Promise<boolean> {
     watch = normalizeGithubIssueCommentWatch(watch)
     const key = githubIssueSourceKey(watch.source)
     this.#githubIssueCommentWatchStates.set(key, watch)
     await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
     if (this.#githubIssueCommentWatchers.has(key)) {
-      await this.#replayGithubIssueComments(key)
+      if (opts.replay !== false) await this.#replayGithubIssueComments(key)
       return false
     }
 
@@ -15128,7 +15152,7 @@ export class FactoryLoop implements Factory {
         await this.#boundedStopTeardown('GitHub issue comment subscription unsubscribe', () => subscription.unsubscribe())
       },
     })
-    await this.#replayGithubIssueComments(key)
+    if (opts.replay !== false) await this.#replayGithubIssueComments(key)
     return true
   }
 
@@ -15311,12 +15335,32 @@ export class FactoryLoop implements Factory {
       ? parseGithubHumanInputRequest(comment.body)
       : undefined
     if (request) {
-      await this.#handleGithubAgentQuestionComment(watch, comment, request)
+      try {
+        await this.#handleGithubAgentQuestionComment(watch, comment, request)
+      } catch (error) {
+        if (error instanceof PostSpawnDispatchWaitRejectedError) {
+          watch.deferredQuestionCommentIds = [...new Set([
+            ...(watch.deferredQuestionCommentIds ?? []), normalizedCommentId,
+          ])]
+          await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
+        }
+        throw error
+      }
+      watch.deferredQuestionCommentIds = watch.deferredQuestionCommentIds?.filter((id) => id !== normalizedCommentId)
+      if (!watch.deferredQuestionCommentIds?.length) delete watch.deferredQuestionCommentIds
       processedCommentIds.add(normalizedCommentId)
       watch.processedCommentIds = [...processedCommentIds]
       watch.lastSeenCommentId = String(Math.max(commentId, githubCommentNumericId(watch.lastSeenCommentId)))
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
       return
+    }
+
+    // A rejected question has not created its pending clarification yet.
+    // Keep later replies unprocessed so chronological replay can first park
+    // the recovered team, then apply the answer. Persisting the marker also
+    // preserves this ordering across watcher re-arm and process restart.
+    if (watch.deferredQuestionCommentIds?.some((id) => githubCommentNumericId(id) < commentId)) {
+      throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
     }
 
     const reply = githubCorrelatedReply(comment.body)
@@ -15427,7 +15471,23 @@ export class FactoryLoop implements Factory {
     request: GithubHumanInputRequest,
   ): Promise<void> {
     this.#increment('githubAgentQuestionsReceived')
+    // A worker can post its question and exit before the remaining spawn
+    // acknowledgements or the dispatch claim return. Let dispatch finish
+    // owning those mutations before snapshotting/releasing the team; otherwise
+    // its late acknowledgements can resurrect a parked record and overwrite
+    // waiting-for-human with running. The per-issue comment queue also keeps
+    // an answer behind this question while the exit replay waits for it.
+    const dispatchClaim = this.#postSpawnDispatchClaimFences.get(dispatchLifecycleKey(watch.issue))
+    if (dispatchClaim && !await dispatchClaim.settled) {
+      // Leave the comment unprocessed so recovery can replay it. Returning
+      // normally would acknowledge and permanently discard the question.
+      throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
+    }
     const record = (await this.#batch()).getIssue(watch.issue)
+    if ((record && this.#questionRejectedDispatches.has(record))
+      || (!record && watch.deferredQuestionCommentIds?.includes(comment.commentId))) {
+      throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
+    }
     if (!record || record.dryRun || request.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {
       this.#increment('githubAgentQuestionsIgnoredNoInFlight')
       return

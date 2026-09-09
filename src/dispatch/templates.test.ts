@@ -80,7 +80,7 @@ describe('renderAgentTask', () => {
     expect(task).toContain('### Software Garden human input request')
     expect(task).toContain('Agent: ar-123-impl-pear')
     expect(task).toContain('Issue: AR-123')
-    expect(task).toContain('exit cleanly')
+    expect(task).toContain('keep the session available until Software Garden releases the team')
     expect(task).toContain('Slack is optional')
     expect(task).toContain('question and answer folded into each fresh spawn task')
     expect(task).not.toContain('[factory-needs-input]')
@@ -582,7 +582,7 @@ describe('renderAgentTask', () => {
     }
   })
 
-  it('makes the source issue comment a durable release boundary', () => {
+  it('keeps the asker available until the source issue question is parked by Software Garden', () => {
     const task = renderAgentTask({
       issue,
       route: { repo: 'pear', clonePath: '/tmp/pear' },
@@ -597,7 +597,9 @@ describe('renderAgentTask', () => {
     expect(task).toContain('/github/repos/AgentWorkforce/factory/issues/123')
     expect(task).toContain('Agent: ar-123-impl-pear')
     expect(task).toContain('Question: <one concrete question>')
-    expect(task).toContain('Do not emit a needs-input message, wait, poll')
+    expect(task).toContain('keep the session available until Software Garden releases the team')
+    expect(task).toContain('Do not exit or report task completion merely because you asked a question')
+    expect(task).not.toContain('After the issue-comment writeback confirms, exit cleanly')
     expect(task).toContain('records the team as awaiting a human answer, and releases the team')
     expect(task).toContain('question and answer folded into each fresh spawn task')
     expect(task).toContain('cold-start the team with the issue, question, answer, branch, and PR context')

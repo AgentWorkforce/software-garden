@@ -200,7 +200,7 @@ export function renderAgentTask(input: RenderAgentTaskInput): string {
           sourceGithubIssue.reporter,
         ),
         '```',
-        'After the issue-comment writeback confirms, exit cleanly. Do not emit a needs-input message, wait, poll, or keep the session alive for an injected reply.',
+        'After the issue-comment writeback confirms, stop work but keep the session available until Software Garden releases the team. Do not exit or report task completion merely because you asked a question. Do not emit a duplicate needs-input message or poll for the human answer.',
         'Software Garden reads the source issue comments, records the team as awaiting a human answer, and releases the team. A Slack copy may be posted for visibility, but Slack is optional and is not the request/response record.',
         'After the first authorized human answer appears as a later comment on the same issue, Software Garden will start the released agents again with the question and answer folded into each fresh spawn task.',
         'If session resume is unavailable, Software Garden will cold-start the team with the issue, question, answer, branch, and PR context so work can be re-hydrated explicitly.',

@@ -375,6 +375,8 @@ export type GithubIssueCommentWatchState = {
   sinceCommentId?: string
   lastSeenCommentId?: string
   processedCommentIds?: string[]
+  /** Rejected questions whose later answers must remain replayable until dispatch recovers. */
+  deferredQuestionCommentIds?: string[]
 }
 
 export interface BatchSnapshot {
