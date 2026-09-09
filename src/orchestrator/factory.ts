@@ -2412,10 +2412,8 @@ export class FactoryLoop implements Factory {
       // in-flight, instead of leaving the timestamps empty and the derived
       // state reading `healthy` forever.
       //
-      // Only the timestamps. `consecutiveFailures` and `lastError` belong to
-      // the reconcile loop's own failure accounting, which owns the degraded
-      // threshold and the #297 reason allowlist; a startup failure is already
-      // counted by `liveStartupBackfillErrors` and reported through `#error`.
+      // Startup failures have their own counter, but must retain the same
+      // diagnostic cause as periodic failures in status and the heartbeat.
       const backfillStartedAtMs = this.#clock.now()
       this.#readinessReconcileLastStartedAtMs = backfillStartedAtMs
       try {
@@ -2431,6 +2429,8 @@ export class FactoryLoop implements Factory {
       } catch (error) {
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
         this.#readinessReconcileLastFailureAtMs = this.#clock.now()
+        this.#readinessReconcileLastError = readinessReconcileErrorMessage(error)
+        this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
         // A startup backfill failure must not abort the daemon: log it and fall
         // back to the live event stream (plus any buffered events) instead of
         // leaving the factory down.
@@ -2700,12 +2700,7 @@ export class FactoryLoop implements Factory {
       // not just a log line: `lastError` is returned from `status()` and
       // written into the loop heartbeat file, so an unbounded
       // dependency-controlled string would land on disk.
-      const overload = relayfileOverload(error)
-      const errorMessage = overload
-        ? `${describeError(error).errorMessage} ` +
-          `[relayfile ${overload.status} ${relayfileOverloadReasonLabel(overload.reason)}` +
-          `${overload.retryAfterSeconds === undefined ? '' : `; retry-after=${overload.retryAfterSeconds}s`}]`
-        : describeError(error).errorMessage
+      const errorMessage = readinessReconcileErrorMessage(error)
       this.#readinessReconcileConsecutiveFailures += 1
       this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
       this.#readinessReconcileLastFailureAtMs = this.#clock.now()
@@ -24914,6 +24909,20 @@ const describeError = (error: unknown): { errorMessage: string; errorStack?: str
   } catch {
     return { errorMessage: 'Unknown error' }
   }
+}
+
+const readinessReconcileErrorMessage = (error: unknown): string => {
+  // JavaScript may reject with an empty string or no value. Always retain a
+  // useful cause when a failure is counted, including on the startup path.
+  const message = describeError(error).errorMessage
+  const cause = message.trim() && error !== null && error !== undefined
+    ? message
+    : 'Discovery sweep failed without an error message'
+  const overload = relayfileOverload(error)
+  return overload
+    ? `${cause} [relayfile ${overload.status} ${relayfileOverloadReasonLabel(overload.reason)}` +
+      `${overload.retryAfterSeconds === undefined ? '' : `; retry-after=${overload.retryAfterSeconds}s`}]`
+    : cause
 }
 
 const failedIterationReport = (error: unknown, dryRun: boolean): IterationReport => {

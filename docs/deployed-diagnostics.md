@@ -258,6 +258,12 @@ logic of its own by design: the boundary lives in one place, in this repo, with 
 
 ### How discovery health reaches `ok`
 
+Startup and periodic sweep failures retain their cause in authenticated
+`readinessReconcile.lastError` and its persisted heartbeat record. Rejections with no message
+record `Discovery sweep failed without an error message`; a successful periodic pass clears the
+previous error. The public health block exposes only `lastErrorClass`, so reading `lastError`
+from that redacted block does not establish whether the authenticated cause was recorded.
+
 `ok` requires a live process and discovery that is not `stalled`. The existing readiness state
 machine supplies that verdict; a hung sweep need not return or increment `consecutiveFailures`
 first. A fresh heartbeat, free dispatch capacity, or zero waiting issues cannot override it.

@@ -17248,7 +17248,13 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('marks periodic readiness reconciliation degraded after repeated failures and clears it on recovery', async () => {
+  it.each([
+    { label: 'Error', failure: new Error('periodic discovery unavailable'), message: 'periodic discovery unavailable' },
+    { label: 'empty string', failure: '', message: 'Discovery sweep failed without an error message' },
+    { label: 'whitespace', failure: '  ', message: 'Discovery sweep failed without an error message' },
+    { label: 'null', failure: null, message: 'Discovery sweep failed without an error message' },
+    { label: 'undefined', failure: undefined, message: 'Discovery sweep failed without an error message' },
+  ])('records a $label failure in readiness status and heartbeat and clears it on recovery', async ({ failure, message }) => {
     class FailingPeriodicStateStore extends InMemoryStateStore {
       failClaims = false
 
@@ -17258,7 +17264,7 @@ describe('FactoryLoop', () => {
         nowMs: number,
         leaseMs: number,
       ): Promise<DiscoverySweepClaim> {
-        if (this.failClaims) throw new Error('periodic discovery unavailable')
+        if (this.failClaims) throw failure
         return await super.claimDiscoverySweep(workspaceId, owner, nowMs, leaseMs)
       }
     }
@@ -17292,7 +17298,7 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(factory.status().readinessReconcile).toMatchObject({
         state: 'degraded',
         failureThreshold: 3,
-        lastError: 'periodic discovery unavailable',
+        lastError: message,
       }), { timeout: 3_000 })
       expect(factory.status().readinessReconcile?.consecutiveFailures).toBeGreaterThanOrEqual(3)
       await vi.waitFor(async () => expect(await readFactoryLoopHeartbeat(heartbeatPath)).toMatchObject({
@@ -17300,7 +17306,7 @@ describe('FactoryLoop', () => {
           state: 'degraded',
           consecutiveFailures: expect.any(Number),
           failureThreshold: 3,
-          lastError: 'periodic discovery unavailable',
+          lastError: message,
         },
       }))
 
@@ -17310,6 +17316,15 @@ describe('FactoryLoop', () => {
         consecutiveFailures: 0,
         lastCompletedAtMs: expect.any(Number),
       }), { timeout: 3_000 })
+      expect(factory.status().readinessReconcile?.lastError).toBeUndefined()
+      expect(factory.status().readinessReconcile?.lastErrorClass).toBeUndefined()
+      expect(factory.status().counters.readinessReconcileDeadlineExceeded ?? 0).toBe(0)
+      await vi.waitFor(async () => {
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        expect(heartbeat?.readinessReconcile?.consecutiveFailures).toBe(0)
+        expect(heartbeat?.readinessReconcile?.lastError).toBeUndefined()
+        expect(heartbeat?.readinessReconcile?.lastErrorClass).toBeUndefined()
+      })
     } finally {
       stateStore.failClaims = false
       await factory.stop()
@@ -18789,19 +18804,34 @@ describe('FactoryLoop', () => {
     await factory.stop()
   })
 
-  it('keeps the daemon up when the startup full pull throws', async () => {
+  it('keeps the daemon up and persists the cause when the startup full pull throws', async () => {
     const mount = new RouteNotFoundThrowingPullMount({})
     const fleet = new FakeFleetClient()
-    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    const root = await mkdtemp(join(tmpdir(), 'factory-startup-failure-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const factory = createFactory(config({
+      loop: { heartbeatPath, registryPath: join(root, 'registry.json') },
+    }), { mount, fleet, triage: new StaticTriage() })
 
-    await expect(
-      factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } }),
-    ).resolves.toBeUndefined()
+    try {
+      await expect(
+        factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } }),
+      ).resolves.toBeUndefined()
 
-    expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBe(1)
-    expect(factory.status().counters.liveHighWatermarkFullPullErrors).toBe(1)
-    expect(factory.status().counters.liveStartupBackfillErrors).toBe(1)
-    await factory.stop()
+      expect(factory.status().counters.liveHighWatermarkFullPullFallbacks).toBe(1)
+      expect(factory.status().counters.liveHighWatermarkFullPullErrors).toBe(1)
+      expect(factory.status().counters.liveStartupBackfillErrors).toBe(1)
+      const failure = {
+        lastError: 'startup pull boom',
+        lastErrorClass: 'Error',
+        lastFailureAtMs: expect.any(Number),
+      }
+      expect(factory.status().readinessReconcile).toMatchObject(failure)
+      expect((await readFactoryLoopHeartbeat(heartbeatPath))?.readinessReconcile).toMatchObject(failure)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('dispatches an issue that arrives via a live event during the startup full pull', async () => {
