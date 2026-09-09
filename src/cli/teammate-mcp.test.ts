@@ -89,7 +89,9 @@ describe('Factory teammate MCP', () => {
       await client.close()
       await server.close()
     }
-  })
+    // Preserve headroom for the full MCP handshake on a loaded CI runner;
+    // inbox HTTP requests are isolated above rather than covered by this budget.
+  }, 15_000)
 })
 
 function toolJson(result: { content?: unknown }): unknown {
