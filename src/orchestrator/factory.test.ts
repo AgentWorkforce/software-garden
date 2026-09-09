@@ -26594,9 +26594,10 @@ describe('FactoryLoop', () => {
     const issue = githubIssueFile(491, { labels: ['factory'], author: 'reporter' })
     const mount = new FakeMountClient({ [path]: issue })
     const fleet = new FakeFleetClient()
+    const clock = new ManualClock()
     const stateStore = new InMemoryStateStore({ batchSize: 2 })
     const factory = createFactory(config({ issueSource: 'github' }), {
-      mount, fleet, stateStore, triage: new StaticTriage(),
+      mount, fleet, stateStore, clock, triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
     })
     let rejectSpawn!: (error: Error) => void
@@ -26617,6 +26618,24 @@ describe('FactoryLoop', () => {
       const watch = (await stateStore.listGithubIssueCommentWatches('factory-test'))[0]?.[1]
       expect(watch).toBeDefined()
       expect(watch?.processedCommentIds).not.toContain('94911')
+      expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
+
+      clock.advance(60_000)
+      vi.mocked(fleet.spawn).mockRestore()
+      await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(path, issue)))
+      // Retry must replay the persisted question without another comment or
+      // agent-exit event. Its later human answer then has a pending question.
+      await vi.waitFor(() => expect(factory.status().counters.githubAgentQuestionsDetected).toBe(1))
+      expect(factory.status().inFlight).toEqual([])
+      expect(fleet.releases).toEqual([
+        { name: 'ar-491-impl-pear', reason: 'waiting-for-human' },
+        { name: 'ar-491-review-pear', reason: 'waiting-for-human' },
+      ])
+      mount.files.set(path, { content: githubIssueFile(491, { labels: ['factory', 'factory:in-progress'], author: 'reporter' }) })
+      emitGithubIssueComment(mount, 'AgentWorkforce', 'pear', 491, 94912, {
+        body: 'Use the shared helper.', author: { login: 'reporter' },
+      })
+      await vi.waitFor(() => expect(factory.status().counters.clarificationTeamsWoken).toBe(1))
       expect(await stateStore.listWaitingClarifications('factory-test')).toEqual([])
     } finally {
       rejectSpawn(new Error('placement acknowledgement failed'))

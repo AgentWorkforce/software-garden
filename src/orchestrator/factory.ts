@@ -6040,7 +6040,6 @@ export class FactoryLoop implements Factory {
     // exact shape of #303, reached through the fresh dispatch path instead of
     // the durable one (#303 review, CodeRabbit).
     this.#scheduleHeldAgentDeadline(record)
-    if (!dryRun) await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
 
     const spawnedForReaperHandoff: RegistryHandoffAgent[] = []
     // These waits belong to the durable work unit, not the ingestion surface.
@@ -6103,6 +6102,7 @@ export class FactoryLoop implements Factory {
     let rejectDispatchClaim: (() => Promise<never>) | undefined
     try {
       if (!dryRun) {
+        await this.#ensureGithubAgentQuestionWatch(record, liveIssue)
         const issue = await this.#readIssue(dispatchDecision.issue.path)
         if (!issue || !this.#isIssueReady(issue)) {
           throw new LiveDispatchStateChangedError(dispatchDecision.issue.key)
@@ -6248,6 +6248,20 @@ export class FactoryLoop implements Factory {
       settlePostSpawnIssueObservation(true)
       this.#increment('dispatched')
       this.#emit('dispatched', { issue: dispatchDecision.issue, result })
+      if (!dryRun) {
+        const source = githubIssueSourceRef(liveIssue)
+        if (source) {
+          // Replay questions rejected by a prior attempt even when its watcher
+          // stayed subscribed. Do not await: an answer in this same comment
+          // queue can itself be waiting for this dispatch to return.
+          void this.#replayGithubIssueComments(githubIssueSourceKey(source)).catch((error) => {
+            this.#increment('githubIssueCommentReplyErrors')
+            this.#logger.warn?.('[factory] failed to replay GitHub questions after dispatch', {
+              issue: record.issue, error,
+            })
+          })
+        }
+      }
       return result
     } catch (caughtError) {
       // Stop/deadline may reject the fence while any awaited provider or
@@ -15053,7 +15067,9 @@ export class FactoryLoop implements Factory {
       await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, normalizedWatch)
       return
     }
-    await this.#watchGithubIssueComments(watch)
+    // Dispatch installed its fence before subscribing. Replay after a
+    // successful claim, when all agents exist and can safely be parked.
+    await this.#watchGithubIssueComments(watch, { replay: false })
     if (!this.#githubIssueCommentWatchStates.has(key)) {
       throw new Error(`Unable to watch source GitHub issue comments for ${record.issue.key}`)
     }
@@ -15071,13 +15087,16 @@ export class FactoryLoop implements Factory {
     return waiting?.questionSource === 'github' && waiting.agents.some(({ name }) => name === agentName)
   }
 
-  async #watchGithubIssueComments(watch: GithubIssueCommentWatchState): Promise<boolean> {
+  async #watchGithubIssueComments(
+    watch: GithubIssueCommentWatchState,
+    opts: { replay?: boolean } = {},
+  ): Promise<boolean> {
     watch = normalizeGithubIssueCommentWatch(watch)
     const key = githubIssueSourceKey(watch.source)
     this.#githubIssueCommentWatchStates.set(key, watch)
     await this.#state.setGithubIssueCommentWatch(this.#workspaceId, key, watch)
     if (this.#githubIssueCommentWatchers.has(key)) {
-      await this.#replayGithubIssueComments(key)
+      if (opts.replay !== false) await this.#replayGithubIssueComments(key)
       return false
     }
 
@@ -15133,7 +15152,7 @@ export class FactoryLoop implements Factory {
         await this.#boundedStopTeardown('GitHub issue comment subscription unsubscribe', () => subscription.unsubscribe())
       },
     })
-    await this.#replayGithubIssueComments(key)
+    if (opts.replay !== false) await this.#replayGithubIssueComments(key)
     return true
   }
 
