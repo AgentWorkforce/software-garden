@@ -4011,6 +4011,52 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('reuses unchanged dependency PR history across sweeps and observes a later merge', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dependency-probe-cache-'))
+    const run = async (cached: boolean) => {
+      const mount = new FakeMountClient({
+        [githubIssuePath('AgentWorkforce', 'pear', 128)]: githubIssueFile(128, { labels: ['reference-only'] }),
+        [githubIssuePath('AgentWorkforce', 'pear', 131)]: githubIssueFile(131, { labels: ['factory'], body: 'Blocked by: #128' }),
+        ...Object.fromEntries(Array.from({ length: 161 }, (_, index) => [
+          `/github/repos/AgentWorkforce__pear/pulls/by-id/${9000 + index}.json`,
+          prFile(9000 + index, { title: 'Unrelated', body: '', head_ref: `unrelated-${index}`, state: 'CLOSED' }),
+        ])),
+      })
+      let watermark = 'evt_1'
+      mount.getEventHighWatermark = async (opts) => cached && opts?.provider === 'github' ? watermark : undefined
+      const factory = createFactory(config({
+        issueSource: 'github', loop: { registryPath: join(root, `registry-${cached}.json`) },
+      }), {
+        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(), logger: {},
+      })
+      try {
+        for (let sweep = 0; sweep < 3; sweep += 1) {
+          const report = await factory.runOnce()
+          expect(report.dispatched).toEqual([])
+          expect(report.skipped).toContainEqual(expect.objectContaining({ issue: expect.objectContaining({ key: '131' }), code: 'parked-dependency' }))
+        }
+        expect(factory.status().prProbe).toMatchObject({
+          recordReads: cached ? 161 : 483, recordCacheHits: cached ? 322 : 0,
+        })
+        await mount.writeFile('/github/repos/AgentWorkforce__pear/pulls/by-id/9160.json',
+          prFile(9160, { title: 'Prerequisite', body: 'Fixes #128', head_ref: 'unrelated-160', state: 'closed', merged: true }))
+        watermark = 'evt_2'
+        const merged = await factory.runOnce()
+        expect(merged.dispatched.map((result) => result.issue.key)).toEqual(['131'])
+        expect(factory.status().prProbe?.recordReads).toBe(cached ? 322 : 644)
+      } finally {
+        await factory.stop()
+      }
+    }
+    try {
+      await run(false)
+      await run(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('extracts dependency declarations from Linear issue descriptions', async () => {
     const blockerPath = issuePath(140)
     const dependentPath = issuePath(141)
@@ -6145,6 +6191,43 @@ describe('FactoryLoop', () => {
         terminal: false,
       })
       expect(restartedFactory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shares historical PR reads across orphan candidates in the discovery sweep', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-probe-cache-'))
+    const run = async (watermark: string | undefined) => {
+      const mount = new FakeMountClient({
+        ...Object.fromEntries([52, 53].map((number) => [
+          githubIssuePath('AgentWorkforce', 'pear', number),
+          githubIssueFile(number, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+        ])),
+        ...Object.fromEntries(Array.from({ length: 282 }, (_, index) => [
+          `/github/repos/AgentWorkforce__pear/pulls/by-id/${9000 + index}.json`,
+          prFile(9000 + index, { title: 'Unrelated', body: '', head_ref: `unrelated-${index}`, state: 'CLOSED' }),
+        ])),
+      })
+      mount.getEventHighWatermark = async (opts) => opts?.provider === 'github' ? watermark : undefined
+      const factory = createFactory(config({
+        issueSource: 'github', loop: { registryPath: join(root, `registry-${watermark ?? 'uncached'}.json`) },
+      }), {
+        mount, fleet: new FakeFleetClient(), stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(), githubWriteback: new RecordingGithubWriteback(), logger: {},
+      })
+      try {
+        const report = await factory.runOnce()
+        expect(report.dispatched.map((result) => result.issue.key).sort()).toEqual(['52', '53'])
+        expect(factory.status().counters.githubOrphanedInProgressRecovered).toBe(2)
+        return factory.status().prProbe
+      } finally {
+        await factory.stop()
+      }
+    }
+    try {
+      expect(await run(undefined)).toMatchObject({ recordReads: 564, recordCacheHits: 0 })
+      expect(await run('evt_1')).toMatchObject({ recordReads: 282, recordCacheHits: 282 })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -23027,6 +23110,25 @@ describe('FactoryLoop', () => {
     expect(probePrRecordReads(mount)).toHaveLength(2)
     expect(factory.status().counters.probePrMountReads).toBe(2)
     expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+  })
+
+  it('publishes record reuse across completion probes that find no PR', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(780)]: issueFile(780),
+      ...Object.fromEntries(Array.from({ length: 30 }, (_, index) => [
+        `/github/repos/AgentWorkforce__pear/pulls/by-id/${9000 + index}.json`,
+        prFile(9000 + index, { title: 'Unrelated work', head_ref: `unrelated-${index}`, body: '', state: 'OPEN' }),
+      ])),
+    })
+    mount.getEventHighWatermark = async () => 'evt_1'
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(780), issueFile(780))))
+    fleet.emitAgentExit('ar-780-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.probePrRecordsVisited).toBe(60))
+    expect(factory.status().prProbe).toMatchObject({ recordReads: 30, recordCacheHits: 30 })
+    expect(factory.status().counters.probePrMountReads).toBe(30)
   })
 
   it('walks unscoped rather than scoping a keyword-routed probe to repos.default', async () => {

@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
+import { PrProbeReadCache } from './pr-probe-read-cache'
 
 import {
   DEFAULT_DISCOVERY_SWEEP_BUDGET_MS,
@@ -1401,6 +1402,7 @@ export class FactoryLoop implements Factory {
   readonly #previewReferences = new Map<string, PreviewReference[]>()
   readonly #removedPreviewIds = new Set<string>()
   readonly #probePrResolvedCache = new Map<string, { pr: ResolvedIssuePr; expiresAtMs: number }>()
+  readonly #probePrRecords = new PrProbeReadCache<NonNullable<Awaited<ReturnType<typeof readProbePrCandidate>>>>()
   // GitHub issue mirror-id -> resolved Linear mirror path, so repeat ingestion
   // cycles read the mirror directly instead of re-scanning all Linear issues.
   readonly #githubMirrorPathCache = new Map<string, string>()
@@ -3408,13 +3410,19 @@ export class FactoryLoop implements Factory {
       return cached.pr
     }
 
+    // A no-match answer still requires examining bodies that the pull index
+    // cannot describe. Share those records across probes while the mount is
+    // unchanged; do not cache an issue-level negative answer.
+    const observer = this.#probeMountWalkProgress('[factory] PR probe mount read progress', issue)
+    const readRecord = await this.#probePrRecordReader(observer)
     const mountPr = await resolveIssuePrFromMount(
       this.#mount,
       this.#config,
       issue,
       opts,
       (prefix) => this.#listRelayfileTree(prefix, 'PR probe resolution'),
-      this.#probeMountWalkProgress('[factory] PR probe mount read progress', issue),
+      observer,
+      readRecord,
     )
     if (mountPr) {
       // The mount branch runs first and is the common hit, and until now it was
@@ -5602,6 +5610,16 @@ export class FactoryLoop implements Factory {
     return Math.max(0, this.#clock.now() - startedAtMs)
   }
 
+  async #probePrRecordReader(observer: ProbeMountWalkObserver): Promise<(path: string, fresh?: boolean) => ReturnType<typeof readProbePrCandidate>> {
+    const watermark = await this.#probePrRecords.watermark(
+      () => this.#mount.getEventHighWatermark?.({ provider: 'github' }) ?? Promise.resolve(undefined),
+    )
+    return this.#probePrRecords.reader(watermark, (path) => {
+      observer.onRecordRead?.()
+      return readProbePrCandidate(this.#mount, path, observer.onLookupError)
+    })
+  }
+
   /**
    * Progress reporting for the mount PR walk.
    *
@@ -5622,8 +5640,9 @@ export class FactoryLoop implements Factory {
     const startedAtMs = this.#clock.now()
     let lastLoggedAtMs = startedAtMs
     return {
+      onRecordRead: () => { this.#increment('probePrMountReads') },
       onRead: (progress) => {
-        this.#increment('probePrMountReads')
+        this.#increment('probePrRecordsVisited')
         lastLoggedAtMs = this.#logTimedProgress(message, startedAtMs, lastLoggedAtMs, {
           issue: issue.key,
           read: progress.read,
@@ -6518,6 +6537,7 @@ export class FactoryLoop implements Factory {
         capacityBlocked: parked.capacityBlocked,
       })) ?? [],
       counters: { ...this.#counters },
+      prProbe: this.#probePrRecords.status(),
       fleetControlPlane: this.#fleetControlPlane.status(),
       // Optional on the port: a backend with no socket omits it, and an absent
       // value stays absent rather than being invented as healthy.
@@ -10564,6 +10584,10 @@ export class FactoryLoop implements Factory {
     const generation = this.#dependencyPrProbeGeneration
     let lookupFailed = false
     this.#increment('dependencyPrProbeCacheMisses')
+    const observer: ProbeMountWalkObserver = {
+      ...this.#probeMountWalkProgress('[factory] dependency PR probe mount read progress', issue),
+      onLookupError: () => { lookupFailed = true },
+    }
     const pullRequest = await resolveIssuePrFromMount(
       this.#mount,
       this.#config,
@@ -10573,10 +10597,8 @@ export class FactoryLoop implements Factory {
         repo,
       },
       (prefix) => this.#listRelayfileTree(prefix, 'dependency PR probe resolution'),
-      {
-        ...this.#probeMountWalkProgress('[factory] dependency PR probe mount read progress', issue),
-        onLookupError: () => { lookupFailed = true },
-      },
+      observer,
+      await this.#probePrRecordReader(observer),
     )
     if (normalizePrState(pullRequest?.state) !== 'MERGED') {
       if (lookupFailed) this.#increment('dependencyPrProbeCacheSkippedErrors')
@@ -11085,6 +11107,7 @@ export class FactoryLoop implements Factory {
           }
         : {}),
       registryPath,
+      prProbe: this.#probePrRecords.status(),
       eventListener: this.#eventListenerStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
@@ -18538,6 +18561,7 @@ export class FactoryLoop implements Factory {
       settleIssueWritebackOnce()
       this.#completionInFlight.delete(completionKey)
       const stateKey = issueStateKey(record.issue)
+      this.#probePrRecords.invalidate()
       // Both maps are keyed by issue state key PLUS the option suffixes
       // `#resolveIssuePr` appends (`:open`, `:legacy`, `:open:legacy`), but this
       // invalidation only ever deleted the bare key. Every `openOnly` probe —
@@ -23297,6 +23321,7 @@ const PROBE_PR_INDEX_FALLBACK_COUNTERS: Record<PullIndexFallbackReason, string> 
 
 type ProbeMountWalkObserver = {
   onLookupError?: () => void
+  onRecordRead?: () => void
   onRead?: (progress: { read: number; total: number; path: string }) => void
   onIndexFallback?: (repo: string, reason: PullIndexFallbackReason) => void
   onIndexHit?: (repo: string, prNumber: number) => void
@@ -23509,6 +23534,7 @@ const resolveProbePrFromPullIndex = async (
   walk: string[],
   pullNumbersOnDisk: Set<number>,
   observer: ProbeMountWalkObserver,
+  readRecord: (path: string, fresh?: boolean) => ReturnType<typeof readProbePrCandidate>,
 ): Promise<
   | { candidate: ResolvedIssuePr & { score: number }; reason?: undefined }
   | { candidate?: undefined; reason: PullIndexFallbackReason }
@@ -23531,7 +23557,9 @@ const resolveProbePrFromPullIndex = async (
   const path = walk.find((candidatePath) => githubPullPathParts(candidatePath)?.number === best.number)
   if (!path) return { reason: 'index-disagreed' }
 
-  const pr = await readProbePrCandidate(mount, path, observer.onLookupError)
+  // Index confirmation remains a fresh point read, even when a fallback walk
+  // has previously cached this record.
+  const pr = await readRecord(path, true)
   observer.onRead?.({ read: 1, total: 1, path })
   if (!pr) return { reason: 'index-disagreed' }
   if (opts.openOnly && normalizePrState(pr.state) !== 'OPEN') return { reason: 'index-disagreed' }
@@ -23564,6 +23592,10 @@ export const resolveIssuePrFromMount = async (
   } = {},
   listTree: (prefix: string) => Promise<string[]> = (prefix) => mount.listTree(prefix),
   observer: ProbeMountWalkObserver = {},
+  readRecord: (path: string, fresh?: boolean) => ReturnType<typeof readProbePrCandidate> = (path) => {
+    observer.onRecordRead?.()
+    return readProbePrCandidate(mount, path, observer.onLookupError)
+  },
 ): Promise<ResolvedIssuePr | undefined> => {
   const candidates: Array<ResolvedIssuePr & { score: number }> = []
   const listErrors: unknown[] = []
@@ -23625,6 +23657,7 @@ export const resolveIssuePrFromMount = async (
       walk,
       pullNumbersOnDisk,
       observer,
+      readRecord,
     )
     if (fromIndex.candidate) {
       candidates.push(fromIndex.candidate)
@@ -23634,7 +23667,7 @@ export const resolveIssuePrFromMount = async (
 
     let read = 0
     for (const path of walk) {
-      const pr = await readProbePrCandidate(mount, path, observer.onLookupError)
+      const pr = await readRecord(path)
       read += 1
       observer.onRead?.({ read, total: walk.length, path })
       if (opts.openOnly && normalizePrState(pr?.state) !== 'OPEN') continue

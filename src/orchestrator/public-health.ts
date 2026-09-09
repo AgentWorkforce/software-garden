@@ -159,6 +159,20 @@ const plainRecord = (value: unknown): Record<string, unknown> | undefined =>
     ? value as Record<string, unknown>
     : undefined
 
+const prProbeHealth = (value: unknown): FactoryPublicHealth['prProbe'] => {
+  const record = plainRecord(value)
+  if (!record) return undefined
+  return {
+    recordReads: counter(record.recordReads),
+    recordCacheHits: counter(record.recordCacheHits),
+    recordCacheEntries: counter(record.recordCacheEntries),
+    recordCacheLimit: counter(record.recordCacheLimit),
+    invalidations: counter(record.invalidations),
+    evictions: counter(record.evictions),
+    uncachedProbes: counter(record.uncachedProbes),
+  }
+}
+
 const optionalNumber = <K extends string>(key: K, value: unknown): Partial<Record<K, number>> => {
   const parsed = finiteNumber(value)
   return parsed === undefined ? {} : { [key]: parsed } as Partial<Record<K, number>>
@@ -921,6 +935,7 @@ export function publicHealthFromHeartbeat(
     degradedSubsystems: [...degradedSubsystems],
     ...(reason ? { reason } : {}),
     ...(readinessReconcile ? { readinessReconcile } : {}),
+    ...(heartbeat.prProbe ? { prProbe: prProbeHealth(heartbeat.prProbe) } : {}),
     ...(eventListener ? { eventListener } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
     ...(fleetConnect ? { fleetConnect } : {}),
@@ -953,6 +968,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const record = plainRecord(value)
   if (!record) return undefined
   const readiness = plainRecord(record.readinessReconcile)
+  const prProbe = prProbeHealth(record.prProbe)
   const listener = plainRecord(record.eventListener)
   const fleet = plainRecord(record.fleetControlPlane)
   const fleetConnect = plainRecord(record.fleetConnect)
@@ -1011,6 +1027,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     ...optionalDuration('ageMs', record.ageMs),
     loopStatus: enumValue(record.loopStatus, ['running', 'idle', 'stopping'] as const),
     degradedSubsystems: [...degradedSubsystems],
+    ...(prProbe ? { prProbe } : {}),
     ...(typeof record.reason === 'string'
       ? { reason: boundedText(record.reason) }
       : {}),
