@@ -816,6 +816,9 @@ abandoned so a restart cannot respawn it:
 A reservation that has not placed an agent is reclaimed after
 `dispatch.agentlessHoldTimeoutMs` (default: **60 seconds**). Increase this grace
 explicitly for slower provisioning. Late placements are fenced and released.
+When every placed worker is confirmed gone, `dispatch.deadPlacementHoldTimeoutMs`
+(default: **30 minutes**, measured from first placement and capped by
+`agentHoldTimeoutMs`) bounds the remaining hold independently of provisioning.
 Confirmed terminal writeback frees the slot before notification and release
 cleanup; a resumed or reopened work item gets a fresh reservation clock.
 

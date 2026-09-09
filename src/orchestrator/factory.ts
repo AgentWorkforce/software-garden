@@ -7363,7 +7363,9 @@ export class FactoryLoop implements Factory {
     /** True when the agent hold ran under the shorter dead-placement fallback. */
     deadPlacementFallback: boolean
   } | undefined {
-    if (record.dryRun) return undefined
+    // Acknowledged writeback has freed capacity. Completion cleanup and its
+    // retries own this row; a hold timeout must not turn success into failure.
+    if (record.dryRun || record.lifecyclePhase === 'writeback-applied') return undefined
     if (record.heldSinceAtMs !== undefined) {
       // Gated on still holding a slot, and not on dead placements alone. A
       // record handed off to babysitters has released its implementers and is
@@ -7371,13 +7373,13 @@ export class FactoryLoop implements Factory {
       // is progressing perfectly well. What this bounds is the occupant that
       // costs everyone else their capacity.
       const deadPlacementFallback = !this.#hasLivePlacement(record) && this.#recordOccupiesSlot(record)
-      // `Math.min`, not the agent-less timeout outright: the two are
+      // `Math.min`, not the dead-placement timeout outright: the two are
       // independently configurable, and a fallback that LENGTHENED a hold
       // would be a worse bug than the one it fixes.
       const timeoutMs = deadPlacementFallback
         ? Math.min(
           this.#config.dispatch.agentHoldTimeoutMs,
-          this.#config.dispatch.agentlessHoldTimeoutMs,
+          this.#config.dispatch.deadPlacementHoldTimeoutMs,
         )
         : this.#config.dispatch.agentHoldTimeoutMs
       return {

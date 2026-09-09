@@ -176,6 +176,9 @@ export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000
  */
 export const DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS = 60_000
 
+/** Hold from first placement when every worker is confirmed gone. */
+export const DEFAULT_DEAD_PLACEMENT_HOLD_TIMEOUT_MS = 30 * 60_000
+
 /** Capacity wait past which a full batch stops reading as ordinary backpressure. */
 export const DEFAULT_CAPACITY_WAIT_WARN_MS = 30 * 60_000
 
@@ -193,6 +196,10 @@ const dispatchSchema = z.object({
   // happened, so before #303 nothing could ever reap it.
   agentlessHoldTimeoutMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000)
     .default(DEFAULT_AGENTLESS_HOLD_TIMEOUT_MS),
+  // Separate from first-placement grace: worker exit can precede merge gating
+  // and terminal writeback, so a short provisioning grace must not reap them.
+  deadPlacementHoldTimeoutMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000)
+    .default(DEFAULT_DEAD_PLACEMENT_HOLD_TIMEOUT_MS),
   /**
    * Wall-clock capacity wait past which dispatch is reported degraded (#303).
    *
