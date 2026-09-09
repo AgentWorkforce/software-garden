@@ -813,6 +813,27 @@ abandoned so a restart cannot respawn it:
 }
 ```
 
+A reservation that has not placed an agent is reclaimed after
+`dispatch.agentlessHoldTimeoutMs` (default: **60 seconds**). Increase this grace
+explicitly for slower provisioning. Late placements are fenced and released.
+When every placed worker is confirmed gone, `dispatch.deadPlacementHoldTimeoutMs`
+(default: **30 minutes**, measured from first placement and capped by
+`agentHoldTimeoutMs`) bounds the remaining hold independently of provisioning.
+Confirmed terminal writeback frees the slot before notification and release
+cleanup; a resumed or reopened work item gets a fresh reservation clock.
+
+`/healthz` publishes cumulative `dispatchCapacity.candidateSweeps`,
+`noCandidateSweeps`, `candidatesFound`, and `candidatesWithoutSlot`. The first
+three measure discovery of ready, in-scope work; the last counts capacity-denied
+admissions, including direct/event dispatch, without counting retry polls.
+Compare counter deltas: no-candidate sweeps indicate empty discovery, while
+capacity denials indicate work blocked on slots even before `waiting` updates.
+`incompleteCandidateSweeps` counts sweeps with any shed, missing, malformed, or
+failed candidate read, including sweeps aborted during a read. Those sweeps do
+not increment `candidateSweeps` or `noCandidateSweeps`; successfully read
+candidates still contribute to `candidatesFound` and can dispatch. Zero
+candidate sweeps means discovery has not completed a full measurement yet.
+
 ### Recover names created before dispatch identity proofs
 
 Software Garden stamps every dispatched agent with a stable broker identity derived from

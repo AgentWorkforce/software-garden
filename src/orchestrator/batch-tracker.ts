@@ -2,7 +2,7 @@ import type { AgentSpec, SpawnResult } from '../ports'
 import type { DispatchLifecyclePhase } from '../ports/state'
 import type { DispatchResult, FactoryDispatchClaimStatus, IssueRef, TriageDecision } from '../types'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
-import { githubRepositoriesMatch } from '../github/repo-identity'
+import { dispatchPhaseOccupiesSlot, dispatchHandedOffToBabysitters } from '../state/dispatch-lifecycle-slot'
 
 export interface TrackedAgent {
   spec: AgentSpec
@@ -398,12 +398,7 @@ const parkedSignature = (issue: ParkedIssue): string => JSON.stringify({
  * remains addressable for review events without starving new ready issues.
  */
 const dispatchOccupiesImplementationSlot = (record: InFlightIssue): boolean => {
-  const implementerRepos = [...new Set(record.decision.implementers.map((spec) => spec.repo))]
-  if (implementerRepos.length === 0) return true
-  const babysitterRepos = [...record.agents.values()]
-    .filter((agent) => agent.spec.role === 'babysitter')
-    .map((agent) => agent.spec.ownedPullRequest?.repo)
-    .filter((repo): repo is string => Boolean(repo))
-  return implementerRepos.some((repo) => !babysitterRepos.some((ownedRepo) =>
-    githubRepositoriesMatch(repo, ownedRepo)))
+  // Legacy records have no durable phase until their first save.
+  return (record.lifecyclePhase === undefined || dispatchPhaseOccupiesSlot(record.lifecyclePhase)) &&
+    !dispatchHandedOffToBabysitters(record.decision.implementers, [...record.agents.values()])
 }

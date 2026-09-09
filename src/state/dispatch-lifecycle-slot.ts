@@ -16,6 +16,7 @@ export const dispatchPhaseOccupiesSlot = (phase: DispatchLifecyclePhase | undefi
   phase !== undefined &&
   phase !== 'queued' &&
   phase !== 'waiting-for-human' &&
+  phase !== 'writeback-applied' &&
   phase !== 'releasing' &&
   phase !== 'complete' &&
   phase !== 'abandoned'
@@ -85,5 +86,11 @@ export const stampDispatchLifecycleSlot = (
     delete lifecycle.slotHeldSinceAtMs
     return
   }
-  lifecycle.slotHeldSinceAtMs ??= previous?.slotHeldSinceAtMs ?? nowMs
+  // A resumed/reopened work item owns a new reservation. Never inherit an
+  // earlier run's anchor or a stale caller snapshot after a released slot.
+  if (previous && (previous.runId !== lifecycle.runId || !dispatchLifecycleOccupiesSlot(previous))) {
+    lifecycle.slotHeldSinceAtMs = nowMs
+    return
+  }
+  lifecycle.slotHeldSinceAtMs = previous?.slotHeldSinceAtMs ?? lifecycle.slotHeldSinceAtMs ?? nowMs
 }

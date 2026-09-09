@@ -555,6 +555,17 @@ export interface FactoryDispatchSlotOccupant {
  * operator could reach. This is that predicate, published.
  */
 export interface FactoryDispatchCapacityStatus {
+  /** Cumulative completed candidate enumerations; zero means not measured yet. */
+  candidateSweeps?: number
+  /** Cumulative sweeps with at least one unreadable candidate path. */
+  incompleteCandidateSweeps?: number
+  /** Cumulative fully read enumerations with no ready, in-scope, dispatchable candidates. */
+  noCandidateSweeps?: number
+  /** Cumulative ready candidates observed, including repeats across sweeps. */
+  candidatesFound?: number
+  /** Cumulative dispatch admissions denied a slot, excluding retry polls. */
+  candidatesWithoutSlot?: number
+
   batchSize: number
   /** Lifecycles occupying a slot right now. */
   active: number
@@ -580,6 +591,17 @@ export interface FactoryDispatchCapacityStatus {
 
 /** Batch occupancy, redacted for the unauthenticated surface (#303). */
 export interface FactoryPublicDispatchCapacityHealth {
+  /** Cumulative completed candidate enumerations; zero means not measured yet. */
+  candidateSweeps?: number
+  /** Cumulative sweeps with at least one unreadable candidate path. */
+  incompleteCandidateSweeps?: number
+  /** Cumulative fully read enumerations with no ready, in-scope, dispatchable candidates. */
+  noCandidateSweeps?: number
+  /** Cumulative ready candidates observed, including repeats across sweeps. */
+  candidatesFound?: number
+  /** Cumulative dispatch admissions denied a slot, excluding retry polls. */
+  candidatesWithoutSlot?: number
+
   state: 'healthy' | 'waiting' | 'stalled'
   batchSize: number
   active: number

@@ -57,6 +57,21 @@ describe('dispatch capacity health (#303)', () => {
     },
   })
 
+  it('publishes candidate observations independently of the retry queue (#491)', () => {
+    const observations = { incompleteCandidateSweeps: 2, candidateSweeps: 3, noCandidateSweeps: 1, candidatesFound: 4, candidatesWithoutSlot: 2 }
+    const health = publicHealthFromHeartbeat(capacity({
+      ...observations, waiting: 0, occupants: [], longestWaitMs: undefined,
+    }), { nowMs: BOOT_MS })
+    expect(health.dispatchCapacity).toMatchObject({ waiting: 0, ...observations })
+    expect(normalizePublicHealth(health)?.dispatchCapacity).toMatchObject(observations)
+    const empty = publicHealthFromHeartbeat(capacity({
+      candidateSweeps: 1, noCandidateSweeps: 1, candidatesFound: 0, candidatesWithoutSlot: 0,
+      waiting: 0, active: 0, occupants: [],
+    }), { nowMs: BOOT_MS })
+    expect(empty.dispatchCapacity).toMatchObject({ candidatesFound: 0, candidatesWithoutSlot: 0, noCandidateSweeps: 1 })
+    expect(publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS }).dispatchCapacity?.candidateSweeps).toBeUndefined()
+  })
+
   it('reports a long capacity wait as a dispatch-gating degradation', () => {
     const health = publicHealthFromHeartbeat(capacity(), { nowMs: BOOT_MS + 1_000 })
 

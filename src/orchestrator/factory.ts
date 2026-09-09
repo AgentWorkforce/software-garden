@@ -97,6 +97,7 @@ import {
   dispatchHandedOffToBabysitters,
   dispatchLifecycleOccupiesSlot,
   dispatchPhaseOccupiesSlot,
+  stampDispatchLifecycleSlot,
 } from '../state/dispatch-lifecycle-slot'
 import { ISSUE_KEY_PARTS, branchImplementsIssue, containsExplicitIssueReference, containsIssueKey, factoryBranchBelongsToIssue, prBodyDisclaimsClosing, prClosureAuthority } from '../issue-key-match'
 import { normalizeLogger, normalizeLogValue, setSafeErrorStack, stringifyLogValue } from '../logging'
@@ -4017,6 +4018,8 @@ export class FactoryLoop implements Factory {
       let lastReadyReadProgressAtMs = this.#clock.now()
       let readyIssueReads = 0
 
+      let candidateCount = 0
+      let candidateReadsIncomplete = false
       const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
         // A between-await check, worth exactly what #368 said such a check is
@@ -4056,6 +4059,14 @@ export class FactoryLoop implements Factory {
             reason: perItemDispatchSkipReason(error),
             code: 'read-failed',
           })
+        } finally {
+          // Shed, missing, malformed, and failed reads cannot establish that
+          // discovery is empty. Count the sweep once, even if the fuse aborts
+          // it, while retaining candidates successfully read from other paths.
+          if (!issue && !candidateReadsIncomplete) {
+            candidateReadsIncomplete = true
+            this.#increment('dispatchIncompleteCandidateSweeps')
+          }
         }
         readyIssueReads += 1
         // Relayfile served this work unit's read: the dependency is shedding
@@ -4082,9 +4093,19 @@ export class FactoryLoop implements Factory {
           if (issue) {
             await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))
           }
+          if (issue && this.#isIssueReady(issue) && isInFactoryScope(issue, this.#config.safety) && isDispatchableIssue(issue)) {
+            candidateCount += 1
+            // Publish before triage/dispatch can block: waiting only measures
+            // work that already reached durable capacity admission.
+            this.#increment('dispatchCandidatesFound')
+          }
           issueEntries.push({ path, issue })
         }
         await this.#refreshLiveHeartbeatIfDue()
+      }
+      if (!this.#discoverySweepDiscoveryFailed && !candidateReadsIncomplete) {
+        this.#increment('dispatchCandidateSweeps')
+        if (candidateCount === 0) this.#increment('dispatchNoCandidateSweeps')
       }
       if (issueSource === 'github') {
         // New ready work must not sit behind a long sequence of stale
@@ -5943,6 +5964,7 @@ export class FactoryLoop implements Factory {
         return lifecycleClaim.lifecycle.result ?? { issue: dispatchDecision.issue, agents: [], dryRun }
       }
       if (lifecycleClaim.lifecycle.phase === 'queued') {
+        this.#increment('dispatchCandidatesWithoutSlot')
         const queuedRecord = inFlightRecordFromLifecycle(lifecycleClaim.lifecycle)
         this.#scheduleDispatchLifecycleRetry(queuedRecord)
         this.#increment('queued')
@@ -6023,6 +6045,7 @@ export class FactoryLoop implements Factory {
       await this.#clearDispatchInFlight(dispatchDecision.issue)
       this.#increment('queued')
       this.#emit('issue-queued', { issue: dispatchDecision.issue })
+      if (!dryRun) this.#increment('dispatchCandidatesWithoutSlot')
       return { issue: dispatchDecision.issue, agents: [], dryRun, hold: { kind: 'capacity' } }
     }
 
@@ -7359,7 +7382,9 @@ export class FactoryLoop implements Factory {
     /** True when the agent hold ran under the shorter dead-placement fallback. */
     deadPlacementFallback: boolean
   } | undefined {
-    if (record.dryRun) return undefined
+    // Acknowledged writeback has freed capacity. Completion cleanup and its
+    // retries own this row; a hold timeout must not turn success into failure.
+    if (record.dryRun || record.lifecyclePhase === 'writeback-applied') return undefined
     if (record.heldSinceAtMs !== undefined) {
       // Gated on still holding a slot, and not on dead placements alone. A
       // record handed off to babysitters has released its implementers and is
@@ -7367,13 +7392,13 @@ export class FactoryLoop implements Factory {
       // is progressing perfectly well. What this bounds is the occupant that
       // costs everyone else their capacity.
       const deadPlacementFallback = !this.#hasLivePlacement(record) && this.#recordOccupiesSlot(record)
-      // `Math.min`, not the agent-less timeout outright: the two are
+      // `Math.min`, not the dead-placement timeout outright: the two are
       // independently configurable, and a fallback that LENGTHENED a hold
       // would be a worse bug than the one it fixes.
       const timeoutMs = deadPlacementFallback
         ? Math.min(
           this.#config.dispatch.agentHoldTimeoutMs,
-          this.#config.dispatch.agentlessHoldTimeoutMs,
+          this.#config.dispatch.deadPlacementHoldTimeoutMs,
         )
         : this.#config.dispatch.agentHoldTimeoutMs
       return {
@@ -8086,12 +8111,14 @@ export class FactoryLoop implements Factory {
           if (tracked) tracked.releasedAtMs ??= releasedAtMs
         }
       }
+      const savedAtMs = this.#clock.now()
+      stampDispatchLifecycleSlot(lifecycle, previous, savedAtMs)
       const saved = await this.#state.saveDispatchLifecycle(
         this.#workspaceId,
         key,
         this.#dispatchLifecycleOwner,
         epoch,
-        this.#clock.now(),
+        savedAtMs,
         lifecycle,
       )
       if (!saved) {
@@ -8104,6 +8131,7 @@ export class FactoryLoop implements Factory {
         this.#scheduleDispatchLifecycleRetry(record)
         return false
       }
+      if (record.lifecyclePhase === phase) record.slotHeldSinceAtMs = lifecycle.slotHeldSinceAtMs
       if (previous?.phase !== lifecycle.phase) {
         await this.#reportLifecycle(
           lifecycle,
@@ -8204,6 +8232,11 @@ export class FactoryLoop implements Factory {
       batchSize: this.#config.batchSize,
       active: occupants.length,
       waiting: waits.length,
+      candidateSweeps: this.#counters.dispatchCandidateSweeps ?? 0,
+      noCandidateSweeps: this.#counters.dispatchNoCandidateSweeps ?? 0,
+      incompleteCandidateSweeps: this.#counters.dispatchIncompleteCandidateSweeps ?? 0,
+      candidatesFound: this.#counters.dispatchCandidatesFound ?? 0,
+      candidatesWithoutSlot: this.#counters.dispatchCandidatesWithoutSlot ?? 0,
       waitWarnMs: this.#config.dispatch.capacityWaitWarnMs,
       agentlessHoldTimeoutMs: this.#config.dispatch.agentlessHoldTimeoutMs,
       // Published so `dispatchCapacity.state` and its readers can see BOTH
@@ -18367,10 +18400,6 @@ export class FactoryLoop implements Factory {
             // The lifecycle-state outcome is now known. Unblock the concurrent
             // post-spawn read before the separate completion comment write.
             settleIssueWritebackOnce()
-            await this.#githubWriteback.postComment(
-              issue,
-              `Software Garden agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
-            )
           } else {
             const closeWrite = await this.#githubWriteback.closeIssue(
               issue,
@@ -18416,11 +18445,20 @@ export class FactoryLoop implements Factory {
         // transition is a foreign live-state change: dispatch owns the
         // abandonment and must release agents with that reason, not issue-done.
         if (postSpawnIssueObservation && !await postSpawnIssueObservation.settled) return
-        if (!humanReview) await this.#markDependencyTerminalAndReconcile(issue)
       } else {
         settleIssueWritebackOnce()
       }
       if (!await this.#saveDispatchLifecycle(record, 'writeback-applied')) return
+
+      // Confirmed work is no longer an implementation slot. Notifications
+      // and dependent-work reconciliation may wait on external services.
+      if (issue && githubIssue && humanReview) {
+        await this.#githubWriteback.postComment(
+          issue,
+          `Software Garden agents completed; this issue is awaiting human review. The pull request remains open.\n\nMerge policy: ${this.#config.mergePolicy}`,
+        )
+      }
+      if (issue && !humanReview) await this.#markDependencyTerminalAndReconcile(issue)
 
       if (issue && this.#slack && this.#config.slack && !await this.#shouldSkipSlackWriteback('completion-thread')) {
         try {

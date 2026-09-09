@@ -92,3 +92,34 @@ describe('dispatch batch-slot accounting (#303)', () => {
     expect(next.slotHeldSinceAtMs).toBe(500)
   })
 })
+
+describe('work-item slot boundaries (#491)', () => {
+  it.each(['writeback-applied', 'releasing', 'complete'] as const)('releases capacity at %s', (phase) => {
+    const finished = lifecycle({ phase, slotHeldSinceAtMs: 100 })
+    stampDispatchLifecycleSlot(finished, lifecycle({ slotHeldSinceAtMs: 100 }), 1_000)
+    expect(dispatchLifecycleOccupiesSlot(finished)).toBe(false)
+    expect(finished.slotHeldSinceAtMs).toBeUndefined()
+  })
+
+  it.each(['new-run', 'resumed-run'] as const)('starts a new slot clock for a %s', (kind) => {
+    const previous = lifecycle({ slotHeldSinceAtMs: 100,
+      ...(kind === 'resumed-run' ? { phase: 'waiting-for-human' } : {}),
+    })
+    const next = lifecycle({ runId: kind === 'new-run' ? 'run-2' : previous.runId, slotHeldSinceAtMs: 100 })
+    const admittedAtMs = 150 * 60_000
+    stampDispatchLifecycleSlot(next, previous, admittedAtMs)
+    const releaseWindowMs = 60_000
+    next.heldSinceAtMs = admittedAtMs + 10_000
+    const observedAtMs = admittedAtMs + 15 * 60_000
+    const slotHeldForMs = observedAtMs - next.slotHeldSinceAtMs!
+    const heldForMs = observedAtMs - next.heldSinceAtMs
+    expect(next.slotHeldSinceAtMs).toBe(admittedAtMs)
+    expect(slotHeldForMs).toBeLessThanOrEqual(heldForMs + releaseWindowMs)
+  })
+
+  it('keeps the durable anchor when a stale writer brings a different timestamp', () => {
+    const next = lifecycle({ slotHeldSinceAtMs: 100 })
+    stampDispatchLifecycleSlot(next, lifecycle({ slotHeldSinceAtMs: 500 }), 1_000)
+    expect(next.slotHeldSinceAtMs).toBe(500)
+  })
+})
