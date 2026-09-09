@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
+import { publicReadinessFailure } from './readiness-failure'
 import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
 import type { FleetConnectStatus } from '../ports/fleet'
@@ -48,7 +49,8 @@ import type {
  * or what class of failure — and could not see a wedged sweep at all, because
  * a hang writes no state. The fields that answer those questions live in the
  * loop heartbeat next to `lastError`, which is free text and must not be
- * published.
+ * published. A public `lastError` is instead generated from the allowlisted
+ * phase and error classes; it never copies that raw message.
  *
  * This module is that boundary. It builds the public record **by
  * construction**: every field is named here, every number is coerced, every
@@ -581,12 +583,9 @@ function readinessReconcileHealth(
       ? { inFlightMs, missedPasses: Math.floor(inFlightMs / cadenceMs) }
       : {}),
     ...sweepOutcome(status),
-    // `lastError` itself never crosses. Its class does, through the same
-    // allowlist that guards IterationReport.skipped[].reason — and a record
-    // that carries an error but no admissible class still says so.
-    ...(status.lastErrorClass !== undefined || status.lastError !== undefined
-      ? { lastErrorClass: telemetryErrorClassName(status.lastErrorClass) }
-      : {}),
+    // A failed public stanza must have an explanation, including old writers
+    // that recorded only a failure count. Never copy the private message.
+    ...publicReadinessFailure(status),
   }
 }
 
@@ -1047,9 +1046,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             ...optionalDuration('inFlightMs', readiness.inFlightMs),
             ...optionalCount('missedPasses', readiness.missedPasses),
             ...sweepOutcome(readiness),
-            ...(readiness.lastErrorClass !== undefined
-              ? { lastErrorClass: telemetryErrorClassName(readiness.lastErrorClass) }
-              : {}),
+            ...publicReadinessFailure(readiness),
           },
         }
       : {}),

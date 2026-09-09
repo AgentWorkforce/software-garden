@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { PrProbeReadCache } from './pr-probe-read-cache'
+import { readinessFailureCauseClass, type ReadinessFailurePhase } from './readiness-failure'
 
 import {
   DEFAULT_DISCOVERY_SWEEP_BUDGET_MS,
@@ -1236,6 +1237,9 @@ export class FactoryLoop implements Factory {
   #readinessReconcileLastFailureAtMs?: number
   #readinessReconcileLastError?: string
   #readinessReconcileLastErrorClass?: string
+  #readinessReconcileLastErrorPhase?: ReadinessFailurePhase
+  #readinessReconcileLastErrorCauseClass?: string
+  #discoverySweepFailure?: { error: unknown; phase: ReadinessFailurePhase }
   #readinessReconcileZeroCandidateSweeps = 0
   /**
    * The last *enumerating* sweep's arithmetic (#355).
@@ -2420,8 +2424,8 @@ export class FactoryLoop implements Factory {
       // in-flight, instead of leaving the timestamps empty and the derived
       // state reading `healthy` forever.
       //
-      // Startup failures have their own counter, but must retain the same
-      // diagnostic cause as periodic failures in status and the heartbeat.
+      // Startup and periodic discovery share failure accounting: a failed
+      // first pass needs a cause and a retrying state before the first timer.
       const backfillStartedAtMs = this.#clock.now()
       this.#readinessReconcileLastStartedAtMs = backfillStartedAtMs
       try {
@@ -2433,12 +2437,14 @@ export class FactoryLoop implements Factory {
         this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
         const completedAtMs = this.#clock.now()
         this.#readinessReconcileLastCompletedAtMs = completedAtMs
+        this.#readinessReconcileConsecutiveFailures = 0
+        this.#readinessReconcileLastError = undefined
+        this.#readinessReconcileLastErrorClass = undefined
+        this.#readinessReconcileLastErrorPhase = undefined
+        this.#readinessReconcileLastErrorCauseClass = undefined
         this.#recordReadinessSweepOutcome(report, completedAtMs)
       } catch (error) {
-        this.#readinessReconcileLastDurationMs = this.#elapsedSince(backfillStartedAtMs)
-        this.#readinessReconcileLastFailureAtMs = this.#clock.now()
-        this.#readinessReconcileLastError = readinessReconcileErrorMessage(error)
-        this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
+        this.#recordReadinessFailure(error, backfillStartedAtMs)
         // A startup backfill failure must not abort the daemon: log it and fall
         // back to the live event stream (plus any buffered events) instead of
         // leaving the factory down.
@@ -2661,6 +2667,47 @@ export class FactoryLoop implements Factory {
     }
   }
 
+  #recordReadinessFailure(error: unknown, startedAtMs: number): void {
+    // #297: all four relayfile overload reason codes share one message, and
+    // `lastError` is what an operator reads from /evidence. Without the
+    // reason, "workspace durable object is busy" cannot be told apart from
+    // three other conditions with three different remedies.
+    //
+    // Allowlisted, because this is a persisted operator-facing surface and
+    // not just a log line: `lastError` is returned from `status()` and
+    // written into the loop heartbeat file, so an unbounded
+    // dependency-controlled string would land on disk.
+    const overload = relayfileOverload(error)
+    const message = describeError(error).errorMessage || 'Unknown error'
+    const errorMessage = overload
+      ? `${message} ` +
+        `[relayfile ${overload.status} ${relayfileOverloadReasonLabel(overload.reason)}` +
+        `${overload.retryAfterSeconds === undefined ? '' : `; retry-after=${overload.retryAfterSeconds}s`}]`
+      : message
+    this.#readinessReconcileConsecutiveFailures += 1
+    this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
+    this.#readinessReconcileLastFailureAtMs = this.#clock.now()
+    this.#readinessReconcileLastError = errorMessage
+    // This failure is now the latest settled pass. A deferral marker left by
+    // an older pass would falsely describe this one as lease contention when
+    // the timestamps/error below prove that it acquired the lease and failed.
+    this.#readinessReconcileLastSweepDeferred = undefined
+    // Same reasoning for the enumeration-failure marker: this pass reached a
+    // hard failure with its own error recorded below, so an older pass's
+    // absorbed listing failure must not be published beside it.
+    this.#readinessReconcileLastSweepFailed = undefined
+    // The class, unlike the message, is publishable: #295 puts it on the
+    // unauthenticated health surface through the same allowlist.
+    this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
+    this.#readinessReconcileLastErrorPhase = error instanceof ReadinessReconcileTimeoutError
+      ? 'readiness-deadline'
+      : this.#discoverySweepFailure && Object.is(this.#discoverySweepFailure.error, error)
+        ? this.#discoverySweepFailure.phase
+        : 'unknown'
+    this.#readinessReconcileLastErrorCauseClass = readinessFailureCauseClass(error)
+    this.#increment('readinessReconcileErrors')
+  }
+
   async #reconcileReadyIssues(): Promise<void> {
     const startedAtMs = this.#clock.now()
     this.#readinessReconcileLastStartedAtMs = startedAtMs
@@ -2678,6 +2725,8 @@ export class FactoryLoop implements Factory {
       this.#readinessReconcileLastCompletedAtMs = completedAtMs
       this.#readinessReconcileLastError = undefined
       this.#readinessReconcileLastErrorClass = undefined
+      this.#readinessReconcileLastErrorPhase = undefined
+      this.#readinessReconcileLastErrorCauseClass = undefined
       // The three integers below have gone to stdout since this loop existed,
       // and stdout does not reach the deployed container's operator (#355).
       // Publishing them is what lets a reader tell a sweep that saw eligible
@@ -2699,34 +2748,11 @@ export class FactoryLoop implements Factory {
         discoveryDeferred: report.discoveryDeferred,
       })
     } catch (error) {
-      // #297: all four relayfile overload reason codes share one message, and
-      // `lastError` is what an operator reads from /evidence. Without the
-      // reason, "workspace durable object is busy" cannot be told apart from
-      // three other conditions with three different remedies.
-      //
-      // Allowlisted, because this is a persisted operator-facing surface and
-      // not just a log line: `lastError` is returned from `status()` and
-      // written into the loop heartbeat file, so an unbounded
-      // dependency-controlled string would land on disk.
-      const errorMessage = readinessReconcileErrorMessage(error)
-      this.#readinessReconcileConsecutiveFailures += 1
-      this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
-      this.#readinessReconcileLastFailureAtMs = this.#clock.now()
-      this.#readinessReconcileLastError = errorMessage
-      // This failure is now the latest settled pass. A deferral marker left by
-      // an older pass would falsely describe this one as lease contention when
-      // the timestamps/error below prove that it acquired the lease and failed.
-      this.#readinessReconcileLastSweepDeferred = undefined
-      // Same reasoning for the enumeration-failure marker: this pass reached a
-      // hard failure with its own error recorded below, so an older pass's
-      // absorbed listing failure must not be published beside it.
-      this.#readinessReconcileLastSweepFailed = undefined
-      // The class, unlike the message, is publishable: #295 puts it on the
-      // unauthenticated health surface through the same allowlist.
-      this.#readinessReconcileLastErrorClass = telemetryErrorClass(error)
-      this.#increment('readinessReconcileErrors')
+      this.#recordReadinessFailure(error, startedAtMs)
       this.#logger.warn?.('[factory] periodic readiness reconciliation failed; retry remains scheduled', {
-        error: errorMessage,
+        error: this.#readinessReconcileLastError,
+        phase: this.#readinessReconcileLastErrorPhase,
+        causeClass: this.#readinessReconcileLastErrorCauseClass,
         durationMs: this.#readinessReconcileLastDurationMs,
         consecutiveFailures: this.#readinessReconcileConsecutiveFailures,
         degraded: this.#readinessReconcileConsecutiveFailures >= READINESS_RECONCILE_FAILURE_THRESHOLD,
@@ -3528,6 +3554,7 @@ export class FactoryLoop implements Factory {
     try {
       return await this.#runDiscoverySweep(opts, budget)
     } catch (error) {
+      this.#discoverySweepFailure = { error, phase: budget.phase() ?? 'unknown' }
       if (error instanceof DiscoverySweepBudgetExceededError) {
         this.#increment('discoverySweepBudgetExceeded')
         this.#logger.error?.('[factory] discovery sweep aborted at its aggregate budget', {
@@ -6838,6 +6865,8 @@ export class FactoryLoop implements Factory {
         ? { discoveryFailed: this.#readinessReconcileLastSweepFailed }
         : {}),
       ...(this.#readinessReconcileLastError ? { lastError: this.#readinessReconcileLastError } : {}),
+      ...(this.#readinessReconcileLastErrorPhase ? { lastErrorPhase: this.#readinessReconcileLastErrorPhase } : {}),
+      ...(this.#readinessReconcileLastErrorCauseClass ? { lastErrorCauseClass: this.#readinessReconcileLastErrorCauseClass } : {}),
       ...(this.#readinessReconcileLastErrorClass
         ? { lastErrorClass: this.#readinessReconcileLastErrorClass }
         : {}),

@@ -1,3 +1,4 @@
+import type { ReadinessFailurePhase } from './orchestrator/readiness-failure'
 import type { FactoryConfig } from './config/schema'
 import type { PrProbeReadCacheStatus } from './orchestrator/pr-probe-read-cache'
 import type { FactoryStateResolution } from './linear/state-resolver'
@@ -438,6 +439,8 @@ export interface FactoryReadinessReconcileStatus {
   lastError?: string
   /** Allowlisted class name of `lastError`; publishable. */
   lastErrorClass?: string
+  lastErrorPhase?: ReadinessFailurePhase
+  lastErrorCauseClass?: string
 }
 
 /** A subsystem state as published, plus the value an unrecognised one collapses to. */
@@ -522,6 +525,10 @@ export interface FactoryPublicReadinessReconcileHealth {
    */
   discoveryDeferred?: 'sweep-in-flight'
   lastErrorClass?: string
+  /** Generated from safe diagnostic fields; raw messages remain in /evidence. */
+  lastError?: string
+  lastErrorPhase?: ReadinessFailurePhase
+  lastErrorCauseClass?: string
 }
 
 /**
