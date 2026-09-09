@@ -18623,11 +18623,11 @@ describe('FactoryLoop', () => {
         }
       })
 
-      it('still fails the pass and re-arms when the broker cannot be reached at all', async () => {
+      it.each([0, 300_000])('keeps re-arming after roster failures with cache TTL %i', async (rosterCacheTtlMs) => {
         const mount = new CountingEventsMount()
         mount.setSubRoot('/linear/issues', 'absent')
         const fleet = new RebindingFleetClient()
-        const factory = createFactory(config({ issueSource: 'github' }), {
+        const factory = createFactory(config({ issueSource: 'github', fleetHealth: { rosterCacheTtlMs } }), {
           mount,
           fleet,
           triage: new StaticTriage(),
@@ -18641,14 +18641,21 @@ describe('FactoryLoop', () => {
         })
         try {
           fleet.failRoster = true
-          // An unreachable broker RAISES rather than hangs, so the pre-existing
-          // failure path carries it. The deadline is the backstop for a hang,
-          // not a substitute for an error, and must stay out of the way here.
+          // Only the no-cache arm should fault readiness. A usable snapshot
+          // keeps the live loop working while publishing roster degradation.
           await vi.waitFor(() => {
             const readiness = factory.status().readinessReconcile
-            expect(readiness?.consecutiveFailures ?? 0)
-              .toBeGreaterThanOrEqual(readiness?.failureThreshold ?? 3)
-            expect(readiness?.state).not.toBe('healthy')
+            if (rosterCacheTtlMs === 0) {
+              expect(readiness?.consecutiveFailures ?? 0)
+                .toBeGreaterThanOrEqual(readiness?.failureThreshold ?? 3)
+              expect(readiness?.state).not.toBe('healthy')
+              expect(factory.status().fleetControlPlane.rosterState).toBe('no-roster')
+            } else {
+              expect(factory.status().counters.fleetRosterStaleButUsable ?? 0).toBeGreaterThanOrEqual(3)
+              expect(readiness?.consecutiveFailures ?? 0).toBe(0)
+              expect(readiness?.state).toBe('healthy')
+              expect(factory.status().fleetControlPlane).toMatchObject({ state: 'closed', rosterState: 'roster-stale-but-usable' })
+            }
           }, { timeout: 8_000 })
           expect(factory.status().counters.readinessReconcileDeadlineExceeded ?? 0).toBe(0)
           // And the loop kept sweeping rather than stopping on the failures.
