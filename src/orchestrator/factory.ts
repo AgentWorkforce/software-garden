@@ -1313,6 +1313,10 @@ export class FactoryLoop implements Factory {
   // write boundary. A completion arriving first makes dispatch wait and
   // re-read; one arriving after claim entry waits for the claim to finish.
   readonly #postSpawnDispatchClaimFences = new Map<string, PostSpawnDispatchClaimFence>()
+  // A settled fence leaves the map before failed-dispatch cleanup releases
+  // its record. Remember rejection on that record so later questions cannot
+  // park it in the cleanup window; a fresh dispatch gets a fresh record.
+  readonly #questionRejectedDispatches = new WeakSet<InFlightIssue>()
   // Shutdown must not lose a local placement merely because a rejected
   // provider claim unwinds before #releaseInFlightAgents snapshots the batch.
   // The capture set makes both interleavings explicit: the dispatch catch may
@@ -6081,6 +6085,7 @@ export class FactoryLoop implements Factory {
         if (postSpawnDispatchClaimSettled) return
         postSpawnDispatchClaimSettled = true
         postSpawnDispatchClaimFence.accepted = accepted
+        if (!accepted) this.#questionRejectedDispatches.add(record)
         resolvePostSpawnDispatchClaim(accepted)
         if (this.#postSpawnDispatchClaimFences.get(postSpawnKey) === postSpawnDispatchClaimFence) {
           this.#postSpawnDispatchClaimFences.delete(postSpawnKey)
@@ -15440,6 +15445,9 @@ export class FactoryLoop implements Factory {
       throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
     }
     const record = (await this.#batch()).getIssue(watch.issue)
+    if (record && this.#questionRejectedDispatches.has(record)) {
+      throw new PostSpawnDispatchWaitRejectedError(watch.issue.key)
+    }
     if (!record || record.dryRun || request.issueKey.toLowerCase() !== record.issue.key.toLowerCase()) {
       this.#increment('githubAgentQuestionsIgnoredNoInFlight')
       return
