@@ -161,6 +161,8 @@ It also reports `fleetControlPlane`. Software Garden bounds its read-only roster
 and caches the last successful roster for `fleetHealth.rosterCacheTtlMs`
 (default five minutes; zero disables fallback). A slow or failed read allows
 dispatch to continue using that snapshot while its age is below the TTL.
+With zero TTL, a successful live read still reports fresh and supports the normal
+placement lease; a later failed read reports no roster and cannot fall back.
 Status, heartbeats, and public health publish `rosterState` as `roster-fresh`,
 `roster-stale-but-usable`, or `no-roster`, plus `rosterAgeMs` and
 `rosterCacheTtlMs`. Admission counters `fleetRosterFresh`,
@@ -175,6 +177,8 @@ from a timed-out read is ignored. The cache is process-local; a restart needs a
 successful read. Cleanup and exit reconciliation still require fresh reads.
 Without a usable roster, dispatch pauses and repeated failures open the circuit.
 Mutation transport failures retain their existing circuit behavior.
+If a half-open recovery probe fails after mutation failures, the circuit reopens
+for another cooldown even if an older roster is still within its TTL.
 While the circuit is open, new spawn and resume calls
 fail fast. After `fleetHealth.resetTimeoutMs`, one half-open roster probe may
 close the circuit. Configure `fleetHealth.rosterTimeoutMs`,

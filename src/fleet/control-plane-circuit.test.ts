@@ -131,6 +131,73 @@ describe('FleetControlPlaneCircuit', () => {
     expect(circuit.status()).toMatchObject({ state: 'open', rosterState: 'no-roster', rosterAgeMs: 200 })
   })
 
+  it('reports fresh live evidence with zero TTL, shares the placement lease, and never falls back', async () => {
+    vi.useFakeTimers()
+    const fleet = new FakeFleetClient()
+    const failure = new Error('broker unavailable')
+    const read = vi.spyOn(fleet, 'roster').mockResolvedValueOnce(roster)
+      .mockRejectedValueOnce(failure).mockResolvedValue(roster)
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 2, resetTimeoutMs: 1_000, rosterCacheTtlMs: 0 })
+    const guarded = guardFleetControlPlane(fleet, circuit, { admissionLeaseMs: 1_000 })
+    expect(circuit.status().rosterState).toBe('no-roster')
+
+    await guarded.spawn({ name: 'first', capability: 'spawn:codex' })
+    expect(circuit.status()).toMatchObject({ rosterState: 'roster-fresh', rosterAgeMs: 0, rosterCacheTtlMs: 0 })
+    await vi.advanceTimersByTimeAsync(100)
+    await guarded.spawn({ name: 'second', capability: 'spawn:codex' })
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(circuit.status()).toMatchObject({ rosterState: 'roster-fresh', rosterAgeMs: 100 })
+
+    await expect(guarded.roster({ allowStale: true })).rejects.toBe(failure)
+    expect(circuit.status()).toMatchObject({ rosterState: 'no-roster', consecutiveFailures: 1, rosterAgeMs: 100 })
+    await guarded.resume({ sessionRef: 'recovered' })
+    expect(read).toHaveBeenCalledTimes(3)
+    expect(circuit.status()).toMatchObject({ rosterState: 'roster-fresh', rosterAgeMs: 0, consecutiveFailures: 0 })
+
+    // Reporting fresh must not extend the independent admission lease.
+    await vi.advanceTimersByTimeAsync(1_001)
+    await guarded.spawn({ name: 'after-lease', capability: 'spawn:codex' })
+    expect(read).toHaveBeenCalledTimes(4)
+  })
+
+  it.each(['timeout', 'rejection'] as const)('re-arms a failed half-open %s despite a usable cache, then recovers', async (failureMode) => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const fleet = new FakeFleetClient()
+    const read = vi.spyOn(fleet, 'roster').mockResolvedValue(roster)
+    vi.spyOn(fleet, 'spawn').mockRejectedValueOnce(new Error('broker unavailable'))
+    const circuit = new FleetControlPlaneCircuit({ timeoutMs: 100, failureThreshold: 1, resetTimeoutMs: 1_000, rosterCacheTtlMs: 10_000 })
+    const guarded = guardFleetControlPlane(fleet, circuit)
+    await expect(guarded.spawn({ name: 'failed', capability: 'spawn:codex' })).rejects.toThrow('broker unavailable')
+    expect(circuit.status()).toMatchObject({ state: 'open', rosterState: 'roster-fresh', retryAtMs: 2_000 })
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(circuit.status().state).toBe('half-open')
+    if (failureMode === 'timeout') read.mockImplementationOnce(() => new Promise(() => undefined))
+    else read.mockRejectedValueOnce(new Error('roster unavailable'))
+    const failedRecovery = expect(guarded.resume({ sessionRef: 'blocked' }))
+      .rejects.toMatchObject({ code: 'FACTORY_FLEET_CONTROL_CIRCUIT_OPEN', state: 'open' })
+    await vi.advanceTimersByTimeAsync(100)
+    await failedRecovery
+    const retryAtMs = failureMode === 'timeout' ? 3_100 : 3_000
+    expect(circuit.status()).toMatchObject({
+      state: 'open', rosterState: 'roster-stale-but-usable', consecutiveFailures: 2,
+      rosterAgeMs: 1_100, retryAtMs,
+    })
+    await expect(guarded.spawn({ name: 'during-cooldown', capability: 'spawn:codex' }))
+      .rejects.toBeInstanceOf(FleetControlPlaneCircuitOpenError)
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(fleet.spawns).toEqual([])
+    expect(fleet.resumes).toEqual([])
+
+    vi.setSystemTime(retryAtMs)
+    await guarded.resume({ sessionRef: 'recovered' })
+    expect(read).toHaveBeenCalledTimes(3)
+    expect(fleet.resumes).toHaveLength(1)
+    expect(circuit.status()).toMatchObject({ state: 'closed', rosterState: 'roster-fresh', consecutiveFailures: 0, rosterAgeMs: 0 })
+    expect(circuit.status().retryAtMs).toBeUndefined()
+  })
+
   it('MUST FIRE: two 5s roster timeouts open for 60s and only a successful half-open probe closes', async () => {
     vi.useFakeTimers()
     let now = 1_000

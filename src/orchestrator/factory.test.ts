@@ -140,6 +140,24 @@ describe('fleet control-plane admission', () => {
     }
   }
 
+  it('publishes fresh health and counters for a live zero-TTL read, then no roster on failure', async () => {
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config({ fleetHealth: { rosterCacheTtlMs: 0, failureThreshold: 1 } }), {
+      mount: new FakeMountClient(), fleet, triage: new StaticTriage(), logger: {},
+    })
+    expect(factory.status().fleetControlPlane.rosterState).toBe('no-roster')
+    await factory.runOnce()
+    expect(factory.status().fleetControlPlane).toMatchObject({ state: 'closed', rosterState: 'roster-fresh', rosterCacheTtlMs: 0 })
+    expect(factory.status().counters.fleetRosterFresh).toBe(1)
+
+    vi.spyOn(fleet, 'roster').mockRejectedValue(new Error('broker unavailable'))
+    await expect(factory.runOnce()).rejects.toThrow('fleet control plane is unavailable')
+    expect(factory.status().fleetControlPlane).toMatchObject({ state: 'open', rosterState: 'no-roster' })
+    expect(factory.status().counters.fleetRosterFresh).toBe(1)
+    expect(factory.status().counters.fleetRosterUnavailable).toBe(1)
+    expect(factory.status().counters.fleetRosterStaleButUsable ?? 0).toBe(0)
+  })
+
   it.each(['local', 'remote'] as const)('keeps %s dispatch running through a slow roster and publishes stale versus unavailable', async (locality) => {
     vi.useFakeTimers()
     vi.setSystemTime(10_000)

@@ -92,6 +92,12 @@ export class FleetControlPlaneCircuit {
 
   /** Returns the current admission state without performing broker I/O. */
   status(): FleetControlPlaneStatus {
+    const usableRoster = this.#usableRoster()
+    // Zero TTL disables stale fallback, not evidence from a successful live
+    // read. Keep that evidence fresh until a failed read supersedes it; the
+    // placement lease still supplies its own independent age bound.
+    const freshRoster = this.#cachedRoster && this.#rosterRefreshAfterMs === undefined &&
+      (this.#rosterCacheTtlMs === 0 || usableRoster !== undefined)
     const state: FleetControlPlaneState = this.#consecutiveFailures < this.#failureThreshold
       ? 'closed'
       : this.#retryAtMs !== undefined && this.#now() < this.#retryAtMs
@@ -103,8 +109,7 @@ export class FleetControlPlaneCircuit {
       timeoutMs: this.#timeoutMs,
       failureThreshold: this.#failureThreshold,
       resetTimeoutMs: this.#resetTimeoutMs,
-      rosterState: !this.#usableRoster() ? 'no-roster'
-        : this.#rosterRefreshAfterMs !== undefined ? 'roster-stale-but-usable' : 'roster-fresh',
+      rosterState: freshRoster ? 'roster-fresh' : usableRoster ? 'roster-stale-but-usable' : 'no-roster',
       rosterCacheTtlMs: this.#rosterCacheTtlMs,
       ...(this.#cachedRoster ? { rosterAgeMs: Math.max(0, this.#now() - this.#cachedRoster.atMs) } : {}),
       ...(this.#lastFailureAtMs === undefined ? {} : { lastFailureAtMs: this.#lastFailureAtMs }),
@@ -214,9 +219,10 @@ export class FleetControlPlaneCircuit {
     this.#lastFailureAtMs = now
     this.#lastError = describeControlPlaneError(error)
     if (wasOpen) return
-    // A read failure degrades roster freshness, not mutation availability.
-    // Mutation transport failures retain the existing circuit semantics.
-    if (options.roster && this.#usableRoster()) return
+    // A usable snapshot keeps a closed circuit available. It cannot recover
+    // mutation failures: a failed half-open probe must re-arm the cooldown,
+    // otherwise every later admission repeats the full timeout in half-open.
+    if (options.roster && this.#consecutiveFailures < this.#failureThreshold && this.#usableRoster()) return
     this.#consecutiveFailures += 1
     if (this.#consecutiveFailures >= this.#failureThreshold) {
       this.#retryAtMs = now + this.#resetTimeoutMs
