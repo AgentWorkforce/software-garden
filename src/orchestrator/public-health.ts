@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { publicReadinessFailure } from './readiness-failure'
-import { telemetryErrorClassName } from '../observability/error-class.js'
 import type { FleetControlPlaneStatus } from '../fleet/control-plane-circuit'
 import type { FleetConnectStatus } from '../ports/fleet'
 import {

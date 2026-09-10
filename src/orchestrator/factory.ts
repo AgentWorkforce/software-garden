@@ -2677,13 +2677,7 @@ export class FactoryLoop implements Factory {
     // not just a log line: `lastError` is returned from `status()` and
     // written into the loop heartbeat file, so an unbounded
     // dependency-controlled string would land on disk.
-    const overload = relayfileOverload(error)
-    const message = describeError(error).errorMessage || 'Unknown error'
-    const errorMessage = overload
-      ? `${message} ` +
-        `[relayfile ${overload.status} ${relayfileOverloadReasonLabel(overload.reason)}` +
-        `${overload.retryAfterSeconds === undefined ? '' : `; retry-after=${overload.retryAfterSeconds}s`}]`
-      : message
+    const errorMessage = readinessReconcileErrorMessage(error)
     this.#readinessReconcileConsecutiveFailures += 1
     this.#readinessReconcileLastDurationMs = this.#elapsedSince(startedAtMs)
     this.#readinessReconcileLastFailureAtMs = this.#clock.now()
