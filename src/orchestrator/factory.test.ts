@@ -4022,16 +4022,19 @@ describe('FactoryLoop', () => {
           prFile(9000 + index, { title: 'Unrelated', body: '', head_ref: `unrelated-${index}`, state: 'CLOSED' }),
         ])),
       })
+      const clock = new ManualClock()
       let watermark = 'evt_1'
       mount.getEventHighWatermark = async (opts) => cached && opts?.provider === 'github' ? watermark : undefined
       const factory = createFactory(config({
         issueSource: 'github', loop: { registryPath: join(root, `registry-${cached}.json`) },
       }), {
-        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+        mount, clock, fleet: new FakeFleetClient(), triage: new StaticTriage(),
         githubWriteback: new RecordingGithubWriteback(), logger: {},
       })
       try {
         for (let sweep = 0; sweep < 3; sweep += 1) {
+          // Exercise record reuse after main's negative dependency verdict expires.
+          clock.advance(30 * 60_000)
           const report = await factory.runOnce()
           expect(report.dispatched).toEqual([])
           expect(report.skipped).toContainEqual(expect.objectContaining({ issue: expect.objectContaining({ key: '131' }), code: 'parked-dependency' }))
@@ -4042,6 +4045,7 @@ describe('FactoryLoop', () => {
         await mount.writeFile('/github/repos/AgentWorkforce__pear/pulls/by-id/9160.json',
           prFile(9160, { title: 'Prerequisite', body: 'Fixes #128', head_ref: 'unrelated-160', state: 'closed', merged: true }))
         watermark = 'evt_2'
+        clock.advance(30 * 60_000)
         const merged = await factory.runOnce()
         expect(merged.dispatched.map((result) => result.issue.key)).toEqual(['131'])
         expect(factory.status().prProbe?.recordReads).toBe(cached ? 322 : 644)

@@ -24,16 +24,18 @@ Discovery reaches this loop through dependency resolution
 (`performRunOnce` → `triageIssue`/dispatch dependency checks →
 `dependencyIsTerminalOrMerged` → `resolveIssuePrFromMount`), and through orphan
 recovery (`reconcileOrphanedGithubInProgress` → `openCompletionPr`). The
-dependency-result memo is cleared at every sweep to observe later merges, but
-that also repeated every record read for unresolved dependencies. Record reuse
-now serves both paths without retaining stale dependency verdicts.
+dependency-result memo introduced in #498 retains unresolved verdicts for up to
+30 minutes, invalidating on PR events or changed association inputs. Record reuse
+serves probes after that memo expires, distinct dependencies, and orphan recovery
+while preserving the existing verdict invalidation rules.
 
 Successful record reads now share a bounded cache keyed by the mount's GitHub
 event high watermark. The index and trees are still read on each resolution. A changed
 or unavailable watermark discards the cache; missing and failed record reads are
 never retained. Index winners still receive a fresh confirming record read.
 Completion also invalidates records to preserve its existing explicit refresh
-boundary. No issue-level negative answer is cached. In a stable watermark, Q
+boundary. This layer caches records; #498 separately caches negative dependency
+answers. In a stable watermark, Q
 fallback probes over P records that fit the cache issue P record reads, while
 still evaluating each query against all P records.
 
@@ -76,7 +78,14 @@ streams invalidate reuse, and corpora larger than the cache can incur evictions;
 the counters expose both limits.
 
 The sweep regressions also exercise the production callers: three sweeps parked
-on an unresolved dependency read 161 records with caching versus 483 without,
+on an unresolved dependency, each after the 30-minute verdict expiry, read 161
+records with caching versus 483 without,
 and both arms dispatch after the watermark advances to expose a merged PR. Two
 orphan candidates in one sweep read 282 records with caching versus 564 without,
 with identical recovered and dispatched work.
+
+The 2026-09-10 sibling-lane measurement reports repeated `index-no-match` walks
+over 84 records, with 69–71 reads taking 45–47 seconds. That sample does not
+demonstrate the historical 1,493-path walk or establish PR I/O as the cause of
+the sandbox-enrollment failures. Record reuse reduces repeated read latency;
+those enrollment failures remain the primary dispatch blocker.
