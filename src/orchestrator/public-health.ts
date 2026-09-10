@@ -796,10 +796,21 @@ function fleetControlPlaneHealth(
     state: enumValue(status.state, FLEET_CONTROL_PLANE_STATES),
     consecutiveFailures: counter(status.consecutiveFailures),
     failureThreshold: counter(status.failureThreshold),
+    ...fleetRosterHealth(status),
     ...optionalTimestamp('lastFailureAtMs', status.lastFailureAtMs),
     ...optionalTimestamp('retryAtMs', status.retryAtMs),
     // `lastError` stays behind /evidence: a roster probe failure names the
     // broker socket path.
+  }
+}
+
+function fleetRosterHealth(status: { rosterState?: unknown; rosterAgeMs?: unknown; rosterCacheTtlMs?: unknown }) {
+  return {
+    ...(status.rosterState === undefined ? {} : {
+      rosterState: enumValue(status.rosterState, ['roster-fresh', 'roster-stale-but-usable', 'no-roster'] as const),
+    }),
+    ...optionalCount('rosterAgeMs', status.rosterAgeMs),
+    ...optionalCount('rosterCacheTtlMs', status.rosterCacheTtlMs),
   }
 }
 
@@ -1032,6 +1043,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
             state: enumValue(fleet.state, FLEET_CONTROL_PLANE_STATES),
             consecutiveFailures: counter(fleet.consecutiveFailures),
             failureThreshold: counter(fleet.failureThreshold),
+            ...fleetRosterHealth(fleet),
             ...optionalTimestamp('lastFailureAtMs', fleet.lastFailureAtMs),
             ...optionalTimestamp('retryAtMs', fleet.retryAtMs),
           },

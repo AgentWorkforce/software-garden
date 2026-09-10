@@ -180,6 +180,7 @@ describe('FactoryConfigSchema', () => {
     })
     expect(parsed.fleetHealth).toEqual({
       rosterTimeoutMs: 5_000,
+      rosterCacheTtlMs: 300_000,
       failureThreshold: 2,
       resetTimeoutMs: 60_000,
       requireDedicatedBroker: false,

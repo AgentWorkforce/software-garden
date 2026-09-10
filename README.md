@@ -157,9 +157,29 @@ names and the provider-claim state (`pending`, `verified`, or `degraded`). This
 view is read from Software Garden's local in-flight registry, so it remains available
 when GitHub lifecycle writeback is the degraded subsystem.
 
-It also reports `fleetControlPlane`. Software Garden bounds its read-only roster probe,
-pauses a live dispatch immediately when that probe fails, and opens a circuit
-after repeated failures. While the circuit is open, new spawn and resume calls
+It also reports `fleetControlPlane`. Software Garden bounds its read-only roster probe
+and caches the last successful roster for `fleetHealth.rosterCacheTtlMs`
+(default five minutes; zero disables fallback). A slow or failed read allows
+dispatch to continue using that snapshot while its age is below the TTL.
+With zero TTL, a successful live read still reports fresh and supports the normal
+placement lease; a later failed read reports no roster and cannot fall back.
+Status, heartbeats, and public health publish `rosterState` as `roster-fresh`,
+`roster-stale-but-usable`, or `no-roster`, plus `rosterAgeMs` and
+`rosterCacheTtlMs`. Admission counters `fleetRosterFresh`,
+`fleetRosterStaleButUsable`, and `fleetRosterUnavailable` distinguish working
+with stale data from being stopped. A stale roster keeps the circuit closed;
+the overall health can remain healthy while the roster field reports degradation.
+
+After a failed probe, dispatch reuses the snapshot until the refresh cooldown
+(`fleetHealth.resetTimeoutMs`) ends, then attempts another bounded read. Neither
+fallback nor successful placement extends the snapshot's TTL, and a late result
+from a timed-out read is ignored. The cache is process-local; a restart needs a
+successful read. Cleanup and exit reconciliation still require fresh reads.
+Without a usable roster, dispatch pauses and repeated failures open the circuit.
+Mutation transport failures retain their existing circuit behavior.
+If a half-open recovery probe fails after mutation failures, the circuit reopens
+for another cooldown even if an older roster is still within its TTL.
+While the circuit is open, new spawn and resume calls
 fail fast. After `fleetHealth.resetTimeoutMs`, one half-open roster probe may
 close the circuit. Configure `fleetHealth.rosterTimeoutMs`,
 `fleetHealth.failureThreshold`, and `fleetHealth.resetTimeoutMs` when the fleet

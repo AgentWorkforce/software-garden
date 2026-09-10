@@ -1535,6 +1535,7 @@ export class FactoryLoop implements Factory {
     this.#clock = ports.clock ?? realClock
     this.#fleetControlPlane = new FleetControlPlaneCircuit({
       timeoutMs: config.fleetHealth.rosterTimeoutMs,
+      rosterCacheTtlMs: config.fleetHealth.rosterCacheTtlMs,
       failureThreshold: config.fleetHealth.failureThreshold,
       resetTimeoutMs: config.fleetHealth.resetTimeoutMs,
       now: () => this.#clock.now(),
@@ -3465,12 +3466,24 @@ export class FactoryLoop implements Factory {
 
   async #assertFleetControlPlaneAvailable(): Promise<RosterEntry> {
     try {
-      const roster = await this.#fleet.roster()
-      this.#increment('fleetControlPlaneProbeSuccesses')
+      const roster = await this.#fleet.roster({ allowStale: true })
+      const health = this.#fleetControlPlane.status()
+      if (health.rosterState === 'roster-stale-but-usable') {
+        this.#increment('fleetRosterStaleButUsable')
+        this.#logger.warn?.('[factory] dispatch using stale fleet roster', {
+          rosterState: health.rosterState,
+          rosterAgeMs: health.rosterAgeMs,
+          rosterCacheTtlMs: health.rosterCacheTtlMs,
+        })
+      } else {
+        this.#increment('fleetRosterFresh')
+        this.#increment('fleetControlPlaneProbeSuccesses')
+      }
       return roster
     } catch (error) {
       const health = this.#fleetControlPlane.status()
       this.#increment('fleetControlPlaneProbeFailures')
+      if (health.rosterState === 'no-roster') this.#increment('fleetRosterUnavailable')
       if (health.state === 'open') this.#increment('fleetControlPlaneCircuitOpen')
       this.#logger.error?.('[factory] fleet control plane unavailable; dispatch paused', {
         state: health.state,
@@ -11740,7 +11753,7 @@ export class FactoryLoop implements Factory {
     }
     let roster: RosterEntry
     try {
-      roster = await retryOnTimeout(() => this.#fleet.roster(), { attempts: 3, delayMs: 2000 })
+      roster = await retryOnTimeout(() => this.#fleet.roster({ allowStale: true }), { attempts: 3, delayMs: 2000 })
     } catch (error) {
       throw contextualError(`Dispatch roster lookup failed for ${record.issue.key}`, error)
     }

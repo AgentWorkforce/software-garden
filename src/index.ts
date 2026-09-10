@@ -547,7 +547,7 @@ export {
   factoryDispatchFailureReasonCounts,
 } from './orchestrator/dispatch-failure-reason'
 export type { FactoryDispatchFailureReasonCode } from './orchestrator/dispatch-failure-reason'
-export type { FleetControlPlaneState, FleetControlPlaneStatus } from './fleet/control-plane-circuit'
+export type { FleetControlPlaneState, FleetControlPlaneStatus, FleetRosterState } from './fleet/control-plane-circuit'
 export {
   LOAD_EVIDENCE_CONTRACT,
   LoadMeasurementsSchema,
