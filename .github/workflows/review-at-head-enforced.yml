@@ -33,7 +33,8 @@ name: Review at head (enforced)
 # That is tolerable while this check is advisory and is NOT tolerable once it
 # is required. Closing it needs a fan-out on `push` to the default branch that
 # re-dispatches this check for every open PR, which is real machinery and is
-# deliberately not bolted on here. Treat it as a blocker on the "make it
+# deliberately not bolted on here. It is tracked as
+# AgentWorkforce/software-garden#511 and is a blocker on the "make it
 # required" step, alongside the configuration repairs below.
 #
 # ROLLOUT: keep non-required and measure for a week first. On the audited data
