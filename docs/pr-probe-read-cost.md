@@ -10,7 +10,7 @@ sweep's counters.
 | `recordReads` | PR resolver record-read attempts issued to the mount |
 | `recordCacheHits` | Record visits served from the current watermark's cache |
 | `recordCacheEntries` / `recordCacheLimit` | Current retained records and the 4096-entry bound |
-| `invalidations` | Cached generations discarded after a watermark change, loss of watermark support, or completion |
+| `invalidations` | Cached generations discarded after a watermark change, loss of watermark support, PR file events, or completion |
 | `evictions` | Entries removed to keep the cache bounded |
 | `uncachedProbes` | Probes for which no usable event watermark was available |
 
@@ -33,6 +33,7 @@ Successful record reads now share a bounded cache keyed by the mount's GitHub
 event high watermark. The index and trees are still read on each resolution. A changed
 or unavailable watermark discards the cache; missing and failed record reads are
 never retained. Index winners still receive a fresh confirming record read.
+PR file events invalidate records even when the watermark is unchanged.
 Completion also invalidates records to preserve its existing explicit refresh
 boundary. This layer caches records; #498 separately caches negative dependency
 answers. In a stable watermark, Q

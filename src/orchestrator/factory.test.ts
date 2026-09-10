@@ -4331,7 +4331,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('invalidates negative dependency probes when a PR change arrives', async () => {
+  it('invalidates dependency verdicts and records on a PR event with an unchanged watermark', async () => {
     const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
     const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 936)
     const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
@@ -4339,6 +4339,9 @@ describe('FactoryLoop', () => {
       [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
       [dependentPath]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
     })
+    // File events can arrive without advancing the provider watermark.
+    mount.getEventHighWatermark = async () => 'unchanged'
+    mount.files.set(pullPath, { content: prFile(9000, { body: 'Fixes #935', state: 'open' }) })
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
@@ -4346,6 +4349,7 @@ describe('FactoryLoop', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       expect(factory.status().parked).toHaveLength(1)
+      expect(factory.status().prProbe?.recordCacheEntries).toBe(1)
       expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
       mount.files.set(pullPath, { content: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }) })
       mount.emit({ id: 'dependency-pr-merged', path: pullPath, type: 'file.updated' })
@@ -4354,6 +4358,51 @@ describe('FactoryLoop', () => {
       expect(factory.status().parked).toEqual([])
       expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(2)
     } finally {
+      await factory.stop()
+    }
+  })
+
+  it('retries every dependency probe after a coalesced PR record read fails', async () => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
+    const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
+    let rejectRead!: (error: Error) => void
+    const pendingRead = new Promise<never>((_, reject) => { rejectRead = reject })
+    class PendingReadMount extends FakeMountClient {
+      fail = true
+      override async readFile(path: string) {
+        if (path === pullPath && this.fail) return pendingRead
+        return super.readFile(path)
+      }
+    }
+    const dependents = [936, 937].map((number) => ({
+      path: githubIssuePath('AgentWorkforce', 'pear', number),
+      content: githubIssueFile(number, { labels: ['factory'], body: 'Blocked by: #935' }),
+    }))
+    const mount = new PendingReadMount({
+      [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [pullPath]: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }),
+      ...Object.fromEntries(dependents.map(({ path, content }) => [path, content])),
+    })
+    mount.getEventHighWatermark = async () => 'unchanged'
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(), logger: {},
+    })
+    try {
+      const decisions = await Promise.all(dependents.map(({ path, content }) =>
+        factory.triageIssue(parseGithubFactoryIssue(path, content))))
+      const probes = Promise.all(decisions.map((decision) => factory.dispatch(decision, { dryRun: true })))
+      await vi.waitFor(() => expect(factory.status().prProbe?.recordCacheHits).toBe(1))
+      rejectRead(new Error('PR record unavailable'))
+      expect((await probes).map((result) => result.hold?.kind)).toEqual(['dependency', 'dependency'])
+      expect(factory.status().counters.dependencyPrProbeCacheSkippedErrors).toBe(2)
+      mount.fail = false
+      for (const decision of decisions) {
+        expect((await factory.dispatch(decision, { dryRun: true })).hold).toBeUndefined()
+      }
+      expect(factory.status().prProbe?.recordReads).toBe(2)
+    } finally {
+      rejectRead(new Error('test cleanup'))
       await factory.stop()
     }
   })

@@ -5614,10 +5614,17 @@ export class FactoryLoop implements Factory {
     const watermark = await this.#probePrRecords.watermark(
       () => this.#mount.getEventHighWatermark?.({ provider: 'github' }) ?? Promise.resolve(undefined),
     )
-    return this.#probePrRecords.reader(watermark, (path) => {
+    const readRecord = this.#probePrRecords.reader(watermark, (path) => {
       observer.onRecordRead?.()
-      return readProbePrCandidate(this.#mount, path, observer.onLookupError)
+      return readProbePrCandidate(this.#mount, path)
     })
+    return async (path, fresh) => {
+      const record = await readRecord(path, fresh)
+      // Every caller must observe an unreadable record, including probes that
+      // joined an in-flight read started by a different observer.
+      if (record === undefined) observer.onLookupError?.()
+      return record
+    }
   }
 
   /**
@@ -17230,6 +17237,9 @@ export class FactoryLoop implements Factory {
   }
 
   #invalidateDependencyPrProbes(path: string): void {
+    // File events can precede (or lack) a new provider watermark. Refresh the
+    // records too, before another probe can retain a stale negative verdict.
+    this.#probePrRecords.invalidate()
     const repoParts = githubRepoPathParts(path)
     if (repoParts) {
       const prefix = `${repoParts.owner}/${repoParts.repo}#`.toLowerCase()
