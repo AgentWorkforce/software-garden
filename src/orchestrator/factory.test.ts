@@ -4362,6 +4362,28 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('retains a negative dependency verdict when the walk contains a non-PR JSON file', async () => {
+    const mount = new FakeMountClient({
+      [githubIssuePath('AgentWorkforce', 'pear', 935)]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [githubIssuePath('AgentWorkforce', 'pear', 936)]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
+      '/github/repos/AgentWorkforce/pear/pulls/_index.json': [],
+    })
+    mount.getEventHighWatermark = async () => 'unchanged'
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(), logger: {},
+    })
+    try {
+      expect((await factory.runOnce()).dispatched).toEqual([])
+      expect((await factory.runOnce()).dispatched).toEqual([])
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
+      expect(factory.status().counters.dependencyPrProbeCacheHits).toBe(1)
+      expect(factory.status().counters.dependencyPrProbeCacheSkippedErrors ?? 0).toBe(0)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('retries every dependency probe after a coalesced PR record read fails', async () => {
     const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
     const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'

@@ -5616,14 +5616,16 @@ export class FactoryLoop implements Factory {
     )
     const readRecord = this.#probePrRecords.reader(watermark, (path) => {
       observer.onRecordRead?.()
-      return readProbePrCandidate(this.#mount, path)
+      // Reject the shared promise so each joining probe observes the failure.
+      return readProbePrCandidate(this.#mount, path, (error) => { throw error })
     })
     return async (path, fresh) => {
-      const record = await readRecord(path, fresh)
-      // Every caller must observe an unreadable record, including probes that
-      // joined an in-flight read started by a different observer.
-      if (record === undefined) observer.onLookupError?.()
-      return record
+      try {
+        return await readRecord(path, fresh)
+      } catch {
+        observer.onLookupError?.()
+        return undefined
+      }
     }
   }
 
@@ -23792,7 +23794,7 @@ const githubPullRoots = (repo: string): string[] => {
 const readProbePrCandidate = async (
   mount: MountClient,
   path: string,
-  onLookupError?: () => void,
+  onLookupError?: (error: unknown) => void,
 ): Promise<{
   number: number
   title: string
@@ -23827,8 +23829,8 @@ const readProbePrCandidate = async (
       state: booleanValue(payload.merged) === true ? 'MERGED' : stringValue(payload.state),
       url: stringValue(payload.url) ?? stringValue(payload.html_url),
     }
-  } catch {
-    onLookupError?.()
+  } catch (error) {
+    onLookupError?.(error)
     return undefined
   }
 }
