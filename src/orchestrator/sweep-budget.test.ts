@@ -378,6 +378,9 @@ class HangingWatermarkMount extends FakeMountClient {
   hungCalls = 0
 
   override async getEventHighWatermark(opts: { provider?: string } = {}): Promise<string | undefined> {
+    // This fixture wedges discovery. Optional, provider-scoped PR cache
+    // validation is a separate operation and must not satisfy hungCalls.
+    if (opts.provider === 'github') return undefined
     if (this.hang && this.served >= this.serveFirst) {
       this.hungCalls += 1
       return await NEVER()

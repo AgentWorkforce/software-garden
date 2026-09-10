@@ -4011,6 +4011,56 @@ describe('FactoryLoop', () => {
     ])
   })
 
+  it('reuses unchanged dependency PR history across sweeps and observes a later merge', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dependency-probe-cache-'))
+    const run = async (cached: boolean) => {
+      const mount = new FakeMountClient({
+        [githubIssuePath('AgentWorkforce', 'pear', 128)]: githubIssueFile(128, { labels: ['reference-only'] }),
+        [githubIssuePath('AgentWorkforce', 'pear', 131)]: githubIssueFile(131, { labels: ['factory'], body: 'Blocked by: #128' }),
+        ...Object.fromEntries(Array.from({ length: 161 }, (_, index) => [
+          `/github/repos/AgentWorkforce__pear/pulls/by-id/${9000 + index}.json`,
+          prFile(9000 + index, { title: 'Unrelated', body: '', head_ref: `unrelated-${index}`, state: 'CLOSED' }),
+        ])),
+      })
+      const clock = new ManualClock()
+      let watermark = 'evt_1'
+      mount.getEventHighWatermark = async (opts) => cached && opts?.provider === 'github' ? watermark : undefined
+      const factory = createFactory(config({
+        issueSource: 'github', loop: { registryPath: join(root, `registry-${cached}.json`) },
+      }), {
+        mount, clock, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(), logger: {},
+      })
+      try {
+        for (let sweep = 0; sweep < 3; sweep += 1) {
+          // Exercise record reuse after main's negative dependency verdict expires.
+          clock.advance(30 * 60_000)
+          const report = await factory.runOnce()
+          expect(report.dispatched).toEqual([])
+          expect(report.skipped).toContainEqual(expect.objectContaining({ issue: expect.objectContaining({ key: '131' }), code: 'parked-dependency' }))
+        }
+        expect(factory.status().prProbe).toMatchObject({
+          recordReads: cached ? 161 : 483, recordCacheHits: cached ? 322 : 0,
+        })
+        await mount.writeFile('/github/repos/AgentWorkforce__pear/pulls/by-id/9160.json',
+          prFile(9160, { title: 'Prerequisite', body: 'Fixes #128', head_ref: 'unrelated-160', state: 'closed', merged: true }))
+        watermark = 'evt_2'
+        clock.advance(30 * 60_000)
+        const merged = await factory.runOnce()
+        expect(merged.dispatched.map((result) => result.issue.key)).toEqual(['131'])
+        expect(factory.status().prProbe?.recordReads).toBe(cached ? 322 : 644)
+      } finally {
+        await factory.stop()
+      }
+    }
+    try {
+      await run(false)
+      await run(true)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('extracts dependency declarations from Linear issue descriptions', async () => {
     const blockerPath = issuePath(140)
     const dependentPath = issuePath(141)
@@ -4281,7 +4331,7 @@ describe('FactoryLoop', () => {
     }
   })
 
-  it('invalidates negative dependency probes when a PR change arrives', async () => {
+  it('invalidates dependency verdicts and records on a PR event with an unchanged watermark', async () => {
     const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
     const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 936)
     const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
@@ -4289,6 +4339,9 @@ describe('FactoryLoop', () => {
       [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
       [dependentPath]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
     })
+    // File events can arrive without advancing the provider watermark.
+    mount.getEventHighWatermark = async () => 'unchanged'
+    mount.files.set(pullPath, { content: prFile(9000, { body: 'Fixes #935', state: 'open' }) })
     const factory = createFactory(config({ issueSource: 'github' }), {
       mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
       githubWriteback: new RecordingGithubWriteback(),
@@ -4296,6 +4349,7 @@ describe('FactoryLoop', () => {
     await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
     try {
       expect(factory.status().parked).toHaveLength(1)
+      expect(factory.status().prProbe?.recordCacheEntries).toBe(1)
       expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
       mount.files.set(pullPath, { content: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }) })
       mount.emit({ id: 'dependency-pr-merged', path: pullPath, type: 'file.updated' })
@@ -4304,6 +4358,73 @@ describe('FactoryLoop', () => {
       expect(factory.status().parked).toEqual([])
       expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(2)
     } finally {
+      await factory.stop()
+    }
+  })
+
+  it('retains a negative dependency verdict when the walk contains a non-PR JSON file', async () => {
+    const mount = new FakeMountClient({
+      [githubIssuePath('AgentWorkforce', 'pear', 935)]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [githubIssuePath('AgentWorkforce', 'pear', 936)]: githubIssueFile(936, { labels: ['factory'], body: 'Blocked by: #935' }),
+      '/github/repos/AgentWorkforce/pear/pulls/_index.json': [],
+    })
+    mount.getEventHighWatermark = async () => 'unchanged'
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(), logger: {},
+    })
+    try {
+      expect((await factory.runOnce()).dispatched).toEqual([])
+      expect((await factory.runOnce()).dispatched).toEqual([])
+      expect(factory.status().counters.dependencyPrProbeCacheMisses).toBe(1)
+      expect(factory.status().counters.dependencyPrProbeCacheHits).toBe(1)
+      expect(factory.status().counters.dependencyPrProbeCacheSkippedErrors ?? 0).toBe(0)
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('retries every dependency probe after a coalesced PR record read fails', async () => {
+    const blockerPath = githubIssuePath('AgentWorkforce', 'pear', 935)
+    const pullPath = '/github/repos/AgentWorkforce/pear/pulls/by-id/9000.json'
+    let rejectRead!: (error: Error) => void
+    const pendingRead = new Promise<never>((_, reject) => { rejectRead = reject })
+    class PendingReadMount extends FakeMountClient {
+      fail = true
+      override async readFile(path: string) {
+        if (path === pullPath && this.fail) return pendingRead
+        return super.readFile(path)
+      }
+    }
+    const dependents = [936, 937].map((number) => ({
+      path: githubIssuePath('AgentWorkforce', 'pear', number),
+      content: githubIssueFile(number, { labels: ['factory'], body: 'Blocked by: #935' }),
+    }))
+    const mount = new PendingReadMount({
+      [blockerPath]: githubIssueFile(935, { labels: ['reference-only'] }),
+      [pullPath]: prFile(9000, { body: 'Fixes #935', state: 'closed', merged: true }),
+      ...Object.fromEntries(dependents.map(({ path, content }) => [path, content])),
+    })
+    mount.getEventHighWatermark = async () => 'unchanged'
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount, fleet: new FakeFleetClient(), triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(), logger: {},
+    })
+    try {
+      const decisions = await Promise.all(dependents.map(({ path, content }) =>
+        factory.triageIssue(parseGithubFactoryIssue(path, content))))
+      const probes = Promise.all(decisions.map((decision) => factory.dispatch(decision, { dryRun: true })))
+      await vi.waitFor(() => expect(factory.status().prProbe?.recordCacheHits).toBe(1))
+      rejectRead(new Error('PR record unavailable'))
+      expect((await probes).map((result) => result.hold?.kind)).toEqual(['dependency', 'dependency'])
+      expect(factory.status().counters.dependencyPrProbeCacheSkippedErrors).toBe(2)
+      mount.fail = false
+      for (const decision of decisions) {
+        expect((await factory.dispatch(decision, { dryRun: true })).hold).toBeUndefined()
+      }
+      expect(factory.status().prProbe?.recordReads).toBe(2)
+    } finally {
+      rejectRead(new Error('test cleanup'))
       await factory.stop()
     }
   })
@@ -6145,6 +6266,43 @@ describe('FactoryLoop', () => {
         terminal: false,
       })
       expect(restartedFactory.status().counters.githubOrphanedInProgressRecovered).toBe(1)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('shares historical PR reads across orphan candidates in the discovery sweep', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-probe-cache-'))
+    const run = async (watermark: string | undefined) => {
+      const mount = new FakeMountClient({
+        ...Object.fromEntries([52, 53].map((number) => [
+          githubIssuePath('AgentWorkforce', 'pear', number),
+          githubIssueFile(number, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+        ])),
+        ...Object.fromEntries(Array.from({ length: 282 }, (_, index) => [
+          `/github/repos/AgentWorkforce__pear/pulls/by-id/${9000 + index}.json`,
+          prFile(9000 + index, { title: 'Unrelated', body: '', head_ref: `unrelated-${index}`, state: 'CLOSED' }),
+        ])),
+      })
+      mount.getEventHighWatermark = async (opts) => opts?.provider === 'github' ? watermark : undefined
+      const factory = createFactory(config({
+        issueSource: 'github', loop: { registryPath: join(root, `registry-${watermark ?? 'uncached'}.json`) },
+      }), {
+        mount, fleet: new FakeFleetClient(), stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(), githubWriteback: new RecordingGithubWriteback(), logger: {},
+      })
+      try {
+        const report = await factory.runOnce()
+        expect(report.dispatched.map((result) => result.issue.key).sort()).toEqual(['52', '53'])
+        expect(factory.status().counters.githubOrphanedInProgressRecovered).toBe(2)
+        return factory.status().prProbe
+      } finally {
+        await factory.stop()
+      }
+    }
+    try {
+      expect(await run(undefined)).toMatchObject({ recordReads: 564, recordCacheHits: 0 })
+      expect(await run('evt_1')).toMatchObject({ recordReads: 282, recordCacheHits: 282 })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -23027,6 +23185,25 @@ describe('FactoryLoop', () => {
     expect(probePrRecordReads(mount)).toHaveLength(2)
     expect(factory.status().counters.probePrMountReads).toBe(2)
     expect(factory.status().counters.mergeGateSyntheticClosed).toBe(1)
+  })
+
+  it('publishes record reuse across completion probes that find no PR', async () => {
+    const mount = new FakeMountClient({
+      [issuePath(780)]: issueFile(780),
+      ...Object.fromEntries(Array.from({ length: 30 }, (_, index) => [
+        `/github/repos/AgentWorkforce__pear/pulls/by-id/${9000 + index}.json`,
+        prFile(9000 + index, { title: 'Unrelated work', head_ref: `unrelated-${index}`, body: '', state: 'OPEN' }),
+      ])),
+    })
+    mount.getEventHighWatermark = async () => 'evt_1'
+    const fleet = new FakeFleetClient()
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+
+    await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(780), issueFile(780))))
+    fleet.emitAgentExit('ar-780-impl-pear', 'issue-done')
+    await vi.waitFor(() => expect(factory.status().counters.probePrRecordsVisited).toBe(60))
+    expect(factory.status().prProbe).toMatchObject({ recordReads: 30, recordCacheHits: 30 })
+    expect(factory.status().counters.probePrMountReads).toBe(30)
   })
 
   it('walks unscoped rather than scoping a keyword-routed probe to repos.default', async () => {

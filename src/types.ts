@@ -1,4 +1,5 @@
 import type { FactoryConfig } from './config/schema'
+import type { PrProbeReadCacheStatus } from './orchestrator/pr-probe-read-cache'
 import type { FactoryStateResolution } from './linear/state-resolver'
 import type { AgentSpec, FleetClient, GithubRead, GithubWriteback, LinearWriteback, MountClient, PreviewReference, SlackWriteback } from './ports'
 import type { DispatchLifecyclePhase, StateStore, TerminalDispatchLifecyclePhase } from './ports/state'
@@ -191,6 +192,8 @@ export interface FactoryLoopRunOptions {
 export type FactoryLoopHeartbeatStatus = 'running' | 'idle' | 'stopping'
 
 export interface FactoryLoopHeartbeat {
+  /** Process-wide PR record I/O, including completion probes outside discovery. */
+  prProbe?: PrProbeReadCacheStatus
   pid: number
   status: FactoryLoopHeartbeatStatus
   /** Writer path for this record; `live-timer` proves process liveness only. */
@@ -762,6 +765,8 @@ export interface FactoryPublicBuildIdentity {
  * `checkFactoryLoopLiveness` signal for process liveness during hydration.
  */
 export interface FactoryPublicHealth {
+  /** Cumulative process counters; not attributed to the latest discovery sweep. */
+  prProbe?: PrProbeReadCacheStatus
   schemaVersion: number
   ok: boolean
   status: 'ok' | 'degraded' | 'unknown'
@@ -1002,6 +1007,7 @@ export interface DispatchResult {
 }
 
 export interface FactoryStatus {
+  prProbe?: PrProbeReadCacheStatus
   inFlight: IssueRef[]
   /** Registry-backed issue/agent ownership, including degraded GitHub claims. */
   inFlightDispatches?: FactoryInFlightDispatchStatus[]
