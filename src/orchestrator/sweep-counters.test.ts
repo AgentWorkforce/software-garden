@@ -745,6 +745,59 @@ describe('readiness sweep counters (#355)', () => {
     }
   })
 
+  it.each([false, true])('identifies the caller and observed lease without taking over (same owner: %s)', async (sameOwner) => {
+    let nowMs = 1_000
+    let requestedOwner = ''
+    class HeldLeaseStateStore extends InMemoryStateStore {
+      lastClaim?: DiscoverySweepClaim
+      override async claimDiscoverySweep(workspaceId: string, owner: string, now: number, leaseMs: number) {
+        requestedOwner = owner
+        if (!this.lastClaim) {
+          await super.claimDiscoverySweep(workspaceId, sameOwner ? owner : `${process.pid}:live-peer`, now, leaseMs)
+        }
+        this.lastClaim = await super.claimDiscoverySweep(workspaceId, owner, now, leaseMs)
+        return this.lastClaim
+      }
+    }
+    const stateStore = new HeldLeaseStateStore({ batchSize: 4 })
+    const logger = { info: vi.fn() }
+    const mount = new FakeMountClient({ [issuePath(941)]: issueFile(941) })
+    const triage = new StaticTriage()
+    const triageSpy = vi.spyOn(triage, 'triage')
+    const factory = createFactory(config({ dryRun: true }), {
+      mount, fleet: new FakeFleetClient(), stateStore, triage, logger,
+      clock: { now: () => nowMs, sleep: async () => {} },
+    })
+    const workspace = 'factory-sweep-counters'
+    try {
+      expect(await factory.runOnce()).toMatchObject({ discoveryDeferred: 'sweep-in-flight' })
+      const lease = stateStore.lastClaim!.state.lease!
+      const expectObservation = () => expect(logger.info).toHaveBeenLastCalledWith(
+        '[factory] skipped discovery because the sweep lease is held',
+        expect.objectContaining({
+          workspaceId: workspace, requestedOwner, owner: lease.owner, sameOwner,
+          epoch: lease.epoch, leaseUntilMs: lease.leaseUntilMs,
+          observedAtMs: nowMs, leaseRemainingMs: lease.leaseUntilMs - nowMs,
+        }),
+      )
+      expectObservation()
+      nowMs += 1_000
+      await factory.runOnce()
+      expectObservation()
+      // Advancing the deadline is observable independently of the caller's
+      // identity; merely seeing the same UUID must never authorize takeover.
+      await stateStore.renewDiscoverySweep(workspace, lease.owner, lease.epoch, nowMs, 300_000)
+      lease.leaseUntilMs = nowMs + 300_000
+      nowMs += 1_000
+      await factory.runOnce()
+      expectObservation()
+      expect(triageSpy).not.toHaveBeenCalled()
+      expect(stateStore.lastClaim!.state.lease).toEqual(lease)
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('names a sweep that deferred to another owner, so its zero is not read as an empty provider', async () => {
     // The nastiest reading of `candidates: 0`. A sweep that never claimed the
     // discovery lease returns an empty report immediately and completes

@@ -861,7 +861,7 @@ export function rememberBoundedFallbackEligibility(
 
 class DispatchLifecycleCapacityError extends Error {}
 class DispatchLifecycleOwnedElsewhereError extends Error {
-  constructor(readonly leaseUntilMs?: number) {
+  constructor(readonly lease?: DispatchLifecycleLease) {
     super('durable dispatch is still owned by another publisher')
   }
 }
@@ -3651,10 +3651,18 @@ export class FactoryLoop implements Factory {
     }
     if (!claim.acquired || !claim.lease) {
       this.#increment('discoverySweepsSkippedInFlight')
-      this.#logger.info?.('[factory] skipped discovery because another process owns the sweep lease', {
+      const observedAtMs = this.#clock.now()
+      this.#logger.info?.('[factory] skipped discovery because the sweep lease is held', {
+        workspaceId: this.#workspaceId,
+        requestedOwner: this.#discoverySweepOwner,
         owner: claim.state.lease?.owner,
+        sameOwner: claim.state.lease?.owner === this.#discoverySweepOwner,
         epoch: claim.state.lease?.epoch,
         leaseUntilMs: claim.state.lease?.leaseUntilMs,
+        observedAtMs,
+        leaseRemainingMs: claim.state.lease === undefined
+          ? undefined
+          : Math.max(0, claim.state.lease.leaseUntilMs - observedAtMs),
       })
       return {
         pulled: [],
@@ -8693,11 +8701,19 @@ export class FactoryLoop implements Factory {
             if (!this.#dispatchLifecycleOwnershipWaitLogged.has(key)) {
               this.#dispatchLifecycleOwnershipWaitLogged.add(key)
               this.#increment('dispatchLifecycleOwnershipWaits')
+              const observedAtMs = this.#clock.now()
               this.#logger.warn?.('[factory] durable dispatch is leased by another publisher; waiting for lease release', {
                 issue: record.issue.key,
-                leaseRemainingMs: error.leaseUntilMs === undefined
+                workspaceId: this.#workspaceId,
+                requestedOwner: this.#dispatchLifecycleOwner,
+                owner: error.lease?.owner,
+                sameOwner: error.lease?.owner === this.#dispatchLifecycleOwner,
+                epoch: error.lease?.epoch,
+                leaseUntilMs: error.lease?.leaseUntilMs,
+                observedAtMs,
+                leaseRemainingMs: error.lease === undefined
                   ? undefined
-                  : Math.max(0, error.leaseUntilMs - this.#clock.now()),
+                  : Math.max(0, error.lease.leaseUntilMs - observedAtMs),
                 retryMs: this.#dispatchLifecycleRetryMs,
               })
             }
@@ -8782,7 +8798,7 @@ export class FactoryLoop implements Factory {
         DISPATCH_LIFECYCLE_LEASE_MS,
       )
       if (!claim.acquired || !claim.lease) {
-        throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease?.leaseUntilMs)
+        throw new DispatchLifecycleOwnedElsewhereError(claim.lifecycle.lease)
       }
       this.#dispatchLifecycleEpochs.set(key, claim.lease.epoch)
       this.#hydrateCostLedger(claim.lifecycle)

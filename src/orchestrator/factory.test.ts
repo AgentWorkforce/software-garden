@@ -10267,7 +10267,17 @@ describe('FactoryLoop', () => {
       expect(restartedLogger.warn).toHaveBeenCalledTimes(1)
       expect(restartedLogger.warn).toHaveBeenCalledWith(
         '[factory] durable dispatch is leased by another publisher; waiting for lease release',
-        expect.objectContaining({ issue: 'AR-85', retryMs: 1_000 }),
+        expect.objectContaining({
+          issue: 'AR-85',
+          retryMs: 1_000,
+          requestedOwner: expect.any(String),
+          owner: beforeCrash?.lease?.owner,
+          sameOwner: false,
+          epoch: beforeCrash?.lease?.epoch,
+          leaseUntilMs: beforeCrash?.lease?.leaseUntilMs,
+          observedAtMs: clock.now(),
+          leaseRemainingMs: beforeCrash!.lease!.leaseUntilMs - clock.now(),
+        }),
       )
 
       clock.advance(5 * 60_000 + 1)
