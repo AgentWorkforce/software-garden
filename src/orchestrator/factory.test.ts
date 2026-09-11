@@ -5665,6 +5665,7 @@ describe('FactoryLoop', () => {
         mount,
         fleet,
         triage: new StaticTriage(),
+        clock: new ManualClock(),
         githubWriteback: new RecordingGithubWriteback(),
         logger: { warn: (message, details) => warnings.push({ message, details }) },
       })
@@ -5687,6 +5688,86 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.discoveryOverloadItemsSkipped).toBe(1)
     })
 
+    it.each([5, 30, 120].flatMap((delay) => [true, false].map((first) => [delay, first] as const)))(
+      'honours a %is Retry-After when the shed candidate is first: %s', async (retryAfterSeconds, first) => {
+      const clock = new ManualClock()
+      const mount = new ShedSomeIssueReadsMount({
+        [shedPath]: githubIssueFile(59, { labels: ['factory', 'pear'] }),
+        [freshPath]: githubIssueFile(60, { labels: ['factory', 'pear'] }),
+      }, () => overloadError({ retryAfterSeconds }))
+      const rejectedPath = first ? shedPath : freshPath
+      const servedPath = first ? freshPath : shedPath
+      const readFile = mount.readFile.bind(mount)
+      let notBeforeMs = 0
+      const earlyReads: string[] = []
+      const readFileSpy = vi.spyOn(mount, 'readFile').mockImplementation(async (path) => {
+        if (clock.now() < notBeforeMs) earlyReads.push(path)
+        if (path === rejectedPath) notBeforeMs = clock.now() + retryAfterSeconds * 1_000
+        return readFile(path)
+      })
+      mount.shedPaths.add(rejectedPath)
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 4 }), {
+        mount,
+        fleet: new LocalLifecycleFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+      })
+
+      const report = await factory.runOnce()
+
+      expect(readFileSpy).toHaveBeenCalledWith(servedPath)
+      expect(earlyReads).toEqual([])
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual([first ? '60' : '59'])
+      expect(factory.status().counters.discoveryReadBackoffWaits).toBe(1)
+      expect(factory.status().counters.discoveryOverloadItemsSkipped).toBe(1)
+    })
+
+    it('releases an expired sweep without issuing the issue read waiting behind Retry-After', async () => {
+      vi.useFakeTimers()
+      const waiting = Promise.withResolvers<void>()
+      const release = Promise.withResolvers<void>()
+      class WaitingClock extends ManualClock {
+        override async sleep(ms: number): Promise<void> {
+          waiting.resolve()
+          await release.promise
+          this.advance(ms)
+        }
+      }
+      const clock = new WaitingClock()
+      const mount = twoReadyIssues()
+      mount.shedPaths.add(shedPath)
+      const readFile = vi.spyOn(mount, 'readFile')
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const factory = createFactory(config({
+        issueSource: 'github', batchSize: 4,
+        liveSubscription: { sweepBudgetMs: 100 },
+      }), {
+        mount, stateStore, clock,
+        fleet: new LocalLifecycleFleetClient(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+      try {
+        const outcome = factory.runOnce().catch((error: unknown) => error)
+        await waiting.promise
+        await vi.advanceTimersByTimeAsync(100)
+        expect(await outcome).toMatchObject({
+          name: 'DiscoverySweepBudgetExceededError',
+          phase: 'run-once',
+        })
+        expect(await stateStore.claimDiscoverySweep('factory-test', 'replacement-owner', clock.now(), 1_000))
+          .toMatchObject({ acquired: true, lease: { epoch: 2, owner: 'replacement-owner' } })
+        release.resolve()
+        await vi.advanceTimersByTimeAsync(0)
+        expect(readFile).not.toHaveBeenCalledWith(freshPath)
+        expect(factory.status().counters.discoveryReadBackoffWaits).toBe(1)
+      } finally {
+        release.resolve()
+        vi.useRealTimers()
+      }
+    })
+
     // MUST FIRE. Deliverable 4: four distinct reason codes share one message
     // string, and only the reason separates a DO-local limiter from a runtime
     // shed from a Worker-global one.
@@ -5698,6 +5779,7 @@ describe('FactoryLoop', () => {
         mount,
         fleet: new LocalLifecycleFleetClient(),
         triage: new StaticTriage(),
+        clock: new ManualClock(),
         githubWriteback: new RecordingGithubWriteback(),
         logger: { warn: (message, details) => warnings.push({ message, details }) },
       })

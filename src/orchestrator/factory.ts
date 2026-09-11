@@ -4062,6 +4062,24 @@ export class FactoryLoop implements Factory {
 
       let candidateCount = 0
       let candidateReadsIncomplete = false
+      let readyReadNotBeforeMs = 0
+      const waitForReadyReadBackoff = async (): Promise<void> => {
+        // A workspace 429 applies to the next issue too. The durable sweep
+        // backoff only runs after this pass settles; skipping straight to
+        // another path used to keep loading the DO during Retry-After.
+        const readBackoffMs = Math.max(0, readyReadNotBeforeMs - this.#clock.now())
+        if (readBackoffMs > 0) {
+          this.#increment('discoveryReadBackoffWaits')
+          this.#logger.info?.('[factory] discovery waiting for Relayfile before further issue reads', {
+            delayMs: readBackoffMs,
+            backoffUntilMs: readyReadNotBeforeMs,
+          })
+          const wait = () => this.#clock.sleep(readBackoffMs)
+          if (budget) await budget.run('discovery-backoff-wait', wait)
+          else await wait()
+          budget?.assertNotExpired('run-once')
+        }
+      }
       const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
         // A between-await check, worth exactly what #368 said such a check is
@@ -4070,6 +4088,7 @@ export class FactoryLoop implements Factory {
         // its next iteration if it ever regains control, instead of running to
         // completion beside the sweep that replaced it.
         budget?.assertNotExpired('run-once')
+        await waitForReadyReadBackoff()
         let issue: LinearIssue | undefined
         let shed = false
         try {
@@ -4088,6 +4107,10 @@ export class FactoryLoop implements Factory {
           const fuse = this.#discoveryOverloadFuseError()
           if (fuse) throw fuse
           shed = true
+          readyReadNotBeforeMs = Math.max(
+            readyReadNotBeforeMs,
+            this.#clock.now() + discoveryOverloadBackoffMs(overload.retryAfterSeconds, 1),
+          )
           this.#increment('discoveryOverloadItemsSkipped')
           this.#logger.warn?.('[factory] relayfile shed a ready-issue read; skipping it and continuing the sweep', {
             path,
@@ -4164,6 +4187,9 @@ export class FactoryLoop implements Factory {
         })
       }
 
+      // A shed final candidate can leave earlier readable units to dispatch.
+      // Their live-state reads must respect the same delay as enumeration.
+      if (issueEntries.length > 0) await waitForReadyReadBackoff()
       for (const { issue } of issueEntries) {
         // The dispatch half of the same fence as the read loop above. Without
         // it a pass abandoned during enumeration would go on to dispatch after
