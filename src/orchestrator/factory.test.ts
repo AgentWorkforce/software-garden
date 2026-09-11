@@ -37,6 +37,7 @@ import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWor
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
+import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
 import { BatchTracker, issueKey } from './batch-tracker'
 import { InMemoryStateStore } from '../state/in-memory-state-store'
@@ -4448,6 +4449,187 @@ describe('FactoryLoop', () => {
     expect(report.dispatched).toEqual([])
     expect(factory.status().parked).toHaveLength(2)
     expect(mount.listTreePrefixes.filter((prefix) => prefix === '/linear/issues')).toHaveLength(1)
+  })
+
+  describe('durable dependency park notices', () => {
+    const dependentPath = githubIssuePath('AgentWorkforce', 'pear', 40)
+    const dependent = githubIssueFile(40, {
+      labels: ['factory'], body: 'Blocked by: #39, #41, AgentWorkforce/other#42',
+    })
+
+    function fixture(receipts = false) {
+      const mount = new FakeMountClient({
+        [dependentPath]: dependent,
+        [githubIssuePath('AgentWorkforce', 'pear', 39)]: githubIssueFile(39, { labels: ['reference-only'] }),
+        [githubIssuePath('AgentWorkforce', 'pear', 41)]: githubIssueFile(41, { labels: ['reference-only'] }),
+        [githubIssuePath('AgentWorkforce', 'other', 42)]: githubIssueFile(42, { labels: ['reference-only'] }),
+      })
+      const comments: string[] = []
+      // Use the connected App path: it has no hasCommentMarker method, so
+      // the orchestrator must reconcile durable mounted provider comments.
+      const postIssueComment = vi.fn(async (input: { body: string }) => {
+        comments.push(input.body)
+        const id = 9000 + comments.length
+        if (receipts) {
+          const path = `/github/repos/AgentWorkforce/pear/issues/40/comments/${factoryGithubIssueCommentDraftName(input.body)}`
+          mount.files.set(path, { content: JSON.stringify({ created: id, path, externalId: String(id), id: String(id) }) })
+        } else {
+          mount.files.set(`/github/repos/AgentWorkforce__pear/issues/40__dependent/comments/${id}/meta.json`, {
+            content: { payload: { id, body: input.body } },
+          })
+        }
+      })
+      mount.githubWrite = {
+        postIssueComment,
+        updateIssue: async () => undefined,
+        publishPullRequest: async () => { throw new Error('unexpected publication') },
+        closePullRequest: async () => undefined,
+      }
+      const create = () => createFactory(config({ issueSource: 'github' }), {
+        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), logger: {},
+      })
+      return { mount, comments, postIssueComment, create }
+    }
+
+    it.each([false, true])('does not repeat the same dependency notice across sweeps or a process restart (receipts=%s)', async (receipts) => {
+      const { create, comments } = fixture(receipts)
+      let factory = create()
+      try {
+        for (let sweep = 0; sweep < 3; sweep += 1) {
+          expect((await factory.runOnce()).dispatched).toEqual([])
+        }
+        expect(comments).toHaveLength(1)
+        await factory.stop()
+        // Fresh orchestrator and state store: only the provider mount survives.
+        factory = create()
+        expect((await factory.runOnce()).dispatched).toEqual([])
+        expect(factory.status().parked).toHaveLength(1)
+        expect(factory.status().parked?.[0].blockers).toHaveLength(3)
+        expect(comments).toHaveLength(1)
+      } finally {
+        await factory.stop()
+      }
+    })
+
+    it.each([
+      { restart: false, receipts: false }, { restart: true, receipts: false },
+      { restart: false, receipts: true }, { restart: true, receipts: true },
+    ])('reconciles a dependency notice whose write landed but response failed ($restart, $receipts)', async ({ restart, receipts }) => {
+      const { create, comments, postIssueComment } = fixture(receipts)
+      const persist = postIssueComment.getMockImplementation()!
+      postIssueComment.mockImplementationOnce(async (input) => {
+        await persist(input)
+        throw new Error('504 after the provider committed the comment')
+      })
+      let factory = create()
+      try {
+        expect((await factory.runOnce()).dispatched).toEqual([])
+        expect(comments).toHaveLength(1)
+        if (restart) {
+          await factory.stop()
+          factory = create()
+        }
+        expect((await factory.runOnce()).dispatched).toEqual([])
+        expect(postIssueComment).toHaveBeenCalledTimes(1)
+        expect(comments).toHaveLength(1)
+      } finally {
+        await factory.stop()
+      }
+    })
+
+    it.each([false, true])('posts a new dependency notice when the blockers change after restart (receipts=%s)', async (receipts) => {
+      const { create, mount, comments } = fixture(receipts)
+      let factory = create()
+      try {
+        await factory.runOnce()
+        await factory.stop()
+        mount.files.set(dependentPath, {
+          content: githubIssueFile(40, { labels: ['factory'], body: 'Blocked by: #41' }),
+        })
+        factory = create()
+        expect((await factory.runOnce()).dispatched).toEqual([])
+        expect(comments).toHaveLength(2)
+        expect(comments[1]).toContain('Blocked by: AgentWorkforce/pear#41')
+        expect(comments[1].split('\n')[0]).not.toBe(comments[0].split('\n')[0])
+        await factory.runOnce()
+        expect(comments).toHaveLength(2)
+      } finally {
+        await factory.stop()
+      }
+    })
+
+    it('retries a dependency notice when the provider write never landed', async () => {
+      const { create, mount, comments, postIssueComment } = fixture(true)
+      postIssueComment.mockImplementationOnce(async ({ body }) => {
+        // A locally authored draft must not masquerade as provider success.
+        mount.files.set(`/github/repos/AgentWorkforce/pear/issues/40/comments/${factoryGithubIssueCommentDraftName(body)}`, {
+          content: { body },
+        })
+        throw new Error('provider rejected the authored draft')
+      })
+      const factory = create()
+      try {
+        await factory.runOnce()
+        expect(comments).toHaveLength(0)
+        await factory.runOnce()
+        expect(comments).toHaveLength(1)
+        expect(postIssueComment).toHaveBeenCalledTimes(2)
+      } finally {
+        await factory.stop()
+      }
+    })
+
+    it('defers dependency notices while existing comments cannot be read', async () => {
+      const { create, mount, comments } = fixture()
+      let factory = create()
+      try {
+        await factory.runOnce()
+        await factory.stop()
+        factory = create()
+        const read = mount.readFile.bind(mount)
+        const reads = vi.spyOn(mount, 'readFile').mockImplementation(async (path) => {
+          if (path.includes('/comments/')) throw new Error('comment read unavailable')
+          return await read(path)
+        })
+        expect((await factory.runOnce()).dispatched).toEqual([])
+        expect(comments).toHaveLength(1)
+        reads.mockRestore()
+        await factory.runOnce()
+        expect(comments).toHaveLength(1)
+      } finally {
+        await factory.stop()
+      }
+    })
+
+    it('posts a new dependency notice when capacity changes and uses provider marker lookup', async () => {
+      const { mount } = fixture()
+      const freePath = githubIssuePath('AgentWorkforce', 'pear', 43)
+      const freeIssue = githubIssueFile(43, { labels: ['factory'] })
+      mount.files.set(freePath, { content: freeIssue })
+      const githubWriteback = new RecordingGithubWriteback()
+      const hasCommentMarker = vi.fn(async (issue: LinearIssue, marker: string) =>
+        githubWriteback.comments.some((comment) => comment.key === issue.key && comment.body.includes(marker)))
+      const factory = createFactory(config({ issueSource: 'github', batchSize: 1 }), {
+        mount, githubWriteback: Object.assign(githubWriteback, { hasCommentMarker }),
+        fleet: new FakeFleetClient(), triage: new StaticTriage(), logger: {},
+      })
+      try {
+        const decision = await factory.triageIssue(parseGithubFactoryIssue(dependentPath, dependent))
+        expect((await factory.dispatch(decision)).hold?.kind).toBe('dependency')
+        await factory.dispatch(await factory.triageIssue(parseGithubFactoryIssue(freePath, freeIssue)))
+        expect((await factory.dispatch(decision)).hold?.kind).toBe('dependency')
+        const notices = githubWriteback.comments.filter((comment) => comment.key === '40')
+        expect(notices).toHaveLength(2)
+        expect(notices[0].body).not.toContain('Capacity is also currently unavailable.')
+        expect(notices[1].body).toContain('Capacity is also currently unavailable.')
+        expect(notices[1].body.split('\n')[0]).not.toBe(notices[0].body.split('\n')[0])
+        expect(hasCommentMarker).toHaveBeenCalledWith(expect.objectContaining({ key: '40' }), notices[1].body.split('\n')[0])
+        await factory.dispatch(decision)
+        expect(githubWriteback.comments.filter((comment) => comment.key === '40')).toHaveLength(2)
+      } finally {
+        await factory.stop()
+      }
+    })
   })
 
   it('posts the same dependency notice again after an issue successfully unparks and later re-parks', async () => {
