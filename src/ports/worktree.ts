@@ -25,6 +25,6 @@ export interface AgentWorktreeManager {
   cleanup(worktree: AgentWorktree): Promise<void>
   /** Enumerate Factory-owned linked checkouts for one configured repository. */
   listWorktrees(repository: AgentWorktreeRepository): Promise<AgentWorktree[]>
-  /** Fail closed before cleanup when local work, unpublished commits, or locks exist. */
-  inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection>
+  /** Fail closed on local state unless the owning dispatch proved its PR merged and released all agents. */
+  inspectForCleanup(worktree: AgentWorktree, options?: { merged?: boolean }): Promise<AgentWorktreeCleanupInspection>
 }

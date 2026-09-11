@@ -178,7 +178,10 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     return worktrees
   }
 
-  async inspectForCleanup(worktree: AgentWorktree): Promise<AgentWorktreeCleanupInspection> {
+  async inspectForCleanup(
+    worktree: AgentWorktree,
+    options: { merged?: boolean } = {},
+  ): Promise<AgentWorktreeCleanupInspection> {
     assertSafeWorktree(worktree)
     await assertNonSymlinkFactoryRoot(factoryWorktreeRoot(worktree.baseClonePath))
     // Inspection runs before cleanup, so it must clear unrelated deleted
@@ -188,6 +191,10 @@ export class GitAgentWorktreeManager implements AgentWorktreeManager {
     await this.#git(worktree.baseClonePath, ['worktree', 'prune'])
     if (!await pathExists(worktree.worktreePath)) return { bytes: 0, retentionReasons: [] }
     await this.#assertRegisteredCheckout(worktree)
+
+    if (options.merged) {
+      return { bytes: await directorySize(worktree.worktreePath), retentionReasons: [] }
+    }
 
     const retentionReasons: string[] = []
     const gitDir = resolveGitPath(
