@@ -514,6 +514,7 @@ export type {
   FactoryInFlightRegistryAgent,
   FactoryInFlightRegistryProcess,
   FactoryLoopHeartbeat,
+  FactorySlackCounters,
   FactoryLoopLiveness,
   FactoryLoopRunOptions,
   FactoryLiveSubscriptionOptions,

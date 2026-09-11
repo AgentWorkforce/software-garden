@@ -12328,6 +12328,87 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it.each([false, true])('Slack heartbeat counters publish authoritative zeros with Slack enabled=%s', async (enabled) => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-slack-zero-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const factory = createFactory(config({
+      ...(enabled ? { slack: slackConfig() } : {}),
+      loop: { heartbeatPath, registryPath: join(root, 'registry.json'), heartbeatStaleMs: 1_000 },
+    }), { mount: new FakeMountClient(), fleet: new FakeFleetClient(), triage: new StaticTriage() })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const initial = await readFactoryLoopHeartbeat(heartbeatPath)
+      const zeros = {
+        slackWritebacksSkipped: 0,
+        slackDegradedEpisodes: 0,
+        slackGateBypassedByWebhookHealth: 0,
+        slackGateBypassedByObservedEvent: 0,
+      }
+      expect(initial?.slack).toEqual(zeros)
+      expect(initial?.health?.slack).toEqual(zeros)
+      await factory.stop()
+      const stopped = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(stopped?.health?.slack).toEqual(zeros)
+      expect(stopped?.startedAt).toBe(initial?.startedAt)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['skipped', 'webhook-health', 'observed-event'] as const)(
+    'Slack heartbeat counters carry real %s activity through the written file', async (scenario) => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-slack-counts-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const clock = new ManualClock()
+      const mount = new SlackStatusConfirmMountClient({
+        [issuePath(150)]: issueFile(150),
+        [issuePath(151)]: issueFile(151),
+      })
+      const factory = createFactory(config({ batchSize: 5, slack: slackConfig() }), {
+        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), clock,
+      })
+      try {
+        if (scenario === 'observed-event') {
+          await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(150), issueFile(150))))
+          const event = changeEvent(
+            slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'observed-heartbeat'),
+            'observed-heartbeat',
+            new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+          )
+          mount.emit({ ...event, resource: { ...event.resource, provider: 'slack' } })
+        }
+        mount.slackStatus = {
+          provider: 'slack', status: 'lagging',
+          lastEventAt: new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+          ...(scenario === 'webhook-health' ? { webhookHealthy: true } : {}),
+        }
+        if (scenario !== 'observed-event') {
+          await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(150), issueFile(150))))
+        }
+        await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(151), issueFile(151))))
+
+        await factory.runLoop({ maxIterations: 1, heartbeatPath, registryPath: join(root, 'registry.json') })
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        const expected = {
+          slackWritebacksSkipped: scenario === 'skipped' ? 2 : 0,
+          slackDegradedEpisodes: scenario === 'skipped' ? 1 : 0,
+          slackGateBypassedByWebhookHealth: scenario === 'webhook-health' ? 2 : 0,
+          slackGateBypassedByObservedEvent: scenario === 'observed-event' ? 1 : 0,
+        }
+        expect(factory.status().counters).toMatchObject({ dispatched: 2 })
+        expect(heartbeat?.slack).toEqual(expected)
+        expect(heartbeat?.health?.slack).toEqual(expected)
+        expect(publicHealthFromHeartbeat(heartbeat, { nowMs: clock.now() }).slack).toEqual(expected)
+        expect(heartbeat).not.toHaveProperty('counters')
+        expect(heartbeat).not.toHaveProperty('slackWritebacksSkipped')
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('question counters preserve authoritative zero through the heartbeat file and reader', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-question-zero-'))
     const heartbeatPath = join(root, 'heartbeat.json')

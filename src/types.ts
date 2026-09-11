@@ -192,6 +192,14 @@ export interface FactoryLoopRunOptions {
 
 export type FactoryLoopHeartbeatStatus = 'running' | 'idle' | 'stopping'
 
+/** Process-local Slack writeback gate counters; reset on daemon restart. */
+export interface FactorySlackCounters {
+  slackWritebacksSkipped: number
+  slackDegradedEpisodes: number
+  slackGateBypassedByWebhookHealth: number
+  slackGateBypassedByObservedEvent: number
+}
+
 export interface FactoryLoopHeartbeat {
   /** Process-wide PR record I/O, including completion probes outside discovery. */
   prProbe?: PrProbeReadCacheStatus
@@ -235,6 +243,8 @@ export interface FactoryLoopHeartbeat {
   }
   registryPath?: string
   eventListener?: FactoryEventListenerStatus
+  /** Absent on older producers. Only the writer supplies authoritative zeros. */
+  slack?: FactorySlackCounters
   readinessReconcile?: FactoryReadinessReconcileStatus
   /** Batch-slot admission: a full batch is why dispatch stops without failing (#303). */
   dispatchCapacity?: FactoryDispatchCapacityStatus
@@ -796,6 +806,11 @@ export interface FactoryPublicHealth {
   reason?: string
   readinessReconcile?: FactoryPublicReadinessReconcileHealth
   eventListener?: FactoryPublicEventListenerHealth
+  /**
+   * Slack writeback gate diagnostics, not a dispatch or liveness gate.
+   * Missing counters remain absent when reading older or invalid records.
+   */
+  slack?: Partial<FactorySlackCounters>
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
   /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
   fleetConnect?: FactoryPublicFleetConnectHealth

@@ -204,6 +204,18 @@ const optionalPositive = <K extends string>(key: K, value: unknown): Partial<Rec
   return parsed === undefined ? {} : { [key]: parsed } as Partial<Record<K, number>>
 }
 
+const slackHealth = (value: unknown): FactoryPublicHealth['slack'] => {
+  const record = plainRecord(value)
+  if (!record) return undefined
+  // Unlike the daemon, readers cannot turn missing instruments into zeros.
+  return {
+    ...optionalCount('slackWritebacksSkipped', record.slackWritebacksSkipped),
+    ...optionalCount('slackDegradedEpisodes', record.slackDegradedEpisodes),
+    ...optionalCount('slackGateBypassedByWebhookHealth', record.slackGateBypassedByWebhookHealth),
+    ...optionalCount('slackGateBypassedByObservedEvent', record.slackGateBypassedByObservedEvent),
+  }
+}
+
 /** Control characters stripped, length bounded: this text can reach a terminal. */
 const boundedText = (value: string): string =>
   // C0 and C1 alike (#300 review, P2, cubic): some terminals interpret the
@@ -875,6 +887,7 @@ export function publicHealthFromHeartbeat(
     // authenticated surface.
     ? { state: enumValue(heartbeat.eventListener.state, EVENT_LISTENER_STATES) }
     : undefined
+  const slack = slackHealth(heartbeat.slack)
 
   // A daemon that is not running a readiness loop is not a live dispatcher —
   // a bounded `factory loop` reports `not-running` here and is not supposed to
@@ -935,6 +948,7 @@ export function publicHealthFromHeartbeat(
     ...(readinessReconcile ? { readinessReconcile } : {}),
     ...(heartbeat.prProbe ? { prProbe: prProbeHealth(heartbeat.prProbe) } : {}),
     ...(eventListener ? { eventListener } : {}),
+    ...(slack ? { slack } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
     ...(fleetConnect ? { fleetConnect } : {}),
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
@@ -968,6 +982,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const readiness = plainRecord(record.readinessReconcile)
   const prProbe = prProbeHealth(record.prProbe)
   const listener = plainRecord(record.eventListener)
+  const slack = slackHealth(record.slack)
   const fleet = plainRecord(record.fleetControlPlane)
   const fleetConnect = plainRecord(record.fleetConnect)
   const capacity = plainRecord(record.dispatchCapacity)
@@ -1026,6 +1041,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     loopStatus: enumValue(record.loopStatus, ['running', 'idle', 'stopping'] as const),
     degradedSubsystems: [...degradedSubsystems],
     ...(prProbe ? { prProbe } : {}),
+    ...(slack ? { slack } : {}),
     ...(typeof record.reason === 'string'
       ? { reason: boundedText(record.reason) }
       : {}),

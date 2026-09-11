@@ -11161,6 +11161,13 @@ export class FactoryLoop implements Factory {
       registryPath,
       prProbe: this.#probePrRecords.status(),
       eventListener: this.#eventListenerStatus(),
+      // Deliberate heartbeat API: do not expose the entire internal counter bag.
+      slack: {
+        slackWritebacksSkipped: this.#counters.slackWritebacksSkipped ?? 0,
+        slackDegradedEpisodes: this.#counters.slackDegradedEpisodes ?? 0,
+        slackGateBypassedByWebhookHealth: this.#counters.slackGateBypassedByWebhookHealth ?? 0,
+        slackGateBypassedByObservedEvent: this.#counters.slackGateBypassedByObservedEvent ?? 0,
+      },
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),

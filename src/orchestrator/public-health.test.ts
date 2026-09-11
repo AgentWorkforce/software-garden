@@ -32,6 +32,45 @@ function heartbeat(overrides: Partial<FactoryLoopHeartbeat> = {}): FactoryLoopHe
   }
 }
 
+describe('Slack heartbeat counters', () => {
+  const slack = {
+    slackWritebacksSkipped: 3,
+    slackDegradedEpisodes: 1,
+    slackGateBypassedByWebhookHealth: 2,
+    slackGateBypassedByObservedEvent: 0,
+  }
+
+  it('preserves the four counters through projection and normalization without gating dispatch', () => {
+    const health = publicHealthFromHeartbeat(heartbeat({
+      slack: { ...slack, secret: 'must not cross', dispatched: 99 } as typeof slack,
+    }), { nowMs: BOOT_MS })
+    expect(health.slack).toEqual(slack)
+    expect(normalizePublicHealth(health)?.slack).toEqual(slack)
+    expect(health).toMatchObject({ ok: true, status: 'ok', degradedSubsystems: [] })
+  })
+
+  it('keeps older heartbeats and health records uninstrumented', () => {
+    const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
+    expect(Object.hasOwn(health, 'slack')).toBe(false)
+    expect(Object.hasOwn(normalizePublicHealth(health)!, 'slack')).toBe(false)
+    expect(publicHealthFromHeartbeat(undefined).slack).toBeUndefined()
+  })
+
+  it('does not invent zeros for missing or invalid counters or retain unlisted fields', () => {
+    const health = normalizePublicHealth({
+      slack: {
+        slackWritebacksSkipped: 0,
+        slackDegradedEpisodes: -1,
+        slackGateBypassedByWebhookHealth: '2',
+        secret: 'must not cross',
+        dispatched: 99,
+      },
+    })
+    expect(health?.slack).toEqual({ slackWritebacksSkipped: 0 })
+    expect(normalizePublicHealth({ slack: null })?.slack).toBeUndefined()
+  })
+})
+
 describe('dispatch capacity health (#303)', () => {
   const capacity = (overrides: Partial<NonNullable<FactoryLoopHeartbeat['dispatchCapacity']>> = {}) => heartbeat({
     dispatchCapacity: {
