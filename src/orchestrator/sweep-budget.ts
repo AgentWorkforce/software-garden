@@ -54,15 +54,17 @@
  */
 
 /** The phases a sweep can be abandoned in. A closed set: see the error below. */
-export type DiscoverySweepPhase =
-  | 'fleet-control-plane-probe'
-  | 'discovery-lease-claim'
-  | 'discovery-backoff-wait'
-  | 'discovery-session'
-  | 'run-once'
-  | 'discovery-checkpoint'
-  | 'discovery-renewal-stop'
-  | 'discovery-commit'
+export const DISCOVERY_SWEEP_PHASES = [
+  'fleet-control-plane-probe',
+  'discovery-lease-claim',
+  'discovery-backoff-wait',
+  'discovery-session',
+  'run-once',
+  'discovery-checkpoint',
+  'discovery-renewal-stop',
+  'discovery-commit',
+] as const
+export type DiscoverySweepPhase = typeof DISCOVERY_SWEEP_PHASES[number]
 
 /**
  * A sweep that did not finish inside its aggregate budget.
@@ -99,6 +101,8 @@ export interface DiscoverySweepBudget {
   readonly signal: AbortSignal
   /** True once the budget is spent, whether or not anything is awaiting. */
   expired(): boolean
+  /** Last entered phase, retained when an ordinary operation rejects too. */
+  phase(): DiscoverySweepPhase | undefined
   /** Await `start()`, or abandon that wait once the sweep's budget is spent. */
   run<T>(phase: DiscoverySweepPhase, start: () => Promise<T>): Promise<T>
   /** Throw if the budget is already spent. A between-await check; see above. */
@@ -136,6 +140,7 @@ export function startDiscoverySweepBudget(timeoutMs: number | undefined): Discov
   const budgetMs = discoverySweepBudgetMs(timeoutMs)
   const controller = new AbortController()
   let expired = false
+  let lastPhase: DiscoverySweepPhase | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   let expire: () => void = () => undefined
   // Never rejects, so an unawaited race arm cannot surface as an unhandled
@@ -174,9 +179,11 @@ export function startDiscoverySweepBudget(timeoutMs: number | undefined): Discov
     ...(budgetMs === undefined ? {} : { budgetMs }),
     signal: controller.signal,
     expired: () => expired,
+    phase: () => lastPhase,
     assertNotExpired,
     expire: spend,
     async run<T>(phase: DiscoverySweepPhase, start: () => Promise<T>): Promise<T> {
+      lastPhase = phase
       if (budgetMs === undefined) return await start()
       // Decided before the call is made, so an already-spent budget cannot
       // start new work against the dependency it is abandoning.

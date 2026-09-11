@@ -17575,6 +17575,66 @@ describe('FactoryLoop', () => {
   })
 
 
+  it('records startup and repeated sweep causes with a healthy fleet, publishes them, and clears on recovery', async () => {
+    class FailingClaims extends InMemoryStateStore {
+      fail = true
+      override async claimDiscoverySweep(...args: Parameters<InMemoryStateStore['claimDiscoverySweep']>): Promise<DiscoverySweepClaim> {
+        if (this.fail) {
+          const cause = Object.assign(new Error('private state-store response'), { name: 'StateStoreUnavailableError' })
+          throw new Error('Unable to claim discovery lease: private state-store response', { cause })
+        }
+        return super.claimDiscoverySweep(...args)
+      }
+    }
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-failure-cause-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const stateStore = new FailingClaims({ batchSize: 2 })
+    const mount = new CountingEventsMount()
+    mount.setSubRoot('/linear/issues', 'absent')
+    const factory = createFactory(config({
+      issueSource: 'github', loop: { heartbeatPath, registryPath: join(root, 'registry.json') },
+    }), {
+      mount, fleet: new FakeFleetClient(), stateStore, triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(), logger: {},
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe', reconcileIntervalMs: 50 } })
+      expect(factory.status().readinessReconcile).toMatchObject({
+        lastError: 'Unable to claim discovery lease: private state-store response',
+        lastErrorPhase: 'discovery-lease-claim',
+        lastErrorCauseClass: 'StateStoreUnavailableError',
+      })
+      expect(factory.status().readinessReconcile?.lastCompletedAtMs).toBeUndefined()
+      expect(factory.status().counters.liveStartupBackfillErrors).toBe(1)
+      await vi.waitFor(async () => {
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        expect(heartbeat?.readinessReconcile?.consecutiveFailures).toBeGreaterThanOrEqual(8)
+        expect(heartbeat?.fleetControlPlane?.state).toBe('closed')
+        expect(heartbeat?.health?.readinessReconcile).toMatchObject({
+          lastError: 'Sweep failed during discovery-lease-claim (Error; cause: StateStoreUnavailableError); details: /evidence',
+          lastErrorPhase: 'discovery-lease-claim',
+          lastErrorCauseClass: 'StateStoreUnavailableError',
+        })
+        expect(JSON.stringify(heartbeat?.health)).not.toContain('private state-store response')
+      })
+      stateStore.fail = false
+      await vi.waitFor(async () => {
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        expect(heartbeat?.readinessReconcile?.consecutiveFailures).toBe(0)
+        expect(heartbeat?.readinessReconcile?.lastCompletedAtMs).toBeDefined()
+        for (const record of [heartbeat?.readinessReconcile, heartbeat?.health?.readinessReconcile]) {
+          expect(record?.lastError).toBeUndefined()
+          expect(record?.lastErrorPhase).toBeUndefined()
+          expect(record?.lastErrorCauseClass).toBeUndefined()
+        }
+      })
+    } finally {
+      stateStore.fail = false
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   // #295. The deployed instance publishes exactly one unauthenticated record,
   // and it is built from this file. These two tests are the pair the outage
   // needed: the failing case (a counter and a class an operator can read
