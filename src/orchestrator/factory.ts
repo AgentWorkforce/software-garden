@@ -1308,7 +1308,7 @@ export class FactoryLoop implements Factory {
   #completionSweepActive = false
   #previewSweepTimer?: ReturnType<typeof setTimeout>
   #previewSweepInFlight?: Promise<void>
-  readonly #completionInFlight = new Set<string>()
+  readonly #completionInFlight = new Map<string, Promise<void>>()
   readonly #issueWritebackInFlight = new Map<string, Promise<void>>()
   // A fast completion can make terminal issue state visible while dispatch is
   // still performing its post-spawn readiness read. Completion publishes its
@@ -10856,6 +10856,16 @@ export class FactoryLoop implements Factory {
     const previousRole = await this.#state.getCanonicalState(this.#workspaceId, canonicalKey)
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
     if (reopenedFromTerminal && role === 'readyForAgent') {
+      // Capacity and the terminal Slack watch can settle before agent release.
+      // Admitting this reopen in that window returns the old releasing row's
+      // cached dispatch result without spawning a new team. Let our completion
+      // finish (including its final ownership cleanup) before clearing its rows.
+      // Keep the terminal role until then so completion cannot consume the edge.
+      const completion = this.#completionInFlight.get(dispatchLifecycleKey(ref))
+      if (completion) {
+        this.#increment('dispatchReopensWaitingForCompletion')
+        await completion
+      }
       await this.#clearTerminalRefusals(ref)
     } else if (role === 'readyForAgent') {
       // The edge above only repairs a row that went terminal because the work
@@ -18419,7 +18429,10 @@ export class FactoryLoop implements Factory {
     if (this.#completionInFlight.has(completionKey)) {
       return
     }
-    this.#completionInFlight.add(completionKey)
+    let settleCompletion!: () => void
+    this.#completionInFlight.set(completionKey, new Promise<void>((resolve) => {
+      settleCompletion = resolve
+    }))
     const postSpawnIssueObservation = this.#postSpawnIssueObservations.get(completionKey)
     const postSpawnDispatchClaimFence = this.#postSpawnDispatchClaimFences.get(completionKey)
     let settleIssueWriteback!: () => void
@@ -18656,7 +18669,6 @@ export class FactoryLoop implements Factory {
       // the waiting dispatch will re-read and preserve the foreign-change
       // abort. Always settle so a failed write cannot strand that dispatch.
       settleIssueWritebackOnce()
-      this.#completionInFlight.delete(completionKey)
       const stateKey = issueStateKey(record.issue)
       this.#probePrRecords.invalidate()
       // Both maps are keyed by issue state key PLUS the option suffixes
@@ -18675,12 +18687,17 @@ export class FactoryLoop implements Factory {
       }
       // Cancellation must see the subscription identity so it can issue the
       // idempotent Relayfile DELETE before clearing the local owner maps.
-      await this.#cancelBabysittersForIssue(record.issue)
-      const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue)).catch(() => undefined)
-      if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
-        for (const publishedKey of this.#publishedPullRequests.keys()) {
-          if (publishedKey.startsWith(`${completionKey}:`)) this.#publishedPullRequests.delete(publishedKey)
+      try {
+        await this.#cancelBabysittersForIssue(record.issue)
+        const durable = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(record.issue)).catch(() => undefined)
+        if (!this.#usesDurableDispatchLifecycle() || (durable && isTerminalDispatchLifecycle(durable))) {
+          for (const publishedKey of this.#publishedPullRequests.keys()) {
+            if (publishedKey.startsWith(`${completionKey}:`)) this.#publishedPullRequests.delete(publishedKey)
+          }
         }
+      } finally {
+        this.#completionInFlight.delete(completionKey)
+        settleCompletion()
       }
     }
   }

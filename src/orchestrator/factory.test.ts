@@ -26312,6 +26312,12 @@ describe('FactoryLoop', () => {
   it('keeps the terminal drain waiting on the receipt the fence itself writes', async () => {
     const mount = new FailingFencedReceiptMountClient({ [issuePath(416)]: issueFile(416) })
     const fleet = new RemoteLifecycleFleetClient()
+    const finishRelease = Promise.withResolvers<void>()
+    const originalRelease = fleet.release.bind(fleet)
+    vi.spyOn(fleet, 'release').mockImplementation(async (name, reason) => {
+      if (reason === 'issue-done') await finishRelease.promise
+      await originalRelease(name, reason)
+    })
     const stateStore = new InMemoryStateStore({ batchSize: 10 })
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -26360,6 +26366,13 @@ describe('FactoryLoop', () => {
 
       await mount.writeFile(issuePath(416), issuePayload(416, ready))
       const reopening = factory.runOnce()
+      // Force the reopen to arrive before completion finishes releasing its
+      // agents. It must wait rather than reuse that generation's cached result.
+      await vi.waitFor(() => expect(
+        factory.status().counters.dispatchReopensWaitingForCompletion,
+      ).toBe(1), { timeout: 15_000 })
+      expect(fleet.spawns).toHaveLength(2)
+      finishRelease.resolve()
       await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4), { timeout: 15_000 })
       // Four spawns only prove the reopened dispatch got as far as spawning,
       // which happens *before* it touches the Slack fence. Wait for the drain
@@ -26416,6 +26429,7 @@ describe('FactoryLoop', () => {
       expect(carried).not.toContain(staleText)
       expect(slackConversationResumes(fleet)).toEqual([])
     } finally {
+      finishRelease.resolve()
       mount.failFencedReceipt = false
       mount.releaseStraddlingRead()
       mount.releaseUnroutableWrite()
