@@ -89,6 +89,32 @@ export class DocumentStateStore extends InMemoryStateStore {
     await this.#exclusive(async () => this.#documentStore.assertReady())
   }
 
+  override async beginDependencyPark(workspaceId: string, key: string): Promise<number> {
+    return await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      const parks = workspace.dependencyParks ??= {}
+      const park = parks[key] ??= { epoch: 0, active: false }
+      if (!park.active) {
+        park.active = true
+        await this.#persist(document)
+      }
+      return park.epoch
+    }))
+  }
+
+  override async clearDependencyPark(workspaceId: string, key: string): Promise<void> {
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const park = document.workspaces[workspaceId]?.dependencyParks?.[key]
+      if (park?.active) {
+        park.active = false
+        park.epoch += 1
+        await this.#persist(document)
+      }
+    }))
+  }
+
   override async claimDiscoverySweep(
     workspaceId: string,
     owner: string,
@@ -1503,6 +1529,7 @@ const emptyWorkspaceState = (): PersistedWorkspaceState => ({
 })
 
 const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
+  Object.keys(workspace.dependencyParks ?? {}).length === 0 &&
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
   Object.keys(workspace.slackThreadWatches).length === 0 &&
   Object.keys(workspace.waitingClarifications).length === 0 &&

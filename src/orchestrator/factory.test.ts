@@ -4457,7 +4457,7 @@ describe('FactoryLoop', () => {
       labels: ['factory'], body: 'Blocked by: #39, #41, AgentWorkforce/other#42',
     })
 
-    function fixture(receipts = false) {
+    function fixture(receipts = false, stateStore?: () => StateStore) {
       const mount = new FakeMountClient({
         [dependentPath]: dependent,
         [githubIssuePath('AgentWorkforce', 'pear', 39)]: githubIssueFile(39, { labels: ['reference-only'] }),
@@ -4486,7 +4486,7 @@ describe('FactoryLoop', () => {
         closePullRequest: async () => undefined,
       }
       const create = () => createFactory(config({ issueSource: 'github' }), {
-        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), logger: {},
+        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), logger: {}, stateStore: stateStore?.(),
       })
       return { mount, comments, postIssueComment, create }
     }
@@ -4534,6 +4534,63 @@ describe('FactoryLoop', () => {
         expect(comments).toHaveLength(1)
       } finally {
         await factory.stop()
+      }
+    })
+
+    it.each([
+      { receipts: false, restart: false }, { receipts: true, restart: false },
+      { receipts: false, restart: true }, { receipts: true, restart: true },
+    ])('notifies exactly twice for park, clear, re-park with old evidence retained ($receipts, $restart)', async ({ receipts, restart }) => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-dependency-repark-'))
+      const { create, mount, comments, postIssueComment } = fixture(receipts, () => new FileStateStore({
+        batchSize: 2, watchStatePath: join(root, 'state.json'),
+      }))
+      let factory = create()
+      try {
+        await factory.runOnce()
+        expect(comments).toHaveLength(1)
+        if (restart) {
+          await factory.stop()
+          factory = create()
+        }
+        // Clear admission, then lose readiness at the final spawn check. No
+        // dispatch comment or old-comment deletion can invalidate the receipt.
+        mount.files.set(dependentPath, { content: githubIssueFile(40, { labels: ['factory'], body: '' }) })
+        const read = mount.readFile.bind(mount)
+        let dependentReads = 0
+        const reads = vi.spyOn(mount, 'readFile').mockImplementation(async (path) => {
+          if (path === dependentPath && ++dependentReads === 2) {
+            return { content: githubIssueFile(40, { labels: [], body: '' }) }
+          }
+          return await read(path)
+        })
+        const decision = await factory.triageIssue(parseGithubFactoryIssue(dependentPath, dependent))
+        await expect(factory.dispatch(decision)).rejects.toThrow()
+        reads.mockRestore()
+        expect(factory.status().parked).toHaveLength(0)
+        if (restart) {
+          await factory.stop()
+          factory = create()
+        }
+        mount.files.set(dependentPath, { content: dependent })
+        // Exercise lost acknowledgement on the *second* park as well.
+        const persist = postIssueComment.getMockImplementation()!
+        postIssueComment.mockImplementationOnce(async (input) => {
+          await persist(input)
+          throw new Error('504 after provider committed the re-park notice')
+        })
+        await factory.runOnce()
+        expect(comments).toHaveLength(2)
+        expect(comments[1].split('\n')[0]).not.toBe(comments[0].split('\n')[0])
+        await factory.stop()
+        factory = create()
+        await factory.runOnce()
+        await factory.runOnce()
+        expect(comments).toHaveLength(2)
+        expect(postIssueComment).toHaveBeenCalledTimes(2)
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
       }
     })
 

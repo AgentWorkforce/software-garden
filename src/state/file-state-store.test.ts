@@ -10,6 +10,30 @@ import { FileStateStore } from './file-state-store'
 import { InMemoryStateStore } from './in-memory-state-store'
 
 describe('FileStateStore', () => {
+  it('persists dependency park epochs and serializes repeated clears across store instances', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dependency-epochs-'))
+    try {
+      const options = { batchSize: 2, watchStatePath: join(root, 'state.json') }
+      const first = new FileStateStore(options)
+      const second = new FileStateStore(options)
+      await first.clearDependencyPark('workspace-1', 'issue')
+      expect(await first.beginDependencyPark('workspace-1', 'issue')).toBe(0)
+      expect(await second.beginDependencyPark('workspace-1', 'issue')).toBe(0)
+      await Promise.all([
+        first.clearDependencyPark('workspace-1', 'issue'),
+        second.clearDependencyPark('workspace-1', 'issue'),
+      ])
+      const restarted = new FileStateStore(options)
+      expect(await restarted.beginDependencyPark('workspace-1', 'issue')).toBe(1)
+      expect(await first.beginDependencyPark('workspace-1', 'issue')).toBe(1)
+      expect(await first.beginDependencyPark('workspace-2', 'issue')).toBe(0)
+      await restarted.clearDependencyPark('workspace-1', 'issue')
+      expect(await second.beginDependencyPark('workspace-1', 'issue')).toBe(2)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('forwards the configured agent-question dedupe limit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-question-limit-'))
     try {

@@ -5965,7 +5965,7 @@ export class FactoryLoop implements Factory {
         },
       }
     }
-    this.#clearDependencyPark(batch, dispatchDecision.issue)
+    await this.#clearDependencyPark(batch, dispatchDecision.issue, dryRun)
     // Event-driven and direct dispatches do not necessarily pass through issue
     // discovery. Admit them before creating previews, claiming a lifecycle, or
     // consuming a dispatch attempt. The mutation proxy probes again at the
@@ -8801,7 +8801,7 @@ export class FactoryLoop implements Factory {
           if (parked) await this.#reportDependencyPark(liveIssue, parked, lifecycle.dryRun)
           return
         }
-        this.#clearDependencyPark(batch, lifecycle.issue)
+        await this.#clearDependencyPark(batch, lifecycle.issue, lifecycle.dryRun)
       }
       const epoch = this.#dispatchLifecycleEpochs.get(key)
       if (epoch === undefined || !await this.#state.promoteDispatchLifecycle(
@@ -10542,7 +10542,10 @@ export class FactoryLoop implements Factory {
     }
   }
 
-  #clearDependencyPark(batch: BatchSnapshot, issue: IssueRef): void {
+  async #clearDependencyPark(batch: BatchSnapshot, issue: IssueRef, dryRun = false): Promise<void> {
+    // Persist the boundary before admitting dispatch or dropping local state.
+    // A restart may have no local parked record, but must still retire its receipt.
+    if (!dryRun) await this.#state.clearDependencyPark(this.#workspaceId, dispatchIssueIdentity(issue))
     batch.clearPark(issue)
     this.#dependencyParkNotices.delete(issueKey(issue))
   }
@@ -10634,7 +10637,12 @@ export class FactoryLoop implements Factory {
   async #reportDependencyPark(issue: LinearIssue, parked: ParkedIssue, dryRun: boolean): Promise<string> {
     const cycle = parked.cycle?.join(' -> ')
     const blockers = parked.blockers.map((blocker) => blocker.label)
-    const signature = JSON.stringify({ blockers, cycle, capacityBlocked: parked.capacityBlocked })
+    const epoch = dryRun ? 0 : await this.#state.beginDependencyPark(
+      this.#workspaceId, dispatchIssueIdentity(parked.issue),
+    )
+    // Preserve epoch-zero markers for notices written before epoch tracking.
+    // Later parks get distinct comments AND distinct App receipt filenames.
+    const signature = JSON.stringify({ blockers, cycle, capacityBlocked: parked.capacityBlocked, ...(epoch > 0 ? { epoch } : {}) })
     const marker = `<!-- factory-dependency-park:${stableHash(signature)} -->`
     const comment = parked.cycle
       ? [
@@ -10689,7 +10697,7 @@ export class FactoryLoop implements Factory {
     // its new state, so apply the explicit observation after indexing it.
     this.#terminalDependencyIdentities.add(identity)
     const batch = await this.#batch()
-    this.#clearDependencyPark(batch, issueRef(issue))
+    await this.#clearDependencyPark(batch, issueRef(issue))
     const candidates = batch.parked.filter((parked) =>
       parked.blockers.some((blocker) => blocker.identity === identity),
     )

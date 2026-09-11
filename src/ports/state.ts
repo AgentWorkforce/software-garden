@@ -410,7 +410,13 @@ export interface BatchSnapshot {
   restore(record: InFlightIssue): InFlightIssue
 }
 
+export type DependencyParkState = { epoch: number; active: boolean }
+
 export interface StateStore {
+  /** Reuse the current epoch, including after restart; first park uses legacy epoch zero. */
+  beginDependencyPark(workspaceId: string, key: string): Promise<number>
+  /** Atomically end an active park and advance its epoch once; repeated clears are no-ops. */
+  clearDependencyPark(workspaceId: string, key: string): Promise<void>
   getBatch(workspaceId: string): Promise<BatchSnapshot>
   recordDispatchAttempt(workspaceId: string, issueKey: string, attempt: DispatchAttemptState): Promise<void>
   getDispatchAttempts(workspaceId: string, issueKey: string): Promise<DispatchAttemptState | undefined>
