@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { BatchTracker } from '../orchestrator/batch-tracker'
 import type {
   BatchSnapshot,
+  DependencyParkState,
   BabysitterGenerationRecord,
   BabysitterSessionState,
   CriticalRecord,
@@ -33,6 +34,7 @@ import {
 import { dispatchLifecycleOccupiesSlot, stampDispatchLifecycleSlot } from './dispatch-lifecycle-slot'
 
 type WorkspaceState = {
+  dependencyParks: Map<string, DependencyParkState>
   batch: BatchTracker
   criticalMessages: Map<string, CriticalRecord>
   resumedExitKeys: Set<string>
@@ -65,6 +67,22 @@ export class InMemoryStateStore implements StateStore {
   constructor(options: InMemoryStateStoreOptions) {
     this.#batchSize = options.batchSize
     this.#agentQuestionDedupeLimit = Math.max(1, Math.trunc(options.agentQuestionDedupeLimit ?? 500))
+  }
+
+  async beginDependencyPark(workspaceId: string, key: string): Promise<number> {
+    const parks = this.#workspace(workspaceId).dependencyParks
+    const park = parks.get(key) ?? { epoch: 0, active: false }
+    park.active = true
+    parks.set(key, park)
+    return park.epoch
+  }
+
+  async clearDependencyPark(workspaceId: string, key: string): Promise<void> {
+    const park = this.#workspace(workspaceId).dependencyParks.get(key)
+    if (park?.active) {
+      park.active = false
+      park.epoch += 1
+    }
   }
 
   async getBatch(workspaceId: string): Promise<BatchSnapshot> {
@@ -999,6 +1017,7 @@ export class InMemoryStateStore implements StateStore {
     let state = this.#workspaces.get(workspaceId)
     if (!state) {
       state = {
+        dependencyParks: new Map(),
         batch: new BatchTracker(this.#batchSize),
         criticalMessages: new Map(),
         resumedExitKeys: new Set(),

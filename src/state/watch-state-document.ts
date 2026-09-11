@@ -1,4 +1,5 @@
 import type {
+  DependencyParkState,
   DispatchLifecycleAgent,
   BabysitterGenerationRecord,
   BabysitterSessionState,
@@ -42,6 +43,9 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
         (discoverySweep !== undefined && !isRecord(discoverySweep))
       ) throw invalidDocument()
       workspaces[workspaceId] = {
+        ...(rawWorkspace.dependencyParks === undefined ? {} : {
+          dependencyParks: parseDependencyParks(rawWorkspace.dependencyParks),
+        }),
         githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
         slackThreadWatches: parseSlackThreadWatches(slackWatches ?? {}),
         waitingClarifications: parseWaitingClarifications(clarifications),
@@ -95,6 +99,13 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
     return { version: 3, workspaces }
   }
   throw invalidDocument()
+}
+
+const parseDependencyParks = (value: unknown): Record<string, DependencyParkState> => {
+  if (!isRecord(value) || !Object.values(value).every((park) =>
+    isRecord(park) && Number.isSafeInteger(park.epoch) && (park.epoch as number) >= 0 &&
+    typeof park.active === 'boolean')) throw invalidDocument()
+  return structuredClone(value) as Record<string, DependencyParkState>
 }
 
 export const emptyDiscoverySweepState = (): DiscoverySweepState => ({

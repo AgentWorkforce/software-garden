@@ -1,4 +1,5 @@
 import type {
+  DependencyParkState,
   BabysitterGenerationRecord,
   BabysitterSessionState,
   ConversationSessionState,
@@ -10,6 +11,7 @@ import type {
 } from '../ports/state'
 
 export type PersistedWorkspaceState = {
+  dependencyParks?: Record<string, DependencyParkState>
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
   slackThreadWatches: Record<string, SlackThreadWatchState>
   waitingClarifications: Record<string, WaitingClarification>
