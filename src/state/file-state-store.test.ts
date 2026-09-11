@@ -34,6 +34,66 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('reclaims a verified retired process epoch with a reused PID and fences all stale writes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-process-epoch-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      const alive = new Set(['runtime-a:boot-1:37:start-1'])
+      const store = (processEpoch: string) => new FileStateStore({
+        batchSize: 2, watchStatePath, processEpoch,
+        isProcessAlive: () => true, // PID 37 exists again after restart.
+        isProcessEpochAlive: async (epoch) => alive.has(epoch),
+      })
+      const oldEpoch = 'runtime-a:boot-1:37:start-1'
+      const newEpoch = 'runtime-a:boot-2:37:start-2'
+      const first = store(oldEpoch)
+      // Reusing even the OWNER must not bypass the process fence.
+      const owner = '37:same-instance'
+      await first.claimDiscoverySweep('workspace', owner, 1_000, 60_000)
+      alive.delete(oldEpoch)
+      alive.add(newEpoch)
+      const restarted = store(newEpoch)
+      const claim = await restarted.claimDiscoverySweep('workspace', owner, 1_001, 60_000)
+      expect(claim).toMatchObject({
+        acquired: true,
+        reclaimedLease: { processEpoch: oldEpoch, epoch: 1, leaseUntilMs: 61_000 },
+        lease: { processEpoch: newEpoch, epoch: 2, leaseUntilMs: 61_001 },
+      })
+      expect(await first.renewDiscoverySweep('workspace', owner, 1, 1_002, 60_000)).toBe(false)
+      expect(await first.completeDiscoverySweep('workspace', owner, 1)).toBe(false)
+      expect(await first.deferDiscoverySweep('workspace', owner, 1, 99_000, 3)).toBe(false)
+      await first.releaseDiscoverySweep('workspace', owner, 1)
+      expect(await restarted.renewDiscoverySweep('workspace', owner, 2, 1_003, 60_000)).toBe(true)
+      await expect(first.claimDiscoverySweep('workspace', owner, 100_000, 60_000))
+        .rejects.toThrow('process epoch has retired')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('never steals an unexpired live peer epoch, even with the same owner or an absent local PID', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-live-process-epoch-'))
+    try {
+      const options = { batchSize: 2, watchStatePath: join(root, 'state.json'),
+        isProcessAlive: () => false, isProcessEpochAlive: async () => true }
+      const first = new FileStateStore({ ...options, processEpoch: 'live-peer' })
+      await first.claimDiscoverySweep('workspace', '37:shared-instance', 1_000, 60_000)
+      const second = new FileStateStore({ ...options, processEpoch: 'new-process' })
+      expect(await second.claimDiscoverySweep('workspace', '37:shared-instance', 1_001, 60_000))
+        .toMatchObject({ acquired: false, reason: 'in-flight', state: { lease: { processEpoch: 'live-peer' } } })
+      // A legacy process cannot apply its local PID probe to a fenced lease.
+      const legacy = new FileStateStore(options)
+      expect(await legacy.claimDiscoverySweep('workspace', '38:legacy', 1_002, 60_000))
+        .toMatchObject({ acquired: false, reason: 'in-flight' })
+      const unknown = new FileStateStore({ ...options, processEpoch: 'unknown',
+        isProcessEpochAlive: async () => { throw new Error('authority unavailable') } })
+      await expect(unknown.claimDiscoverySweep('workspace', '39:unknown', 1_003, 60_000))
+        .rejects.toThrow('authority unavailable')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('forwards the configured agent-question dedupe limit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-question-limit-'))
     try {

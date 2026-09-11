@@ -118,13 +118,20 @@ const parseDiscoverySweepState = (value: unknown): DiscoverySweepState => {
   if (value === undefined) return emptyDiscoverySweepState()
   if (!isRecord(value)) throw invalidDocument()
   const checkpoint = value.checkpoint
+  const cooldown = value.provisionerCooldown
   const lease = value.lease
   const lastEpoch = value.lastEpoch ?? (isRecord(lease) ? lease.epoch : 0)
   if (
+    (cooldown !== undefined && (!isRecord(cooldown) ||
+      !Number.isSafeInteger(cooldown.untilMs) || (cooldown.untilMs as number) < 0 ||
+      !Number.isSafeInteger(cooldown.nextBackoffMs) || (cooldown.nextBackoffMs as number) < 0 ||
+      !Number.isSafeInteger(cooldown.generation) || (cooldown.generation as number) < 0 ||
+      typeof cooldown.processEpoch !== 'string' || !cooldown.processEpoch)) ||
     !Number.isSafeInteger(value.consecutiveOverloads) || (value.consecutiveOverloads as number) < 0 ||
     !Number.isSafeInteger(value.backoffUntilMs) ||
     !Number.isSafeInteger(lastEpoch) || (lastEpoch as number) < 0 ||
     (lease !== undefined && (!isRecord(lease) || typeof lease.owner !== 'string' ||
+      (lease.processEpoch !== undefined && (typeof lease.processEpoch !== 'string' || !lease.processEpoch)) ||
       !Number.isSafeInteger(lease.epoch) || !Number.isSafeInteger(lease.leaseUntilMs))) ||
     (checkpoint !== undefined && (!isRecord(checkpoint) || !isRecord(checkpoint.trees) ||
       !Number.isSafeInteger(checkpoint.updatedAtMs) ||

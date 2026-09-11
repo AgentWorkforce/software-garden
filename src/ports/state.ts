@@ -197,12 +197,21 @@ export type DiscoveryCheckpoint = {
 }
 
 export type DiscoverySweepLease = {
+  /** Host-verifiable process incarnation; absent on legacy leases. */
+  processEpoch?: string
   owner: string
   epoch: number
   leaseUntilMs: number
 }
 
 export type DiscoverySweepState = {
+  /** Host provisioner overload state survives process/container replacement. */
+  provisionerCooldown?: {
+    untilMs: number
+    nextBackoffMs: number
+    generation: number
+    processEpoch: string
+  }
   checkpoint?: DiscoveryCheckpoint
   consecutiveOverloads: number
   backoffUntilMs: number

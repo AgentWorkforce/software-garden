@@ -38,13 +38,24 @@ import type {
 } from './document-store'
 import { emptyDiscoverySweepState, parseWatchStateDocument } from './watch-state-document'
 
-export type FileStateStoreOptions = InMemoryStateStoreOptions & {
+export type DiscoveryProcessFence = {
+  /** Unique process incarnation, never a stable instance name or a bare PID. */
+  processEpoch?: string
+  /**
+   * Return false ONLY with authoritative proof that this exact incarnation
+   * stopped. Foreign runtimes and inconclusive probes must remain alive or
+   * throw. A new epoch alone is not proof that its predecessor stopped.
+   */
+  isProcessEpochAlive?: (processEpoch: string) => Promise<boolean>
+}
+
+export type FileStateStoreOptions = InMemoryStateStoreOptions & DiscoveryProcessFence & {
   watchStatePath: string
   /** Injectable for deterministic stale-process lease recovery tests. */
   isProcessAlive?: (pid: number) => boolean
 }
 
-export type DocumentStateStoreOptions = InMemoryStateStoreOptions & {
+export type DocumentStateStoreOptions = InMemoryStateStoreOptions & DiscoveryProcessFence & {
   /** Optional host-defined identifier surfaced by embedded CLI status. */
   backend?: string
   documentStore: WatchStateDocumentStore
@@ -71,10 +82,12 @@ const WATCH_STATE_LOCK_STALE_MS = 60_000
  * updates instead of publishing divergent cached documents.
  */
 export class DocumentStateStore extends InMemoryStateStore {
+  static readonly processEpochFenceVersion = 1
   readonly backend?: string
   readonly #documentStore: WatchStateDocumentStore
   readonly #batchSize: number
   readonly #isProcessAlive: (pid: number) => boolean
+  readonly #processFence: DiscoveryProcessFence
   #operation: Promise<void> = Promise.resolve()
 
   constructor(options: DocumentStateStoreOptions) {
@@ -83,6 +96,13 @@ export class DocumentStateStore extends InMemoryStateStore {
     this.#documentStore = options.documentStore
     this.#batchSize = options.batchSize
     this.#isProcessAlive = options.isProcessAlive ?? processIsAlive
+    this.#processFence = {
+      processEpoch: options.processEpoch,
+      isProcessEpochAlive: options.isProcessEpochAlive,
+    }
+    if (options.processEpoch !== undefined && (!options.processEpoch || !options.isProcessEpochAlive)) {
+      throw new Error('A discovery process epoch requires an authoritative liveness probe')
+    }
   }
 
   async assertReady(): Promise<void> {
@@ -128,9 +148,16 @@ export class DocumentStateStore extends InMemoryStateStore {
       if (state.backoffUntilMs > nowMs) {
         return { acquired: false, reason: 'backoff', state: cloneDiscoverySweepState(state) }
       }
+      const { processEpoch, isProcessEpochAlive } = this.#processFence
+      if (processEpoch && !await isProcessEpochAlive!(processEpoch)) {
+        throw new Error('Discovery process epoch has retired; refusing sweep acquisition')
+      }
       const reclaimedLease = state.lease &&
         state.lease.leaseUntilMs > nowMs &&
-        discoveryLeaseOwnerIsOrphaned(state.lease.owner, owner, this.#isProcessAlive)
+        (state.lease.processEpoch !== undefined
+          ? processEpoch !== undefined && state.lease.processEpoch !== processEpoch &&
+            !await isProcessEpochAlive!(state.lease.processEpoch)
+          : discoveryLeaseOwnerIsOrphaned(state.lease.owner, owner, this.#isProcessAlive))
         ? { ...state.lease }
         : undefined
       if (state.lease && state.lease.leaseUntilMs > nowMs && !reclaimedLease) {
@@ -138,7 +165,10 @@ export class DocumentStateStore extends InMemoryStateStore {
       }
       const epoch = state.lastEpoch + 1
       state.lastEpoch = epoch
-      state.lease = { owner, epoch, leaseUntilMs: nowMs + leaseMs }
+      state.lease = {
+        owner, epoch, leaseUntilMs: nowMs + leaseMs,
+        ...(processEpoch ? { processEpoch } : {}),
+      }
       await this.#persist(document)
       return {
         acquired: true,
@@ -1328,6 +1358,8 @@ export class FileStateStore extends DocumentStateStore {
       batchSize: options.batchSize,
       agentQuestionDedupeLimit: options.agentQuestionDedupeLimit,
       isProcessAlive: options.isProcessAlive,
+      processEpoch: options.processEpoch,
+      isProcessEpochAlive: options.isProcessEpochAlive,
       documentStore: new FileWatchStateDocumentStore(options.watchStatePath),
     })
   }

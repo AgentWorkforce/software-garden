@@ -3674,6 +3674,7 @@ export class FactoryLoop implements Factory {
       this.#increment('discoverySweepsSkippedInFlight')
       this.#logger.info?.('[factory] skipped discovery because another process owns the sweep lease', {
         owner: claim.state.lease?.owner,
+        processEpoch: claim.state.lease?.processEpoch,
         epoch: claim.state.lease?.epoch,
         leaseUntilMs: claim.state.lease?.leaseUntilMs,
       })
@@ -3693,12 +3694,14 @@ export class FactoryLoop implements Factory {
         owner: claim.lease.owner,
         epoch: claim.lease.epoch,
         previousOwner: claim.reclaimedLease.owner,
+        previousProcessEpoch: claim.reclaimedLease.processEpoch,
         previousEpoch: claim.reclaimedLease.epoch,
         previousLeaseUntilMs: claim.reclaimedLease.leaseUntilMs,
       })
     }
     this.#logger.info?.('[factory] discovery sweep lease claimed', {
       owner: claim.lease.owner,
+      processEpoch: claim.lease.processEpoch,
       epoch: claim.lease.epoch,
       leaseUntilMs: claim.lease.leaseUntilMs,
     })
