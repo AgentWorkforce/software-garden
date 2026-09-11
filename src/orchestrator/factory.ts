@@ -9379,7 +9379,8 @@ export class FactoryLoop implements Factory {
     // The same release/termination fence used by failed-dispatch teardown has
     // now confirmed every agent sharing this checkout is gone. Reclamation is
     // best effort: a filesystem failure must not turn merged work into a failed
-    // or indefinitely releasing dispatch.
+    // or indefinitely releasing dispatch. Cleanup failures are surfaced through
+    // an error log and failure counter, without reporting the checkout reclaimed.
     await this.#cleanupAgentWorktrees(record)
     const next = this.#usesDurableDispatchLifecycle() ? undefined : batch.complete(record.issue)
     this.#localReleaseCheckpoints.delete(releaseKey)
@@ -13014,10 +13015,14 @@ export class FactoryLoop implements Factory {
     // directory-scan results have no release fence and may still have workers.
     for (const worktree of unique.values()) {
       try {
+        // Derive the run suffix from the same prefix used at creation. Adopted
+        // PRs use a stableHash digest, which can be shorter than eight characters.
+        const pathPrefix = factoryWorktreePath(worktree.baseClonePath, record.issue.key, worktree.repo, '')
+        const runId = resolve(worktree.worktreePath).slice(resolve(pathPrefix).length)
         const expectedPath = factoryWorktreePath(
-          worktree.baseClonePath, record.issue.key, worktree.repo, worktree.worktreePath.slice(-8),
+          worktree.baseClonePath, record.issue.key, worktree.repo, runId,
         )
-        if (resolve(worktree.worktreePath) !== resolve(expectedPath)) {
+        if (!runId || runId.includes('/') || resolve(worktree.worktreePath) !== resolve(expectedPath)) {
           throw new Error(`Refusing non-factory dispatch worktree path ${worktree.worktreePath}`)
         }
         const merged = await this.#worktreePrObservedMerged(record, worktree)
@@ -13048,7 +13053,7 @@ export class FactoryLoop implements Factory {
         })
       } catch (error) {
         this.#increment('agentWorktreeCleanupFailures')
-        this.#logger.warn?.('[factory] failed to clean completed issue worktree', {
+        this.#logger.error?.('[factory] failed to clean completed issue worktree', {
           issue: record.issue.key,
           repo: worktree.repo,
           worktreePath: worktree.worktreePath,

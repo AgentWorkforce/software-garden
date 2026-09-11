@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { readFileSync, existsSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { GitAgentWorktreeManager } from '../git/agent-worktree'
+import { factoryWorktreePath, GitAgentWorktreeManager } from '../git/agent-worktree'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -39,6 +39,7 @@ import { RelayfileOperationTimeoutError } from '../mount/relayfile-operation-tim
 import type { AgentSpec, AgentWorktree, AgentWorktreeCleanupInspection, AgentWorktreeManager, AgentWorktreeRepository, ChangeEvent, EventPage, GithubConnectionRead, GithubConnectionWrite, GithubIssueStatus, GithubIssueCloseWriteResult, GithubPublishPullRequestInput, GithubStatusClaimReceipt, GithubStatusWriteResult, GithubWriteback, LinearWriteback, PreviewReference, PreviewStartInput, ProviderSyncStatus, RosterEntry, SandboxPushInput, SandboxPushResult, SlackWriteback, SpawnInput, SpawnResult } from '../ports'
 import { FakeFleetClient, FakeMountClient, withDeadline } from '../testing'
 import type { CloseProbePrInput, GithubMergeGatePort, GithubMergeGateVerdict, GithubMergeInput, LinearIssue, VerificationGate, VerificationGateInput, VerificationVerdict } from '../index'
+import { stableHash } from '../writeback/shared'
 import { dispatchIssueIdentity } from '../dispatch/work-unit-identity'
 import { factoryGithubIssueCommentDraftName } from '../github/writeback-paths'
 import { dispatchPhaseOccupiesSlot } from '../state/dispatch-lifecycle-slot'
@@ -7499,6 +7500,92 @@ describe('FactoryLoop', () => {
         await factory.stop()
       }
     } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([false, true])('reclaims an adopted short-hash worktree after merge (inspectionFails=$0)', async (inspectionFails) => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-adopted-worktree-'))
+    const base = join(root, 'pear')
+    const remote = join(root, 'remote.git')
+    const git = async (cwd: string, ...args: string[]) =>
+      (await promisify(execFile)('git', ['-C', cwd, ...args])).stdout.trim()
+    await mkdir(base)
+    await git(base, 'init', '-b', 'main')
+    await git(base, 'config', 'user.name', 'Factory Test')
+    await git(base, 'config', 'user.email', 'factory@example.test')
+    await git(base, 'commit', '--allow-empty', '-m', 'initial')
+    await git(root, 'init', '--bare', remote)
+    await git(base, 'remote', 'add', 'origin', remote)
+    await git(base, 'push', 'origin', 'main')
+    const branch = 'factory/53-agentworkforce-pear-proof'
+    await git(base, 'checkout', '-b', branch)
+    await writeFile(join(base, 'fix.txt'), 'adopted fix\n')
+    await git(base, 'add', 'fix.txt')
+    await git(base, 'commit', '-m', 'fix')
+    await git(base, 'push', 'origin', branch)
+    await git(base, 'checkout', 'main')
+    const path = githubIssuePath('AgentWorkforce', 'pear', 53)
+    const prPath = '/github/repos/AgentWorkforce/pear/pulls/153/metadata.json'
+    const pr = { number: 153, state: 'open', draft: false, labels: [], head_ref: branch }
+    const mount = new FakeMountClient({
+      [path]: githubIssueFile(53, { labels: ['factory', 'pear', 'factory:in-progress'] }),
+      [prPath]: pr,
+    })
+    const fleet = new RemoteLifecycleFleetClient()
+    const worktrees = new GitAgentWorktreeManager()
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }
+    const factory = createFactory(config({
+      issueSource: 'github',
+      babysitter: { enabled: true },
+      terminalState: 'done',
+      mergePolicy: 'never',
+      repos: { default: 'AgentWorkforce/pear', byLabel: { pear: 'AgentWorkforce/pear' }, clonePaths: { 'AgentWorkforce/pear': base } },
+      loop: { registryPath: join(root, 'registry.json') },
+    }), {
+      mount, fleet, worktrees, logger,
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      probePrResolver: async () => ({ repo: 'AgentWorkforce/pear', prNumber: 153, headRef: branch, state: 'OPEN' }),
+    })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      await factory.runOnce()
+      expect(factory.status().counters.githubOrphanedPullRequestsAdopted).toBe(1)
+      const runId = stableHash(`AgentWorkforce/pear#153:${branch}`)
+      expect(runId.length).toBeLessThan(8)
+      const checkout = factoryWorktreePath(base, '53', 'AgentWorkforce/pear', runId)
+      expect(fleet.spawns.map((spawn) => spawn.cwd)).toEqual([checkout])
+      expect(existsSync(checkout)).toBe(true)
+      await writeFile(join(checkout, 'local.txt'), 'merged checkout residue\n')
+      const inspect = vi.spyOn(worktrees, 'inspectForCleanup')
+      if (inspectionFails) inspect.mockRejectedValue(new Error('worktree inspection unavailable'))
+      const cleanup = vi.spyOn(worktrees, 'cleanup')
+      mount.files.set(prPath, { content: { ...pr, state: 'closed', merged: true } })
+      mount.emit(changeEvent(prPath, 'adopted-pr-merged'))
+
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      expect(factory.status().inFlight).toEqual([])
+      expect(fleet.releases.map((release) => release.name)).toEqual(['ar-53-babysit-pear'])
+      expect(inspect).toHaveBeenCalledWith(expect.objectContaining({ worktreePath: checkout }), { merged: true })
+      expect(existsSync(checkout)).toBe(inspectionFails)
+      if (inspectionFails) {
+        expect(cleanup).not.toHaveBeenCalled()
+        expect(factory.status().counters.agentWorktreeCleanupFailures).toBe(1)
+        expect(factory.status().counters.agentWorktreesReclaimed).toBeUndefined()
+        expect(logger.error).toHaveBeenCalledWith(
+          '[factory] failed to clean completed issue worktree',
+          expect.objectContaining({ worktreePath: checkout, error: 'worktree inspection unavailable' }),
+        )
+      } else {
+        expect(cleanup).toHaveBeenCalledTimes(1)
+        expect(await git(base, 'worktree', 'list', '--porcelain')).not.toContain(checkout)
+        expect(factory.status().counters.agentWorktreesReclaimed).toBe(1)
+        expect(factory.status().counters.agentWorktreeBytesReclaimed).toBeGreaterThan(0)
+        expect(factory.status().counters.agentWorktreeCleanupFailures).toBeUndefined()
+      }
+    } finally {
+      await factory.stop()
       await rm(root, { recursive: true, force: true })
     }
   })
@@ -31850,7 +31937,7 @@ describe('FactoryLoop PR babysitter', () => {
         expect(cleanup).toHaveBeenCalledTimes(1)
         expect(factory.status().counters.agentWorktreeCleanupFailures).toBe(1)
         expect(factory.status().counters.agentWorktreesReclaimed).toBeUndefined()
-        expect(logger.warn).toHaveBeenCalledWith(
+        expect(logger.error).toHaveBeenCalledWith(
           '[factory] failed to clean completed issue worktree',
           expect.objectContaining({ error: 'worktree filesystem unavailable' }),
         )
