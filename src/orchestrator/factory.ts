@@ -10866,6 +10866,14 @@ export class FactoryLoop implements Factory {
         this.#increment('dispatchReopensWaitingForCompletion')
         await completion
       }
+      // A failed release settles the call above but leaves cleanup to a durable
+      // retry, which does not enter #completeIssue. Its releasing row still
+      // owns the old agents/result; wait for that run's terminal commit too.
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(ref))
+      if (lifecycle?.phase === 'releasing' || lifecycle?.phase === 'writeback-applied') {
+        if (!completion) this.#increment('dispatchReopensWaitingForCompletion')
+        await this.waitForDispatchTerminal(ref)
+      }
       await this.#clearTerminalRefusals(ref)
     } else if (role === 'readyForAgent') {
       // The edge above only repairs a row that went terminal because the work

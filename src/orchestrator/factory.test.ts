@@ -8809,6 +8809,51 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
   })
 
+  it('waits for a durable release retry before re-dispatching a reopened issue', async () => {
+    const mount = new FakeMountClient({ [issuePath(364)]: issueFile(364) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const retryStarted = Promise.withResolvers<void>()
+    const finishRetry = Promise.withResolvers<void>()
+    const release = fleet.release.bind(fleet)
+    let failed = false
+    vi.spyOn(fleet, 'release').mockImplementation(async (name, reason) => {
+      if (reason === 'issue-done' && name.includes('-impl-')) {
+        if (!failed) {
+          failed = true
+          throw new Error('transient release failure')
+        }
+        retryStarted.resolve()
+        await finishRetry.promise
+      }
+      await release(name, reason)
+    })
+    const factory = createFactory(config(), {
+      mount, fleet, triage: new StaticTriage(), dispatchLifecycleRetryMs: 1,
+    })
+    try {
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
+      await withDeadline(retryStarted.promise, 5_000, 'release retry never started')
+
+      await mount.writeFile(issuePath(364), issuePayload(364, ready))
+      const reopening = factory.runOnce()
+      await vi.waitFor(() => expect(
+        factory.status().counters.dispatchReopensWaitingForCompletion,
+      ).toBe(1))
+      expect(fleet.spawns).toHaveLength(2)
+      finishRetry.resolve()
+      const reopened = await reopening
+
+      expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
+      expect(reopened.skipped).toEqual([])
+      expect(fleet.spawns).toHaveLength(4)
+      expect(fleet.spawns[0]?.invocationId).not.toBe(fleet.spawns[2]?.invocationId)
+    } finally {
+      finishRetry.resolve()
+      await factory.stop()
+    }
+  })
+
   it('re-dispatches a terminal issue after a canonical Human Review to Ready re-open', async () => {
     const factoryConfig = config({
       stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: 'state-planning' },
