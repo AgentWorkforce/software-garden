@@ -12573,7 +12573,15 @@ describe('FactoryLoop', () => {
         expect(heartbeat?.health?.slack).toEqual(expected)
         expect(publicHealthFromHeartbeat(heartbeat, { nowMs: clock.now() }).slack).toEqual(expected)
         expect(heartbeat).not.toHaveProperty('counters')
-        expect(heartbeat).not.toHaveProperty('slackWritebacksSkipped')
+        // The flat top-level copies stay. #462 writes them with no `?? 0`, so a
+        // counter that never fired is genuinely absent rather than a fabricated
+        // 0 -- the distinction factory-cloud#114 pins on the consumer side and
+        // the sibling case at 'leaving unfired counters absent' asserts here.
+        // The `slack` block above is the separate vetted surface, zero-filled on
+        // purpose, and is what publicHealthFromHeartbeat projects. Both shapes
+        // are load-bearing and carry different guarantees, so this no longer
+        // asserts the flat copy is absent: that assertion is what left main red
+        // once #462 and #514 had both landed.
       } finally {
         await factory.stop()
         await rm(root, { recursive: true, force: true })
