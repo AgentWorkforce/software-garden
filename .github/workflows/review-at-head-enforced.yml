@@ -1,0 +1,148 @@
+name: Review at head (enforced)
+
+# Only trusted workflow definitions may publish this verdict. Review events
+# execute PR-owned YAML, even when checkout selects the base: NEVER add
+# pull_request_review or pull_request_review_comment here. Their advisory runs
+# are wakeups only; workflow_run loads this file from the default branch.
+# No upstream verdict, artifact, cache, or source code is consumed.
+#
+# This workflow cannot enforce its own introduction: it becomes active once
+# installed on the default branch, together with the predicate CLI. Before
+# then only the advisory workflow tests this PR. Missing base code after
+# installation fails closed; there is no fallback to PR code.
+#
+# Keep non-required during rollout (#432). Configure a trusted required
+# workflow (or an independently authenticated check producer), not just a job
+# name that a PR-owned workflow can reuse. Review-provider repairs also remain
+# prerequisites. Push fan-out and scheduled reconciliation address #511;
+# schedules can be delayed, so this is not an atomic merge-time authorization.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+  workflow_run:
+    workflows: [Review at head]
+    types: [requested, completed]
+  push:
+    branches: [main]
+  # Reconcile even if a PR deletes/disables its advisory review wakeup, and
+  # cover changes to non-default base branches without executing their YAML.
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions: {}
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      contents: read
+    outputs:
+      pulls: ${{ steps.targets.outputs.result }}
+    steps:
+      - uses: actions/github-script@v8
+        id: targets
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            // Read current metadata from GitHub. Do not accept PR numbers,
+            // SHAs, refs, or code supplied through upstream artifacts.
+            const pulls = context.eventName === 'pull_request_target'
+              ? [(await github.rest.pulls.get({ owner, repo,
+                  pull_number: context.payload.pull_request.number })).data]
+              : await github.paginate(github.rest.pulls.list, {
+                  owner, repo, state: 'open', per_page: 100 });
+            // Fan out on wakeups: workflow_run.pull_requests can be empty
+            // (notably for forks), and an attacker can edit upstream YAML.
+            // pull.base.sha can be a recorded snapshot. Resolve the live
+            // branch tip explicitly so base pushes apply the current rule.
+            const bases = new Map();
+            const targets = [];
+            for (const pr of pulls.filter(pr => pr.state === 'open')) {
+              if (!bases.has(pr.base.ref)) {
+                const { data } = await github.rest.git.getRef({
+                  owner, repo, ref: `heads/${pr.base.ref}`
+                });
+                bases.set(pr.base.ref, data.object.sha);
+              }
+              targets.push({ number: pr.number, head: pr.head.sha,
+                base: bases.get(pr.base.ref) });
+            }
+            return targets;
+
+  evaluate:
+    needs: targets
+    # A skipped orchestration job is never the enforced check. Only the
+    # explicit check run below carries that name and attaches to the PR head.
+    if: ${{ needs.targets.outputs.pulls != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pull: ${{ fromJSON(needs.targets.outputs.pulls) }}
+    concurrency:
+      group: trusted-review-at-head-${{ github.repository }}-${{ matrix.pull.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+      statuses: read
+    steps:
+      - name: Mark the exact head as awaiting evaluation
+        uses: actions/github-script@v8
+        id: check
+        env:
+          HEAD_SHA: ${{ matrix.pull.head }}
+        with:
+          script: |
+            const check = await github.rest.checks.create({
+              ...context.repo, name: 'Review at head (enforced)',
+              head_sha: process.env.HEAD_SHA, status: 'in_progress',
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+            return check.data.id;
+
+      - name: Check out the immutable base predicate
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.pull.base }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+          # Do not restore caches written by an upstream PR workflow.
+
+      - run: npm ci
+
+      - name: Evaluate current review evidence against the expected head
+        id: verdict
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ github.repository }}
+          TARGET_PR: ${{ matrix.pull.number }}
+          EXPECTED_HEAD: ${{ matrix.pull.head }}
+          EXPECTED_BASE: ${{ matrix.pull.base }}
+        run: node_modules/.bin/tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR" "$EXPECTED_HEAD" "$EXPECTED_BASE"
+
+      - name: Publish the enforced verdict
+        if: ${{ always() && steps.check.outputs.result }}
+        uses: actions/github-script@v8
+        env:
+          CHECK_ID: ${{ steps.check.outputs.result }}
+          VERDICT: ${{ steps.verdict.outcome }}
+        with:
+          script: |
+            // Setup errors, missing base CLI, skips, and cancellation all
+            // fail closed. Only the predicate's actual success passes.
+            const passed = process.env.VERDICT === 'success';
+            await github.rest.checks.update({
+              ...context.repo, check_run_id: Number(process.env.CHECK_ID),
+              status: 'completed', conclusion: passed ? 'success' : 'failure',
+              output: {
+                title: passed ? 'Substantive review at head' : 'Review evidence refused or evaluation failed',
+                summary: 'Evaluated with the base commit predicate. See the workflow run for evidence.'
+              }
+            });
