@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
-import { FactoryConfigSchema } from '@agent-relay/factory'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { createFactory, FactoryConfigSchema, readFactoryLoopHeartbeat } from '@agent-relay/factory'
+import { FakeFleetClient, FakeMountClient } from '@agent-relay/factory/testing'
 import { defineFeatureGuardianAgent } from '@agent-relay/factory/feature-guardian'
 import {
   createHostedFactory,
@@ -183,5 +187,37 @@ assert.equal((await secondHost.runOnce()).status, 'fenced')
 releaseDiscovery()
 assert.equal((await firstRun).status, 'completed')
 checks.push('active-active-fencing')
+
+// Exercise the installed dist writer and reader, not a source-only projection.
+const heartbeatRoot = await mkdtemp(join(tmpdir(), 'factory-packed-heartbeat-'))
+const heartbeatPath = join(heartbeatRoot, 'heartbeat.json')
+const daemon = createFactory({ ...config, issueSource: 'github' }, {
+  mount: new FakeMountClient(), fleet: new FakeFleetClient(), logger: {},
+})
+try {
+  await daemon.runLoop({
+    maxIterations: 1, heartbeatPath, registryPath: join(heartbeatRoot, 'registry.json'),
+  })
+  const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+  const zeros = {
+    slackWritebacksSkipped: 0,
+    slackDegradedEpisodes: 0,
+    slackGateBypassedByWebhookHealth: 0,
+    slackGateBypassedByObservedEvent: 0,
+  }
+  assert.deepEqual(heartbeat?.slack, zeros)
+  assert.deepEqual(heartbeat?.health?.slack, zeros)
+  assert.equal(Object.hasOwn(heartbeat, 'counters'), false)
+  checks.push('packed-slack-heartbeat-counters')
+
+  await writeFile(heartbeatPath, JSON.stringify({ status: 'running', updatedAtMs: 0 }))
+  const legacy = await readFactoryLoopHeartbeat(heartbeatPath)
+  assert.equal(Object.hasOwn(legacy, 'slack'), false)
+  assert.equal(legacy?.health?.slack, undefined)
+  checks.push('packed-slack-legacy-absence')
+} finally {
+  await daemon.stop()
+  await rm(heartbeatRoot, { recursive: true, force: true })
+}
 
 process.stdout.write(`${JSON.stringify({ result: 'passed', checks })}\n`)

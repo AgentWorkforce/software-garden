@@ -8899,6 +8899,88 @@ describe('FactoryLoop', () => {
     expect(factory.status().counters.dispatchTerminalReopened).toBe(1)
   })
 
+  it('waits for a durable release retry before re-dispatching a reopened issue', async () => {
+    const mount = new FakeMountClient({ [issuePath(364)]: issueFile(364) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const retryStarted = Promise.withResolvers<void>()
+    const finishRetry = Promise.withResolvers<void>()
+    const release = fleet.release.bind(fleet)
+    let failed = false
+    vi.spyOn(fleet, 'release').mockImplementation(async (name, reason) => {
+      if (reason === 'issue-done' && name.includes('-impl-')) {
+        if (!failed) {
+          failed = true
+          throw new Error('transient release failure')
+        }
+        retryStarted.resolve()
+        await finishRetry.promise
+      }
+      await release(name, reason)
+    })
+    const factory = createFactory(config(), {
+      mount, fleet, triage: new StaticTriage(), dispatchLifecycleRetryMs: 1,
+    })
+    try {
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
+      await withDeadline(retryStarted.promise, 5_000, 'release retry never started')
+
+      await mount.writeFile(issuePath(364), issuePayload(364, ready))
+      const reopening = factory.runOnce()
+      await vi.waitFor(() => expect(
+        factory.status().counters.dispatchReopensWaitingForCompletion,
+      ).toBe(1))
+      expect(fleet.spawns).toHaveLength(2)
+      finishRetry.resolve()
+      const reopened = await reopening
+
+      expect(reopened.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
+      expect(reopened.skipped).toEqual([])
+      expect(fleet.spawns).toHaveLength(4)
+      expect(fleet.spawns[0]?.invocationId).not.toBe(fleet.spawns[2]?.invocationId)
+    } finally {
+      finishRetry.resolve()
+      await factory.stop()
+    }
+  })
+
+  it('bounds a reopen while local completion is still blocked', async () => {
+    const mount = new FakeMountClient({ [issuePath(364)]: issueFile(364) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const releaseStarted = Promise.withResolvers<void>()
+    const finishRelease = Promise.withResolvers<void>()
+    const release = fleet.release.bind(fleet)
+    vi.spyOn(fleet, 'release').mockImplementation(async (name, reason) => {
+      if (reason === 'issue-done') {
+        releaseStarted.resolve()
+        await finishRelease.promise
+      }
+      await release(name, reason)
+    })
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    try {
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
+      await withDeadline(releaseStarted.promise, 5_000, 'completion release never started')
+      await mount.writeFile(issuePath(364), issuePayload(364, ready))
+      await mount.writeFile(issuePath(365), issuePayload(365, ready))
+      const report = await withDeadline(factory.runOnce(), 6_500, 'local completion outlived reopen budget')
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-365'])
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-364' }), code: 'dispatch-in-flight',
+      }))
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-364-'))).toHaveLength(2)
+      finishRelease.resolve()
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      const retried = await factory.runOnce()
+      expect(retried.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-364-'))).toHaveLength(4)
+    } finally {
+      finishRelease.resolve()
+      await factory.stop()
+    }
+  }, 15_000)
+
   it('re-dispatches a terminal issue after a canonical Human Review to Ready re-open', async () => {
     const factoryConfig = config({
       stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: 'state-planning' },
@@ -12417,6 +12499,87 @@ describe('FactoryLoop', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  it.each([false, true])('Slack heartbeat counters publish authoritative zeros with Slack enabled=%s', async (enabled) => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-slack-zero-'))
+    const heartbeatPath = join(root, 'heartbeat.json')
+    const factory = createFactory(config({
+      ...(enabled ? { slack: slackConfig() } : {}),
+      loop: { heartbeatPath, registryPath: join(root, 'registry.json'), heartbeatStaleMs: 1_000 },
+    }), { mount: new FakeMountClient(), fleet: new FakeFleetClient(), triage: new StaticTriage() })
+    try {
+      await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+      const initial = await readFactoryLoopHeartbeat(heartbeatPath)
+      const zeros = {
+        slackWritebacksSkipped: 0,
+        slackDegradedEpisodes: 0,
+        slackGateBypassedByWebhookHealth: 0,
+        slackGateBypassedByObservedEvent: 0,
+      }
+      expect(initial?.slack).toEqual(zeros)
+      expect(initial?.health?.slack).toEqual(zeros)
+      await factory.stop()
+      const stopped = await readFactoryLoopHeartbeat(heartbeatPath)
+      expect(stopped?.health?.slack).toEqual(zeros)
+      expect(stopped?.startedAt).toBe(initial?.startedAt)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each(['skipped', 'webhook-health', 'observed-event'] as const)(
+    'Slack heartbeat counters carry real %s activity through the written file', async (scenario) => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-slack-counts-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const clock = new ManualClock()
+      const mount = new SlackStatusConfirmMountClient({
+        [issuePath(150)]: issueFile(150),
+        [issuePath(151)]: issueFile(151),
+      })
+      const factory = createFactory(config({ batchSize: 5, slack: slackConfig() }), {
+        mount, fleet: new FakeFleetClient(), triage: new StaticTriage(), clock,
+      })
+      try {
+        if (scenario === 'observed-event') {
+          await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(150), issueFile(150))))
+          const event = changeEvent(
+            slackReplyFixturePath('C0FACTORY__factory-e2e', mount.threadTs, 'observed-heartbeat'),
+            'observed-heartbeat',
+            new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+          )
+          mount.emit({ ...event, resource: { ...event.resource, provider: 'slack' } })
+        }
+        mount.slackStatus = {
+          provider: 'slack', status: 'lagging',
+          lastEventAt: new Date(clock.now() - 24 * 60 * 60_000).toISOString(),
+          ...(scenario === 'webhook-health' ? { webhookHealthy: true } : {}),
+        }
+        if (scenario !== 'observed-event') {
+          await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(150), issueFile(150))))
+        }
+        await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(151), issueFile(151))))
+
+        await factory.runLoop({ maxIterations: 1, heartbeatPath, registryPath: join(root, 'registry.json') })
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        const expected = {
+          slackWritebacksSkipped: scenario === 'skipped' ? 2 : 0,
+          slackDegradedEpisodes: scenario === 'skipped' ? 1 : 0,
+          slackGateBypassedByWebhookHealth: scenario === 'webhook-health' ? 2 : 0,
+          slackGateBypassedByObservedEvent: scenario === 'observed-event' ? 1 : 0,
+        }
+        expect(factory.status().counters).toMatchObject({ dispatched: 2 })
+        expect(heartbeat?.slack).toEqual(expected)
+        expect(heartbeat?.health?.slack).toEqual(expected)
+        expect(publicHealthFromHeartbeat(heartbeat, { nowMs: clock.now() }).slack).toEqual(expected)
+        expect(heartbeat).not.toHaveProperty('counters')
+        expect(heartbeat).not.toHaveProperty('slackWritebacksSkipped')
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it('question counters preserve authoritative zero through the heartbeat file and reader', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-question-zero-'))
@@ -26366,6 +26529,12 @@ describe('FactoryLoop', () => {
   it('keeps the terminal drain waiting on the receipt the fence itself writes', async () => {
     const mount = new FailingFencedReceiptMountClient({ [issuePath(416)]: issueFile(416) })
     const fleet = new RemoteLifecycleFleetClient()
+    const finishRelease = Promise.withResolvers<void>()
+    const originalRelease = fleet.release.bind(fleet)
+    vi.spyOn(fleet, 'release').mockImplementation(async (name, reason) => {
+      if (reason === 'issue-done') await finishRelease.promise
+      await originalRelease(name, reason)
+    })
     const stateStore = new InMemoryStateStore({ batchSize: 10 })
     const factory = createFactory(config({ slack: slackConfig() }), {
       mount,
@@ -26414,6 +26583,13 @@ describe('FactoryLoop', () => {
 
       await mount.writeFile(issuePath(416), issuePayload(416, ready))
       const reopening = factory.runOnce()
+      // Force the reopen to arrive before completion finishes releasing its
+      // agents. It must wait rather than reuse that generation's cached result.
+      await vi.waitFor(() => expect(
+        factory.status().counters.dispatchReopensWaitingForCompletion,
+      ).toBe(1), { timeout: 15_000 })
+      expect(fleet.spawns).toHaveLength(2)
+      finishRelease.resolve()
       await vi.waitFor(() => expect(fleet.spawns).toHaveLength(4), { timeout: 15_000 })
       // Four spawns only prove the reopened dispatch got as far as spawning,
       // which happens *before* it touches the Slack fence. Wait for the drain
@@ -26470,6 +26646,7 @@ describe('FactoryLoop', () => {
       expect(carried).not.toContain(staleText)
       expect(slackConversationResumes(fleet)).toEqual([])
     } finally {
+      finishRelease.resolve()
       mount.failFencedReceipt = false
       mount.releaseStraddlingRead()
       mount.releaseUnroutableWrite()
@@ -35585,6 +35762,163 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
     const [, lifecycle] = await stuckLifecycle(stateStore, issueKey)
     return lifecycle.lease === undefined || lifecycle.lease.leaseUntilMs <= Date.now()
   }
+
+  it('does not wedge live events or discovery when a reopened release was dead-lettered', async () => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount, fleet, stateStore, triage: new StaticTriage(), dispatchLifecycleRetryMs: RETRY_MS,
+    })
+    try {
+      await factory.start({ mode: 'live' })
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+        { timeout: 10_000, interval: 5 })
+      const [key] = await stuckLifecycle(stateStore, 'AR-75')
+
+      await mount.writeFile(issuePath(75), issuePayload(75, ready))
+      mount.emit(changeEvent(issuePath(75), 'reopen-dead-letter-75'))
+      await mount.writeFile(issuePath(76), issuePayload(76, ready))
+      mount.emit(changeEvent(issuePath(76), 'after-dead-letter-76'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-76-impl-pear'))
+
+      const report = await withDeadline(factory.runOnce(), 1_000, 'dead-lettered reopen wedged discovery')
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-75' }), code: 'dispatch-in-flight',
+      }))
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-75-'))).toHaveLength(2)
+      expect((await stateStore.getDispatchLifecycle(WORKSPACE, key))?.phase).toBe('releasing')
+      expect(await stateStore.getCanonicalState(WORKSPACE, key)).toBe('done')
+      // A successor can finish cleanup while this process still remembers the
+      // dead letter. That local marker must not permanently consume the reopen.
+      const [, retained] = await stuckLifecycle(stateStore, 'AR-75')
+      const successor = await stateStore.claimDispatchLifecycle(
+        WORKSPACE, key, retained, 'cleanup-successor', Date.now(), 60_000,
+      )
+      expect(successor.acquired).toBe(true)
+      for (const agent of retained.agents) await fleet.release(agent.name, 'successor-cleanup')
+      expect(await stateStore.saveDispatchLifecycle(
+        WORKSPACE, key, 'cleanup-successor', successor.lease!.epoch, Date.now(),
+        { ...successor.lifecycle, phase: 'complete', updatedAtMs: Date.now() },
+      )).toBe(true)
+      const recovered = await factory.runOnce()
+      expect(recovered.dispatched.map((result) => result.issue.key)).toEqual(['AR-75'])
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-75-'))).toHaveLength(4)
+    } finally {
+      await factory.stop()
+    }
+  }, 15_000)
+
+  it('bounds a retained releasing row without a local dead-letter marker and stops polling', async () => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const previous = createFactory(config(), {
+      mount, fleet, stateStore, triage: new StaticTriage(), dispatchLifecycleRetryMs: RETRY_MS,
+    })
+    try {
+      await previous.runOnce()
+      fleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(previous.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+        { timeout: 10_000, interval: 5 })
+    } finally {
+      await previous.stop()
+    }
+    const [key] = await stuckLifecycle(stateStore, 'AR-75')
+    await mount.writeFile(issuePath(75), issuePayload(75, ready))
+    await mount.writeFile(issuePath(76), issuePayload(76, ready))
+    const nextFleet = new RemoteLifecycleFleetClient()
+    const observer = createFactory(config(), { mount, fleet: nextFleet, stateStore, triage: new StaticTriage() })
+    const reads = vi.spyOn(stateStore, 'getDispatchLifecycle')
+    try {
+      const report = await withDeadline(observer.runOnce(), 6_500, 'retained release outlived reopen budget')
+      expect(observer.status().counters.dispatchReopensDeferredCleanup).toBe(1)
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-76'])
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-75' }), code: 'dispatch-in-flight',
+      }))
+      expect((await stateStore.getDispatchLifecycle(WORKSPACE, key))?.phase).toBe('releasing')
+      expect(await stateStore.getCanonicalState(WORKSPACE, key)).toBe('done')
+      const readsAfterBudget = reads.mock.calls.filter((call) => call[1] === key).length
+      await new Promise((resolve) => setTimeout(resolve, 1_100))
+      expect(reads.mock.calls.filter((call) => call[1] === key)).toHaveLength(readsAfterBudget)
+    } finally {
+      await observer.stop()
+    }
+  }, 20_000)
+
+  it.each(['transient', 'persistent', 'late'] as const)('contains %s store faults within the reopen observer', async (fault) => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const previousFleet = new RemoteLifecycleFleetClient()
+    const previous = createFactory(config(), { mount, fleet: previousFleet, stateStore, triage: new StaticTriage() })
+    try {
+      await previous.runOnce()
+      previousFleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(previous.status().counters.done).toBe(1))
+    } finally {
+      await previous.stop()
+    }
+    const [key] = await stuckLifecycle(stateStore, 'AR-75')
+    await mount.writeFile(issuePath(75), issuePayload(75, ready))
+    await mount.writeFile(issuePath(76), issuePayload(76, ready))
+    const warnings: unknown[][] = []
+    const observer = createFactory(config(), {
+      mount, fleet: new RemoteLifecycleFleetClient(), stateStore, triage: new StaticTriage(),
+      logger: { warn: (...args: unknown[]) => warnings.push(args) },
+    })
+    const read = stateStore.getDispatchLifecycle.bind(stateStore)
+    const late = Promise.withResolvers<Awaited<ReturnType<typeof read>>>()
+    const unavailable = new Error('reopen lifecycle store unavailable')
+    let reads = 0
+    let recovered = false
+    vi.spyOn(stateStore, 'getDispatchLifecycle').mockImplementation(async (workspace, lifecycleKey) => {
+      if (lifecycleKey === key && !recovered) {
+        reads += 1
+        if (fault === 'late') return await late.promise
+        if (fault === 'persistent' || reads === 1) throw unavailable
+      }
+      return await read(workspace, lifecycleKey)
+    })
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      const report = await withDeadline(observer.runOnce(), 6_500, 'store fault aborted or wedged readiness')
+      if (fault === 'transient') {
+        expect(reads).toBeGreaterThanOrEqual(2)
+        expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-75', 'AR-76'])
+        expect(report.skipped).toEqual([])
+      } else {
+        expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-76'])
+        expect(report.skipped).toContainEqual(expect.objectContaining({
+          issue: expect.objectContaining({ key: 'AR-75' }), code: 'dispatch-in-flight',
+        }))
+        expect(await stateStore.getCanonicalState(WORKSPACE, key)).toBe('done')
+        if (fault === 'persistent') expect(reads).toBeGreaterThanOrEqual(2)
+        if (fault === 'late') {
+          expect(reads).toBe(1)
+          late.reject(unavailable)
+          await new Promise((resolve) => setTimeout(resolve, 25))
+          expect(unhandled).not.toHaveBeenCalled()
+          expect(warnings).toEqual([])
+        }
+        recovered = true
+        const retry = await observer.runOnce()
+        expect(retry.dispatched.map((result) => result.issue.key)).toEqual(['AR-75'])
+      }
+      if (fault !== 'late') expect(warnings).toContainEqual([
+        '[factory] durable reopen observation failed; retrying within admission budget',
+        expect.objectContaining({ issue: 'AR-75', error: unavailable.message }),
+      ])
+    } finally {
+      recovered = true
+      if (fault === 'late' && reads > 0) late.reject(unavailable)
+      await observer.stop()
+      process.off('unhandledRejection', unhandled)
+    }
+  }, 15_000)
 
   it('frees the lease once the release budget is exhausted, so another publisher can claim the key', async () => {
     const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })

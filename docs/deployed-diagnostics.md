@@ -91,6 +91,19 @@ The daemon writes a redacted projection of its loop heartbeat — `heartbeat.hea
 `publicHealthFromHeartbeat()` — and the container serves it verbatim. The container has no redaction
 logic of its own by design: the boundary lives in one place, in this repo, with tests.
 
+`heartbeat.health.slack` carries four cumulative Slack writeback gate counters:
+`slackWritebacksSkipped`, `slackDegradedEpisodes`,
+`slackGateBypassedByWebhookHealth`, and `slackGateBypassedByObservedEvent`.
+The daemon writes these explicitly in `heartbeat.slack` and projects them beside
+the other health subsystems; no other internal counters or free text cross this
+boundary. Each counter is present as zero before its first increment, including
+when Slack is disabled. An absent block or field means the instrument is
+unavailable, not zero. Readers must preserve that distinction for older producers.
+Counts reset with the daemon; use `heartbeat.startedAt` to distinguish lifetimes.
+They describe Slack writeback activity and do not change dispatch readiness or
+liveness. The container passes this health block through; authenticated evidence
+consumers can read the same named fields without inventing defaults.
+
 ```jsonc
 // The daemon stamps this when it WRITES the heartbeat, so `ageMs` is 0 and
 // `stale` false in the file; freshness is `updatedAtMs` against the clock of
