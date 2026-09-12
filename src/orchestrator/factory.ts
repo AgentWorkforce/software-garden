@@ -10863,12 +10863,28 @@ export class FactoryLoop implements Factory {
         if (!await Promise.race([completion.then(() => true), expiry])) return false
       }
       while (!expired && !this.#stopping) {
-        const lifecycle = await Promise.race([
-          this.#state.getDispatchLifecycle(this.#workspaceId, key), expiry,
-        ])
-        if (lifecycle === false || expired || this.#stopping) return false
-        if (lifecycle?.phase !== 'releasing' && lifecycle?.phase !== 'writeback-applied') return true
-        if (this.#dispatchLifecycleReleaseAbandoned.has(key)) return false
+        // Settle the read into a value before racing it. Its rejection is
+        // consumed even if the deadline already ended this admission; a late
+        // result must not log, restart polling, or change canonical state.
+        const read = (async () => {
+          try {
+            return { ok: true as const, lifecycle: await this.#state.getDispatchLifecycle(this.#workspaceId, key) }
+          } catch (error) {
+            return { ok: false as const, error }
+          }
+        })()
+        const result = await Promise.race([read, expiry])
+        if (result === false || expired || this.#stopping) return false
+        if (result.ok) {
+          const { lifecycle } = result
+          if (lifecycle?.phase !== 'releasing' && lifecycle?.phase !== 'writeback-applied') return true
+          if (this.#dispatchLifecycleReleaseAbandoned.has(key)) return false
+        } else {
+          this.#logger.warn?.('[factory] durable reopen observation failed; retrying within admission budget', {
+            issue: ref.key,
+            error: describeError(result.error).errorMessage,
+          })
+        }
         if (!counted) {
           this.#increment('dispatchReopensWaitingForCompletion')
           counted = true

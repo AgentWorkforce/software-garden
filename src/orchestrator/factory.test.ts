@@ -35608,6 +35608,77 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
     }
   }, 20_000)
 
+  it.each(['transient', 'persistent', 'late'] as const)('contains %s store faults within the reopen observer', async (fault) => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const previousFleet = new RemoteLifecycleFleetClient()
+    const previous = createFactory(config(), { mount, fleet: previousFleet, stateStore, triage: new StaticTriage() })
+    try {
+      await previous.runOnce()
+      previousFleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(previous.status().counters.done).toBe(1))
+    } finally {
+      await previous.stop()
+    }
+    const [key] = await stuckLifecycle(stateStore, 'AR-75')
+    await mount.writeFile(issuePath(75), issuePayload(75, ready))
+    await mount.writeFile(issuePath(76), issuePayload(76, ready))
+    const warnings: unknown[][] = []
+    const observer = createFactory(config(), {
+      mount, fleet: new RemoteLifecycleFleetClient(), stateStore, triage: new StaticTriage(),
+      logger: { warn: (...args: unknown[]) => warnings.push(args) },
+    })
+    const read = stateStore.getDispatchLifecycle.bind(stateStore)
+    const late = Promise.withResolvers<Awaited<ReturnType<typeof read>>>()
+    const unavailable = new Error('reopen lifecycle store unavailable')
+    let reads = 0
+    let recovered = false
+    vi.spyOn(stateStore, 'getDispatchLifecycle').mockImplementation(async (workspace, lifecycleKey) => {
+      if (lifecycleKey === key && !recovered) {
+        reads += 1
+        if (fault === 'late') return await late.promise
+        if (fault === 'persistent' || reads === 1) throw unavailable
+      }
+      return await read(workspace, lifecycleKey)
+    })
+    const unhandled = vi.fn()
+    process.on('unhandledRejection', unhandled)
+    try {
+      const report = await withDeadline(observer.runOnce(), 6_500, 'store fault aborted or wedged readiness')
+      if (fault === 'transient') {
+        expect(reads).toBeGreaterThanOrEqual(2)
+        expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-75', 'AR-76'])
+        expect(report.skipped).toEqual([])
+      } else {
+        expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-76'])
+        expect(report.skipped).toContainEqual(expect.objectContaining({
+          issue: expect.objectContaining({ key: 'AR-75' }), code: 'dispatch-in-flight',
+        }))
+        expect(await stateStore.getCanonicalState(WORKSPACE, key)).toBe('done')
+        if (fault === 'persistent') expect(reads).toBeGreaterThanOrEqual(2)
+        if (fault === 'late') {
+          expect(reads).toBe(1)
+          late.reject(unavailable)
+          await new Promise((resolve) => setTimeout(resolve, 25))
+          expect(unhandled).not.toHaveBeenCalled()
+          expect(warnings).toEqual([])
+        }
+        recovered = true
+        const retry = await observer.runOnce()
+        expect(retry.dispatched.map((result) => result.issue.key)).toEqual(['AR-75'])
+      }
+      if (fault !== 'late') expect(warnings).toContainEqual([
+        '[factory] durable reopen observation failed; retrying within admission budget',
+        expect.objectContaining({ issue: 'AR-75', error: unavailable.message }),
+      ])
+    } finally {
+      recovered = true
+      if (fault === 'late' && reads > 0) late.reject(unavailable)
+      await observer.stop()
+      process.off('unhandledRejection', unhandled)
+    }
+  }, 15_000)
+
   it('frees the lease once the release budget is exhausted, so another publisher can claim the key', async () => {
     const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
     const fleet = new HostUnavailableReleaseFleetClient()
