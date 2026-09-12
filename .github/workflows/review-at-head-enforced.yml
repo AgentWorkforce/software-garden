@@ -1,109 +1,135 @@
 name: Review at head (enforced)
 
-# The trusted half of AgentWorkforce/factory#432 part (c). This is the check to
-# require; `review-at-head.yml` is advisory and must never be required.
+# Only trusted workflow definitions may publish this verdict. Review events
+# execute PR-owned YAML, even when checkout selects the base: NEVER add
+# pull_request_review or pull_request_review_comment here. Their advisory runs
+# are wakeups only; workflow_run loads this file from the default branch.
+# No upstream verdict, artifact, cache, or source code is consumed.
 #
-# It runs the BASE BRANCH'S copy of the predicate, so the code deciding the
-# verdict is code that already passed review. A pull request cannot alter the
-# rule it is judged by, and contributor source is never fetched or executed
-# here.
+# This workflow cannot enforce its own introduction: it becomes active once
+# installed on the default branch, together with the predicate CLI. Before
+# then only the advisory workflow tests this PR. Missing base code after
+# installation fails closed; there is no fallback to PR code.
 #
-# WHY A SEPARATE FILE. A job skipped by an `if` is reported to branch
-# protection as a SUCCESS. Keeping this job beside the advisory one meant every
-# advisory event produced a skipped — therefore green — `enforced` check
-# without the trusted predicate ever running. A required check that passes
-# because it did not run is precisely the vacuous green #432 exists to remove,
-# so the enforced job lives in a file whose only triggers are ones it should
-# actually run on. It carries no `if` for the same reason: nothing here may
-# report success by being skipped.
-#
-# The review and comment triggers matter as much as the push one. The predicate
-# reads reviews and inline comments, so its answer changes when a review is
-# submitted, edited or dismissed — not only when the head moves. Without them a
-# required check would keep a stale green after the trusted predicate had
-# become false.
-#
-# KNOWN STALENESS, AND A PREREQUISITE FOR REQUIRING THIS CHECK. The job reads
-# the base branch, which is mutable, but no PR event fires when the base branch
-# simply advances — `synchronize` covers head updates only, and `edited` covers
-# retargeting. So a green recorded here can outlive the rule that produced it:
-# if `main` lands a stricter predicate, open PRs keep the verdict computed
-# under the older one until something else re-triggers them.
-#
-# That is tolerable while this check is advisory and is NOT tolerable once it
-# is required. Closing it needs a fan-out on `push` to the default branch that
-# re-dispatches this check for every open PR, which is real machinery and is
-# deliberately not bolted on here. It is tracked as
-# AgentWorkforce/software-garden#511 and is a blocker on the "make it
-# required" step, alongside the configuration repairs below.
-#
-# ROLLOUT: keep non-required and measure for a week first. On the audited data
-# the correct predicate blocks the large majority of recent merges, so
-# requiring it before the cubic seat, CodeRabbit public-repo and Devin trial
-# repairs land would only train people to bypass it. Those repairs are
-# configuration and are tracked on #432.
+# Keep non-required during rollout (#432). Configure a trusted required
+# workflow (or an independently authenticated check producer), not just a job
+# name that a PR-owned workflow can reuse. Review-provider repairs also remain
+# prerequisites. Push fan-out and scheduled reconciliation address #511;
+# schedules can be delayed, so this is not an atomic merge-time authorization.
 
 on:
   pull_request_target:
-    types:
-      - opened
-      - reopened
-      - ready_for_review
-      - synchronize
-      # `edited` fires when the PR is retargeted at a different base, which
-      # changes which predicate applies. See the staleness note in the header.
-      - edited
-  pull_request_review:
-    types:
-      - submitted
-      - edited
-      - dismissed
-  pull_request_review_comment:
-    types:
-      - created
-      - edited
-      - deleted
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+  workflow_run:
+    workflows: [Review at head]
+    types: [requested, completed]
+  push:
+    branches: [main]
+  # Reconcile even if a PR deletes/disables its advisory review wakeup, and
+  # cover changes to non-default base branches without executing their YAML.
+  schedule:
+    - cron: '*/10 * * * *'
 
 permissions: {}
 
-concurrency:
-  group: review-at-head-enforced-${{ github.repository }}-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
-  enforced:
+  targets:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      pulls: ${{ steps.targets.outputs.result }}
+    steps:
+      - uses: actions/github-script@v8
+        id: targets
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            // Read current metadata from GitHub. Do not accept PR numbers,
+            // SHAs, refs, or code supplied through upstream artifacts.
+            const pulls = context.eventName === 'pull_request_target'
+              ? [(await github.rest.pulls.get({ owner, repo,
+                  pull_number: context.payload.pull_request.number })).data]
+              : await github.paginate(github.rest.pulls.list, {
+                  owner, repo, state: 'open', per_page: 100 });
+            // Fan out on wakeups: workflow_run.pull_requests can be empty
+            // (notably for forks), and an attacker can edit upstream YAML.
+            return pulls.filter(pr => pr.state === 'open').map(pr => ({
+              number: pr.number, head: pr.head.sha, base: pr.base.sha
+            }));
+
+  evaluate:
+    needs: targets
+    # A skipped orchestration job is never the enforced check. Only the
+    # explicit check run below carries that name and attaches to the PR head.
+    if: ${{ needs.targets.outputs.pulls != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pull: ${{ fromJSON(needs.targets.outputs.pulls) }}
+    concurrency:
+      group: trusted-review-at-head-${{ github.repository }}-${{ matrix.pull.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
-      # `/commits/{sha}/status` and `/commits/{sha}/check-runs` are gated by
-      # their own scopes; without these a private repository would 403 and the
-      # check would error instead of returning a verdict.
-      checks: read
+      checks: write
       statuses: read
     steps:
-      # Explicitly the base branch, not the default checkout. Under
-      # `pull_request_target` the default is already the base, but the review
-      # and comment events resolve differently, and the trusted predicate must
-      # not depend on which event happened to fire.
-      - name: Check out the base branch predicate
+      - name: Mark the exact head as awaiting evaluation
+        uses: actions/github-script@v8
+        id: check
+        env:
+          HEAD_SHA: ${{ matrix.pull.head }}
+        with:
+          script: |
+            const check = await github.rest.checks.create({
+              ...context.repo, name: 'Review at head (enforced)',
+              head_sha: process.env.HEAD_SHA, status: 'in_progress',
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+            return check.data.id;
+
+      - name: Check out the immutable base predicate
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ matrix.pull.base }}
           persist-credentials: false
 
-      - name: Setup Node
-        uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: '22.14.0'
-          cache: npm
+          # Do not restore caches written by an upstream PR workflow.
 
-      - name: Install dependencies
-        run: npm ci
+      - run: npm ci
 
-      - name: Require a substantive review of the commit that would merge
+      - name: Evaluate current review evidence against the expected head
+        id: verdict
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET_REPO: ${{ github.repository }}
-          TARGET_PR: ${{ github.event.pull_request.number }}
-        run: npx tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR"
+          TARGET_PR: ${{ matrix.pull.number }}
+          EXPECTED_HEAD: ${{ matrix.pull.head }}
+          EXPECTED_BASE: ${{ matrix.pull.base }}
+        run: node_modules/.bin/tsx src/github/review-at-head-cli.ts "$TARGET_REPO" "$TARGET_PR" "$EXPECTED_HEAD" "$EXPECTED_BASE"
+
+      - name: Publish the enforced verdict
+        if: ${{ always() && steps.check.outputs.result }}
+        uses: actions/github-script@v8
+        env:
+          CHECK_ID: ${{ steps.check.outputs.result }}
+          VERDICT: ${{ steps.verdict.outcome }}
+        with:
+          script: |
+            // Setup errors, missing base CLI, skips, and cancellation all
+            // fail closed. Only the predicate's actual success passes.
+            const passed = process.env.VERDICT === 'success';
+            await github.rest.checks.update({
+              ...context.repo, check_run_id: Number(process.env.CHECK_ID),
+              status: 'completed', conclusion: passed ? 'success' : 'failure',
+              output: {
+                title: passed ? 'Substantive review at head' : 'Review evidence refused or evaluation failed',
+                summary: 'Evaluated with the base commit predicate. See the workflow run for evidence.'
+              }
+            });

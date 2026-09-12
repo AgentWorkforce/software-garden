@@ -294,3 +294,53 @@ describe('review-at-head CI check (factory#432 part c)', () => {
       .rejects.toThrow(/Invalid GitHub repository identity/)
   })
 })
+
+describe('trusted publisher commit binding', () => {
+  it('refuses a head that moved before evaluation', async () => {
+    await expect(evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: STALE }, fetcher(routes()),
+    )).rejects.toThrow('PR head moved')
+  })
+
+  it('refuses a head that moves while evidence is read', async () => {
+    const get = fetcher(routes())
+    let reads = 0
+    await expect(evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD }, async path => {
+        if (path === PULL && ++reads === 2) return pull({ head: { sha: STALE } })
+        return get(path)
+      },
+    )).rejects.toThrow('PR head moved while reading')
+  })
+
+  it('refuses a retarget before evaluation', async () => {
+    await expect(evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD, expectedBase: STALE },
+      fetcher(routes({ [PULL]: pull({ base: { sha: HEAD } }) })),
+    )).rejects.toThrow('PR base moved before')
+  })
+
+  it('refuses a retarget while evidence is read', async () => {
+    const get = fetcher(routes({ [PULL]: pull({ base: { sha: STALE } }) }))
+    let reads = 0
+    await expect(evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD, expectedBase: STALE }, async path => {
+        if (path === PULL && ++reads === 2) return pull({ base: { sha: HEAD } })
+        return get(path)
+      },
+    )).rejects.toThrow('PR base moved while reading')
+  })
+
+  it('passes real evidence bound to the expected head and base', async () => {
+    const result = await evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD, expectedBase: STALE }, fetcher(routes({
+        [PULL]: pull({ base: { sha: STALE } }),
+        [`${REVIEWS}&page=1`]: [
+          { user: { login: 'reviewer' }, state: 'APPROVED', commit_id: HEAD, body: 'Reviewed the trust boundary.' },
+        ],
+      })),
+    )
+    expect(result.ok).toBe(true)
+    expect(result.head).toBe(HEAD)
+  })
+})

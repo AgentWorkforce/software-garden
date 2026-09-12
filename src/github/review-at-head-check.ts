@@ -32,6 +32,10 @@ export type GithubRestFetch = (path: string) => Promise<unknown>
 export interface ReviewAtHeadCheckInput {
   repo: string
   number: number
+  /** Head to which the trusted publisher will attach this verdict. */
+  expectedHead?: string
+  /** Immutable base commit supplying the trusted predicate. */
+  expectedBase?: string
 }
 
 export interface ReviewAtHeadCheckResult {
@@ -198,6 +202,12 @@ export async function evaluateReviewAtHeadCheck(
   if (!head) {
     throw new Error(`GitHub returned no head SHA for ${input.repo}#${input.number}`)
   }
+  if (input.expectedHead && input.expectedHead !== head) {
+    throw new Error(`PR head moved: expected ${input.expectedHead}, received ${head}`)
+  }
+  if (input.expectedBase && stringValue(asRecord(pull.base).sha) !== input.expectedBase) {
+    throw new Error('PR base moved before evaluating review evidence')
+  }
   // Fail closed on missing author metadata, matching `evaluateGithubMergeGate`,
   // which refuses outright when `author` is absent. An undefined author makes
   // every `review.login !== author` comparison true, so a PR whose user has
@@ -224,6 +234,15 @@ export async function evaluateReviewAtHeadCheck(
   const checkSignals = checkSignalsFromRollup(rollupFromRestSources(legacy, runs))
 
   const reason = reviewAtHeadRefusal(reviewsAtHead, head, author)
+  if (input.expectedHead || input.expectedBase) {
+    const current = asRecord(await fetch(`${base}/pulls/${input.number}`))
+    if (stringValue(asRecord(current.head).sha) !== head) {
+      throw new Error('PR head moved while reading review evidence')
+    }
+    if (input.expectedBase && stringValue(asRecord(current.base).sha) !== input.expectedBase) {
+      throw new Error('PR base moved while reading review evidence')
+    }
+  }
   const summary = [
     `${input.repo}#${input.number} at ${head}`,
     `reviews at head: ${describeReviews(reviewsAtHead, head)}`,
@@ -270,10 +289,10 @@ export const githubRestFetch = (token: string, apiUrl = 'https://api.github.com'
  * at head, so the check is red on the PR page rather than only inside Factory.
  */
 export async function main(argv: string[]): Promise<number> {
-  const [repo, rawNumber] = argv
+  const [repo, rawNumber, expectedHead, expectedBase] = argv
   const number = Number(rawNumber)
   if (!repo || !Number.isSafeInteger(number) || number <= 0) {
-    process.stderr.write('usage: review-at-head-check <owner/repo> <pr-number>\n')
+    process.stderr.write('usage: review-at-head-check <owner/repo> <pr-number> [expected-head] [expected-base]\n')
     return 2
   }
 
@@ -283,7 +302,7 @@ export async function main(argv: string[]): Promise<number> {
     return 2
   }
 
-  const result = await evaluateReviewAtHeadCheck({ repo, number }, githubRestFetch(token, process.env.GITHUB_API_URL))
+  const result = await evaluateReviewAtHeadCheck({ repo, number, expectedHead, expectedBase }, githubRestFetch(token, process.env.GITHUB_API_URL))
   process.stdout.write(`${result.summary}\n`)
 
   const stepSummary = process.env.GITHUB_STEP_SUMMARY

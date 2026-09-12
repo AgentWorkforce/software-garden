@@ -17,13 +17,13 @@ name: Review at head
 # rule is exercised by the change that makes it. That is exactly why it cannot
 # be the enforcement point: a pull request can rewrite the rule it is judged
 # by. The trusted counterpart lives in `review-at-head-enforced.yml`, runs the
-# base branch's copy, and is the one to require.
+# base branch's copy. Review runs here only wake that default-branch workflow
+# through workflow_run; their verdicts and artifacts are never trusted.
 #
-# These are separate FILES, not two jobs in one file. A job skipped by an `if`
-# is reported to branch protection as a SUCCESS, so an `enforced` job sitting
-# in this file would report green on every advisory event without the trusted
-# predicate ever running — a vacuous green in the very gate meant to remove
-# them.
+# These are separate FILES, not two jobs in one file. The trusted workflow
+# explicitly publishes its check on the evaluated PR head; orchestration jobs
+# (including skips) must never masquerade as that enforced verdict. See its
+# rollout prerequisites before configuring branch protection.
 
 on:
   pull_request:
