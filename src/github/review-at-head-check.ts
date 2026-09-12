@@ -205,7 +205,15 @@ export async function evaluateReviewAtHeadCheck(
   if (input.expectedHead && input.expectedHead !== head) {
     throw new Error(`PR head moved: expected ${input.expectedHead}, received ${head}`)
   }
-  if (input.expectedBase && stringValue(asRecord(pull.base).sha) !== input.expectedBase) {
+  const baseRef = stringValue(asRecord(pull.base).ref)
+  const liveBase = async (): Promise<string | undefined> => {
+    if (!baseRef) throw new Error('GitHub returned no base branch for the PR')
+    const ref = asRecord(await fetch(`${base}/git/ref/heads/${encodeURIComponent(baseRef)}`))
+    return stringValue(asRecord(ref.object).sha)
+  }
+  // pull.base.sha is a recorded snapshot, not necessarily the current tip.
+  // The publisher pins a freshly resolved Git ref, which must remain current.
+  if (input.expectedBase && await liveBase() !== input.expectedBase) {
     throw new Error('PR base moved before evaluating review evidence')
   }
   // Fail closed on missing author metadata, matching `evaluateGithubMergeGate`,
@@ -239,7 +247,10 @@ export async function evaluateReviewAtHeadCheck(
     if (stringValue(asRecord(current.head).sha) !== head) {
       throw new Error('PR head moved while reading review evidence')
     }
-    if (input.expectedBase && stringValue(asRecord(current.base).sha) !== input.expectedBase) {
+    if (input.expectedBase && (
+      stringValue(asRecord(current.base).ref) !== baseRef ||
+      await liveBase() !== input.expectedBase
+    )) {
       throw new Error('PR base moved while reading review evidence')
     }
   }

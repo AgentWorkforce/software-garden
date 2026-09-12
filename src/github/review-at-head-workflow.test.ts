@@ -33,14 +33,29 @@ describe('trusted review workflow', () => {
 
   it('uses current API metadata even for a fork wakeup with no PR association', async () => {
     const pulls = [
-      { number: 3, state: 'open', head: { sha: 'current-head' }, base: { sha: 'trusted-base' } },
+      { number: 3, state: 'open', head: { sha: 'current-head' }, base: { ref: 'main', sha: 'stale-snapshot' } },
       { number: 4, state: 'closed', head: { sha: 'closed' }, base: { sha: 'base' } },
     ]
     const paginate = vi.fn().mockResolvedValue(pulls)
+    const getRef = vi.fn().mockResolvedValue({ data: { object: { sha: 'trusted-base' } } })
     const result = await execute(workflow.jobs.targets.steps[0].with.script,
-      { paginate, rest: { pulls: { list: 'list' } } }, context)
+      { paginate, rest: { pulls: { list: 'list' }, git: { getRef } } }, context)
     expect(result).toEqual([{ number: 3, head: 'current-head', base: 'trusted-base' }])
     expect(paginate).toHaveBeenCalledWith('list', { owner: 'owner', repo: 'repo', state: 'open', per_page: 100 })
+    expect(getRef).toHaveBeenCalledWith({ owner: 'owner', repo: 'repo', ref: 'heads/main' })
+  })
+
+  it('resolves the live base for a pull_request_target wakeup too', async () => {
+    const get = vi.fn().mockResolvedValue({ data: {
+      number: 3, state: 'open', head: { sha: 'head' }, base: { ref: 'release/v1', sha: 'stale-snapshot' },
+    } })
+    const getRef = vi.fn().mockResolvedValue({ data: { object: { sha: 'live-base' } } })
+    const result = await execute(workflow.jobs.targets.steps[0].with.script,
+      { rest: { pulls: { get }, git: { getRef } } }, {
+        ...context, eventName: 'pull_request_target', payload: { pull_request: { number: 3 } },
+      })
+    expect(result).toEqual([{ number: 3, head: 'head', base: 'live-base' }])
+    expect(getRef).toHaveBeenCalledWith({ owner: 'owner', repo: 'repo', ref: 'heads/release/v1' })
   })
 
   it('creates the enforced check on the selected PR head, not the workflow SHA', async () => {

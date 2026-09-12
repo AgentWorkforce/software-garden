@@ -296,6 +296,7 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 })
 
 describe('trusted publisher commit binding', () => {
+  const baseRefPath = 'repos/AgentWorkforce/software-garden/git/ref/heads/main'
   it('refuses a head that moved before evaluation', async () => {
     await expect(evaluateReviewAtHeadCheck(
       { ...input, expectedHead: STALE }, fetcher(routes()),
@@ -316,25 +317,46 @@ describe('trusted publisher commit binding', () => {
   it('refuses a retarget before evaluation', async () => {
     await expect(evaluateReviewAtHeadCheck(
       { ...input, expectedHead: HEAD, expectedBase: STALE },
-      fetcher(routes({ [PULL]: pull({ base: { sha: HEAD } }) })),
+      fetcher(routes({
+        [PULL]: pull({ base: { ref: 'main', sha: STALE } }),
+        [baseRefPath]: { object: { sha: HEAD } },
+      })),
     )).rejects.toThrow('PR base moved before')
   })
 
   it('refuses a retarget while evidence is read', async () => {
-    const get = fetcher(routes({ [PULL]: pull({ base: { sha: STALE } }) }))
+    const get = fetcher(routes({
+      [PULL]: pull({ base: { ref: 'main', sha: STALE } }),
+      [baseRefPath]: { object: { sha: STALE } },
+    }))
     let reads = 0
     await expect(evaluateReviewAtHeadCheck(
       { ...input, expectedHead: HEAD, expectedBase: STALE }, async path => {
-        if (path === PULL && ++reads === 2) return pull({ base: { sha: HEAD } })
+        if (path === PULL && ++reads === 2) return pull({ base: { ref: 'release', sha: STALE } })
         return get(path)
       },
     )).rejects.toThrow('PR base moved while reading')
   })
 
-  it('passes real evidence bound to the expected head and base', async () => {
+  it('refuses a live base advance even when the PR base snapshot stays unchanged', async () => {
+    const get = fetcher(routes({
+      [PULL]: pull({ base: { ref: 'main', sha: STALE } }),
+    }))
+    let reads = 0
+    await expect(evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD, expectedBase: STALE }, async path => {
+        if (path === baseRefPath) return { object: { sha: ++reads === 1 ? STALE : HEAD } }
+        return get(path)
+      },
+    )).rejects.toThrow('PR base moved while reading')
+    expect(reads).toBe(2)
+  })
+
+  it('passes evidence bound to the live base even when the PR base snapshot is stale', async () => {
     const result = await evaluateReviewAtHeadCheck(
       { ...input, expectedHead: HEAD, expectedBase: STALE }, fetcher(routes({
-        [PULL]: pull({ base: { sha: STALE } }),
+        [PULL]: pull({ base: { ref: 'main', sha: 'older-recorded-snapshot' } }),
+        [baseRefPath]: { object: { sha: STALE } },
         [`${REVIEWS}&page=1`]: [
           { user: { login: 'reviewer' }, state: 'APPROVED', commit_id: HEAD, body: 'Reviewed the trust boundary.' },
         ],

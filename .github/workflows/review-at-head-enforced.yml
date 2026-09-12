@@ -37,6 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
+      contents: read
     outputs:
       pulls: ${{ steps.targets.outputs.result }}
     steps:
@@ -54,9 +55,21 @@ jobs:
                   owner, repo, state: 'open', per_page: 100 });
             // Fan out on wakeups: workflow_run.pull_requests can be empty
             // (notably for forks), and an attacker can edit upstream YAML.
-            return pulls.filter(pr => pr.state === 'open').map(pr => ({
-              number: pr.number, head: pr.head.sha, base: pr.base.sha
-            }));
+            // pull.base.sha can be a recorded snapshot. Resolve the live
+            // branch tip explicitly so base pushes apply the current rule.
+            const bases = new Map();
+            const targets = [];
+            for (const pr of pulls.filter(pr => pr.state === 'open')) {
+              if (!bases.has(pr.base.ref)) {
+                const { data } = await github.rest.git.getRef({
+                  owner, repo, ref: `heads/${pr.base.ref}`
+                });
+                bases.set(pr.base.ref, data.object.sha);
+              }
+              targets.push({ number: pr.number, head: pr.head.sha,
+                base: bases.get(pr.base.ref) });
+            }
+            return targets;
 
   evaluate:
     needs: targets
