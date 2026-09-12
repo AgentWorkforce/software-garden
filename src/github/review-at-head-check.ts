@@ -208,7 +208,9 @@ export async function evaluateReviewAtHeadCheck(
   const baseRef = stringValue(asRecord(pull.base).ref)
   const liveBase = async (): Promise<string | undefined> => {
     if (!baseRef) throw new Error('GitHub returned no base branch for the PR')
-    const ref = asRecord(await fetch(`${base}/git/ref/heads/${encodeURIComponent(baseRef)}`))
+    // Preserve ref path separators while escaping characters within segments.
+    const refPath = baseRef.split('/').map(encodeURIComponent).join('/')
+    const ref = asRecord(await fetch(`${base}/git/ref/heads/${refPath}`))
     return stringValue(asRecord(ref.object).sha)
   }
   // pull.base.sha is a recorded snapshot, not necessarily the current tip.

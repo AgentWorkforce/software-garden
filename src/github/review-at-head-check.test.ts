@@ -297,6 +297,40 @@ describe('review-at-head CI check (factory#432 part c)', () => {
 
 describe('trusted publisher commit binding', () => {
   const baseRefPath = 'repos/AgentWorkforce/software-garden/git/ref/heads/main'
+  it.each([
+    { ref: 'release/1.2', path: 'release/1.2' },
+    { ref: 'release/1.2#patch', path: 'release/1.2%23patch' },
+  ])('resolves the slashed base $ref before and after evaluating evidence', async ({ ref, path }) => {
+    const liveRefPath = `repos/AgentWorkforce/software-garden/git/ref/heads/${path}`
+    const get = fetcher(routes({
+      [PULL]: pull({ base: { ref, sha: 'older-recorded-snapshot' } }),
+      [liveRefPath]: { object: { sha: STALE } },
+      [`${REVIEWS}&page=1`]: [
+        { user: { login: 'reviewer' }, state: 'APPROVED', commit_id: HEAD, body: 'Reviewed the trust boundary.' },
+      ],
+    }))
+    const seen: string[] = []
+    const result = await evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD, expectedBase: STALE }, async requestPath => {
+        seen.push(requestPath)
+        return get(requestPath)
+      },
+    )
+    expect(result.ok).toBe(true)
+    expect(seen.filter(requestPath => requestPath.includes('/git/ref/'))).toEqual([liveRefPath, liveRefPath])
+  })
+
+  it('still refuses an unreviewed head when the slashed base resolves', async () => {
+    const result = await evaluateReviewAtHeadCheck(
+      { ...input, expectedHead: HEAD, expectedBase: STALE }, fetcher(routes({
+        [PULL]: pull({ base: { ref: 'release/1.2', sha: STALE } }),
+        'repos/AgentWorkforce/software-garden/git/ref/heads/release/1.2': { object: { sha: STALE } },
+      })),
+    )
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/no review at head/)
+  })
+
   it('refuses a head that moved before evaluation', async () => {
     await expect(evaluateReviewAtHeadCheck(
       { ...input, expectedHead: STALE }, fetcher(routes()),
