@@ -91,6 +91,7 @@ describe('GitAgentWorktreeManager', () => {
     }
     await expect(manager.cleanup(unsafe)).rejects.toThrow(/unsafe Software Garden worktree path/u)
     await expect(manager.inspectForCleanup(unsafe)).rejects.toThrow(/unsafe Software Garden worktree path/u)
+    await expect(manager.inspectForCleanup(unsafe, { merged: true })).rejects.toThrow(/unsafe Software Garden worktree path/u)
   })
 
   it('refuses a Factory-root symlink that resolves to a registered checkout outside the root', async () => {
@@ -119,6 +120,7 @@ describe('GitAgentWorktreeManager', () => {
       const manager = new GitAgentWorktreeManager()
 
       await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/resolved target is/u)
+      await expect(manager.inspectForCleanup(worktree, { merged: true })).rejects.toThrow(/resolved target is/u)
       await expect(manager.cleanup(worktree)).rejects.toThrow(/resolved target is/u)
       await expect(stat(outside)).resolves.toMatchObject({})
     } finally {
@@ -155,6 +157,7 @@ describe('GitAgentWorktreeManager', () => {
       const manager = new GitAgentWorktreeManager()
 
       await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
+      await expect(manager.inspectForCleanup(worktree, { merged: true })).rejects.toThrow(/symbolic-link root/u)
       await expect(manager.cleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
       await expect(stat(outside)).resolves.toMatchObject({})
     } finally {
@@ -185,6 +188,7 @@ describe('GitAgentWorktreeManager', () => {
       const manager = new GitAgentWorktreeManager()
 
       await expect(manager.inspectForCleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
+      await expect(manager.inspectForCleanup(worktree, { merged: true })).rejects.toThrow(/symbolic-link root/u)
       await expect(manager.cleanup(worktree)).rejects.toThrow(/symbolic-link root/u)
       await expect(stat(outsideCheckout)).resolves.toMatchObject({})
     } finally {

@@ -9425,18 +9425,12 @@ export class FactoryLoop implements Factory {
       this.#scheduleReleaseRetry(record, reason)
       return false
     }
-    // The PR branch is already pushed and the babysitter has declared the
-    // current PR green with review feedback addressed. Release is now fenced,
-    // so no agent can race cleanup of the shared per-issue worktree.
-    try {
-      await this.#cleanupAgentWorktrees(record)
-    } catch {
-      // Completion remains in-flight until the isolated checkout is gone.
-      // Remote lifecycles retry from their durable `releasing` phase; local
-      // lifecycles retain this record and retry directly from the same fence.
-      this.#scheduleReleaseRetry(record, reason)
-      return false
-    }
+    // The same release/termination fence used by failed-dispatch teardown has
+    // now confirmed every agent sharing this checkout is gone. Reclamation is
+    // best effort: a filesystem failure must not turn merged work into a failed
+    // or indefinitely releasing dispatch. Cleanup failures are surfaced through
+    // an error log and failure counter, without reporting the checkout reclaimed.
+    await this.#cleanupAgentWorktrees(record)
     const next = this.#usesDurableDispatchLifecycle() ? undefined : batch.complete(record.issue)
     this.#localReleaseCheckpoints.delete(releaseKey)
     // Every agent is released. Nothing is left to retry, so the budget goes
@@ -13069,38 +13063,31 @@ export class FactoryLoop implements Factory {
   }
 
   async #cleanupAgentWorktrees(record: InFlightIssue): Promise<void> {
-    if (!this.#worktrees) return
+    if (!this.#worktrees || record.dryRun) return
     const unique = new Map<string, AgentWorktree>()
     for (const tracked of record.agents.values()) {
       const worktree = this.#agentWorktree(record, tracked.spec)
       if (worktree) unique.set(worktree.worktreePath, worktree)
     }
-    const issueSlug = factoryWorktreeIssueSlug(record.issue.key)
-    const failures: string[] = []
-    for (const repository of this.#worktreeRepositories(record)) {
-      try {
-        const candidates = await this.#worktrees.listWorktrees(repository)
-        for (const candidate of candidates) {
-          if (factoryWorktreeIssueSlug(candidate.issueKey) === issueSlug) {
-            unique.set(candidate.worktreePath, candidate)
-          }
-        }
-      } catch (error) {
-        const message = `${repository.baseClonePath}: ${describeError(error).errorMessage}`
-        failures.push(message)
-        this.#increment('agentWorktreeCleanupFailures')
-        this.#logger.warn?.('[factory] failed to enumerate completed issue worktrees', {
-          issue: record.issue.key,
-          repo: repository.repo,
-          baseClonePath: repository.baseClonePath,
-          error: describeError(error).errorMessage,
-        })
-      }
-    }
+    // Only reclaim the checkout recorded on this dispatch. Older runs and
+    // directory-scan results have no release fence and may still have workers.
     for (const worktree of unique.values()) {
       try {
-        const inspection = await this.#worktrees.inspectForCleanup(worktree)
-        if (inspection.retentionReasons.length > 0) {
+        // Derive the run suffix from the same prefix used at creation. Adopted
+        // PRs use a stableHash digest, which can be shorter than eight characters.
+        const pathPrefix = factoryWorktreePath(worktree.baseClonePath, record.issue.key, worktree.repo, '')
+        const runId = resolve(worktree.worktreePath).slice(resolve(pathPrefix).length)
+        const expectedPath = factoryWorktreePath(
+          worktree.baseClonePath, record.issue.key, worktree.repo, runId,
+        )
+        if (!runId || runId.includes('/') || resolve(worktree.worktreePath) !== resolve(expectedPath)) {
+          throw new Error(`Refusing non-factory dispatch worktree path ${worktree.worktreePath}`)
+        }
+        const merged = await this.#worktreePrObservedMerged(record, worktree)
+        const inspection = await this.#worktrees.inspectForCleanup(worktree, { merged })
+        // A closed PR is not merge evidence. Without a confirmed merge, retain
+        // unpublished commits, dirty trees and locks, recording the reason.
+        if (!merged && inspection.retentionReasons.length > 0) {
           this.#increment('agentWorktreeCleanupRetained')
           this.#logger.warn?.('[factory] retained completed issue worktree with local state', {
             issue: record.issue.key,
@@ -13112,10 +13099,19 @@ export class FactoryLoop implements Factory {
         }
         await this.#worktrees.cleanup(worktree)
         this.#increment('agentWorktreesCleaned')
+        // Missing checkouts inspect as zero bytes on a repeated durable release.
+        if (inspection.bytes > 0) this.#increment('agentWorktreesReclaimed')
+        this.#increment('agentWorktreeBytesReclaimed', inspection.bytes)
+        this.#logger.info?.('[factory] reclaimed completed issue worktree', {
+          issue: record.issue.key,
+          repo: worktree.repo,
+          worktreePath: worktree.worktreePath,
+          merged,
+          reclaimedBytes: inspection.bytes,
+        })
       } catch (error) {
-        failures.push(`${worktree.worktreePath}: ${describeError(error).errorMessage}`)
         this.#increment('agentWorktreeCleanupFailures')
-        this.#logger.warn?.('[factory] failed to clean completed issue worktree', {
+        this.#logger.error?.('[factory] failed to clean completed issue worktree', {
           issue: record.issue.key,
           repo: worktree.repo,
           worktreePath: worktree.worktreePath,
@@ -13123,9 +13119,30 @@ export class FactoryLoop implements Factory {
         })
       }
     }
-    if (failures.length > 0) {
-      throw new Error(`Software Garden worktree cleanup incomplete for ${record.issue.key}: ${failures.join('; ')}`)
+  }
+
+  async #worktreePrObservedMerged(record: InFlightIssue, worktree: AgentWorktree): Promise<boolean> {
+    // Exact ownership survives branch renames. Check each repository separately:
+    // merging one PR does not authorize deleting another repository's work.
+    const owned = [...this.#babysitterPr.entries()].find(([key, ref]) => {
+      const ownerIssue = this.#babysitterIssueRefs.get(key)
+      return ownerIssue && issueKey(ownerIssue) === issueKey(record.issue)
+        && ref.repo.toLowerCase() === worktree.repo.toLowerCase()
+    })?.[1]
+    const persisted = [...record.agents.values()].map((agent) => agent.spec.ownedPullRequest)
+      .find((ref) => ref?.repo.toLowerCase() === worktree.repo.toLowerCase())
+    const ref = owned ?? (persisted ? { ...persisted, prNumber: persisted.number } : undefined)
+    if (ref) {
+      const snapshot = await this.#readPrSnapshot(ref)
+      return Boolean(snapshot && prMetaShowsMerged(snapshot))
     }
+    // Recovery without a babysitter may rediscover a PR, but only this exact
+    // dispatch branch supplies sufficient authority to bypass retention checks.
+    const issue = await this.#readIssue(record.issue.path)
+    const candidate = issue ? await this.#completionPrForIssue(issue) : undefined
+    if (!candidate || candidate.repo.toLowerCase() !== worktree.repo.toLowerCase()) return false
+    const snapshot = await this.#readPrSnapshot(candidate)
+    return Boolean(snapshot && snapshot.headRef === worktree.branch && prMetaShowsMerged(snapshot))
   }
 
   #worktreeRepositories(record?: InFlightIssue): AgentWorktreeRepository[] {
