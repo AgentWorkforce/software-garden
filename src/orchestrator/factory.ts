@@ -581,6 +581,8 @@ const DISPATCH_LIFECYCLE_RETRY_MAX_MS = 30_000
  * lease handover) without covering a permanent one.
  */
 const DISPATCH_LIFECYCLE_MAX_RELEASE_ATTEMPTS = 10
+/** Bound reopen admission even when no publisher will finish retained cleanup. */
+const DISPATCH_REOPEN_COMPLETION_WAIT_MS = 5_000
 /** Rate limit for the capacity-wait warning once the backoff has capped. */
 const DISPATCH_LIFECYCLE_CAPACITY_WAIT_LOG_MS = 60_000
 const DISPATCH_WRITEBACK_MAX_ATTEMPTS = 3
@@ -4132,14 +4134,16 @@ export class FactoryLoop implements Factory {
           // Both surfaces. Gating this on Linear is what left GitHub ingestion
           // with no canonical state at all, so nothing could ever clear the
           // terminal row a completed run left behind (#334).
-          if (issue) {
-            await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))
-          }
+          const cleanupPending = issue && !await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))
           if (issue && this.#isIssueReady(issue) && isInFactoryScope(issue, this.#config.safety) && isDispatchableIssue(issue)) {
             candidateCount += 1
             // Publish before triage/dispatch can block: waiting only measures
             // work that already reached durable capacity admission.
             this.#increment('dispatchCandidatesFound')
+          }
+          if (issue && cleanupPending) {
+            recordSkip({ issue: issueRef(issue), reason: 'previous dispatch cleanup still pending', code: 'dispatch-in-flight' })
+            continue
           }
           issueEntries.push({ path, issue })
         }
@@ -9482,9 +9486,7 @@ export class FactoryLoop implements Factory {
 
     try {
       const issue = await this.#readIssue(path)
-      if (issue) {
-        await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))
-      }
+      if (issue && !await this.#recordCanonicalIssueState(issue, this.#issueLifecycleRole(issue))) return
       if (issue && this.#dependencyIssueIsTerminal(issue)) {
         await this.#markDependencyTerminalAndReconcile(issue)
       }
@@ -10838,9 +10840,60 @@ export class FactoryLoop implements Factory {
     return undefined
   }
 
+  // The budget covers both local completion and durable retry observation.
+  // A dead-letter deliberately retains `releasing`; it is not proof that a
+  // terminal commit will ever arrive. This observer owns and cancels its timer
+  // rather than leaving an unbounded waitForDispatchTerminal poll behind.
+  async #waitForReopenCompletion(ref: IssueRef): Promise<boolean> {
+    const key = dispatchLifecycleKey(ref)
+    let expired = false
+    let finish!: (value: false) => void
+    let pollTimer: ReturnType<typeof setTimeout> | undefined
+    const expiry = new Promise<false>((resolve) => { finish = resolve })
+    const deadline = setTimeout(() => {
+      expired = true
+      finish(false)
+    }, DISPATCH_REOPEN_COMPLETION_WAIT_MS)
+    const observe = async (): Promise<boolean> => {
+      const completion = this.#completionInFlight.get(key)
+      let counted = false
+      if (completion) {
+        this.#increment('dispatchReopensWaitingForCompletion')
+        counted = true
+        if (!await Promise.race([completion.then(() => true), expiry])) return false
+      }
+      while (!expired && !this.#stopping) {
+        const lifecycle = await Promise.race([
+          this.#state.getDispatchLifecycle(this.#workspaceId, key), expiry,
+        ])
+        if (lifecycle === false || expired || this.#stopping) return false
+        if (lifecycle?.phase !== 'releasing' && lifecycle?.phase !== 'writeback-applied') return true
+        if (this.#dispatchLifecycleReleaseAbandoned.has(key)) return false
+        if (!counted) {
+          this.#increment('dispatchReopensWaitingForCompletion')
+          counted = true
+        }
+        await Promise.race([
+          new Promise<void>((resolve) => { pollTimer = setTimeout(resolve, DISPATCH_LIFECYCLE_RETRY_MS) }),
+          expiry,
+        ])
+      }
+      return false
+    }
+    try {
+      return await Promise.race([observe(), expiry])
+    } finally {
+      expired = true
+      finish(false)
+      clearTimeout(deadline)
+      if (pollTimer) clearTimeout(pollTimer)
+    }
+  }
+
   /**
    * Remember the role this work unit was last seen in, and clear the durable
    * refusals a completed run left behind when it comes back ready.
+   * Returns false while previous cleanup still blocks this admission.
    *
    * Called for BOTH surfaces. It used to be gated to Linear, so on a
    * GitHub-sourced Factory the reopen cleanup below was never reached at all
@@ -10850,29 +10903,18 @@ export class FactoryLoop implements Factory {
   async #recordCanonicalIssueState(
     issue: Pick<LinearIssue, 'uuid' | 'key' | 'path'> & { raw?: unknown; origin?: WorkUnitOrigin },
     role: FactoryStateRole | undefined,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const ref = issueRefForState(issue)
     const canonicalKey = canonicalStateKey(ref)
     const previousRole = await this.#state.getCanonicalState(this.#workspaceId, canonicalKey)
     const reopenedFromTerminal = previousRole === 'done' || previousRole === 'humanReview'
     if (reopenedFromTerminal && role === 'readyForAgent') {
-      // Capacity and the terminal Slack watch can settle before agent release.
-      // Admitting this reopen in that window returns the old releasing row's
-      // cached dispatch result without spawning a new team. Let our completion
-      // finish (including its final ownership cleanup) before clearing its rows.
-      // Keep the terminal role until then so completion cannot consume the edge.
-      const completion = this.#completionInFlight.get(dispatchLifecycleKey(ref))
-      if (completion) {
-        this.#increment('dispatchReopensWaitingForCompletion')
-        await completion
-      }
-      // A failed release settles the call above but leaves cleanup to a durable
-      // retry, which does not enter #completeIssue. Its releasing row still
-      // owns the old agents/result; wait for that run's terminal commit too.
-      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, dispatchLifecycleKey(ref))
-      if (lifecycle?.phase === 'releasing' || lifecycle?.phase === 'writeback-applied') {
-        if (!completion) this.#increment('dispatchReopensWaitingForCompletion')
-        await this.waitForDispatchTerminal(ref)
+      // Preserve the terminal role and refusals if cleanup cannot finish in
+      // this admission's budget. A later event/sweep can retry the same edge;
+      // neither caller may reuse the old releasing row's cached result.
+      if (!await this.#waitForReopenCompletion(ref)) {
+        this.#increment('dispatchReopensDeferredCleanup')
+        return false
       }
       await this.#clearTerminalRefusals(ref)
     } else if (role === 'readyForAgent') {
@@ -10894,6 +10936,7 @@ export class FactoryLoop implements Factory {
     if (role === 'done' || role === 'humanReview' || role === 'readyForAgent') {
       await this.#state.recordCanonicalState(this.#workspaceId, canonicalKey, role)
     }
+    return true
   }
 
   /**
@@ -11095,6 +11138,7 @@ export class FactoryLoop implements Factory {
       if (!matches && !legacySurfaceMatch) continue
       await this.#state.clearDispatchLifecycle(this.#workspaceId, lifecycleKey)
       this.#dispatchLifecycleEpochs.delete(lifecycleKey)
+      this.#clearReleaseAttempts(lifecycleKey)
       reopened = true
     }
     if (reopened) this.#increment('dispatchTerminalReopened')

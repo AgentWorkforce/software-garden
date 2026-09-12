@@ -8854,6 +8854,43 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('bounds a reopen while local completion is still blocked', async () => {
+    const mount = new FakeMountClient({ [issuePath(364)]: issueFile(364) })
+    const fleet = new RemoteLifecycleFleetClient()
+    const releaseStarted = Promise.withResolvers<void>()
+    const finishRelease = Promise.withResolvers<void>()
+    const release = fleet.release.bind(fleet)
+    vi.spyOn(fleet, 'release').mockImplementation(async (name, reason) => {
+      if (reason === 'issue-done') {
+        releaseStarted.resolve()
+        await finishRelease.promise
+      }
+      await release(name, reason)
+    })
+    const factory = createFactory(config(), { mount, fleet, triage: new StaticTriage() })
+    try {
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-364-impl-pear', 'issue-done')
+      await withDeadline(releaseStarted.promise, 5_000, 'completion release never started')
+      await mount.writeFile(issuePath(364), issuePayload(364, ready))
+      await mount.writeFile(issuePath(365), issuePayload(365, ready))
+      const report = await withDeadline(factory.runOnce(), 6_500, 'local completion outlived reopen budget')
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-365'])
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-364' }), code: 'dispatch-in-flight',
+      }))
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-364-'))).toHaveLength(2)
+      finishRelease.resolve()
+      await vi.waitFor(() => expect(factory.status().counters.done).toBe(1))
+      const retried = await factory.runOnce()
+      expect(retried.dispatched.map((result) => result.issue.key)).toEqual(['AR-364'])
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-364-'))).toHaveLength(4)
+    } finally {
+      finishRelease.resolve()
+      await factory.stop()
+    }
+  }, 15_000)
+
   it('re-dispatches a terminal issue after a canonical Human Review to Ready re-open', async () => {
     const factoryConfig = config({
       stateIds: { readyForAgent: ready, agentImplementing: implementing, humanReview, done, inPlanning: 'state-planning' },
@@ -35484,6 +35521,92 @@ describe('a dead-lettered release must not keep the durable dispatch lease', () 
     const [, lifecycle] = await stuckLifecycle(stateStore, issueKey)
     return lifecycle.lease === undefined || lifecycle.lease.leaseUntilMs <= Date.now()
   }
+
+  it('does not wedge live events or discovery when a reopened release was dead-lettered', async () => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const factory = createFactory(config(), {
+      mount, fleet, stateStore, triage: new StaticTriage(), dispatchLifecycleRetryMs: RETRY_MS,
+    })
+    try {
+      await factory.start({ mode: 'live' })
+      await factory.runOnce()
+      fleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(factory.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+        { timeout: 10_000, interval: 5 })
+      const [key] = await stuckLifecycle(stateStore, 'AR-75')
+
+      await mount.writeFile(issuePath(75), issuePayload(75, ready))
+      mount.emit(changeEvent(issuePath(75), 'reopen-dead-letter-75'))
+      await mount.writeFile(issuePath(76), issuePayload(76, ready))
+      mount.emit(changeEvent(issuePath(76), 'after-dead-letter-76'))
+      await vi.waitFor(() => expect(fleet.spawns.map((spawn) => spawn.name)).toContain('ar-76-impl-pear'))
+
+      const report = await withDeadline(factory.runOnce(), 1_000, 'dead-lettered reopen wedged discovery')
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-75' }), code: 'dispatch-in-flight',
+      }))
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-75-'))).toHaveLength(2)
+      expect((await stateStore.getDispatchLifecycle(WORKSPACE, key))?.phase).toBe('releasing')
+      expect(await stateStore.getCanonicalState(WORKSPACE, key)).toBe('done')
+      // A successor can finish cleanup while this process still remembers the
+      // dead letter. That local marker must not permanently consume the reopen.
+      const [, retained] = await stuckLifecycle(stateStore, 'AR-75')
+      const successor = await stateStore.claimDispatchLifecycle(
+        WORKSPACE, key, retained, 'cleanup-successor', Date.now(), 60_000,
+      )
+      expect(successor.acquired).toBe(true)
+      for (const agent of retained.agents) await fleet.release(agent.name, 'successor-cleanup')
+      expect(await stateStore.saveDispatchLifecycle(
+        WORKSPACE, key, 'cleanup-successor', successor.lease!.epoch, Date.now(),
+        { ...successor.lifecycle, phase: 'complete', updatedAtMs: Date.now() },
+      )).toBe(true)
+      const recovered = await factory.runOnce()
+      expect(recovered.dispatched.map((result) => result.issue.key)).toEqual(['AR-75'])
+      expect(fleet.spawns.filter((spawn) => spawn.name.startsWith('ar-75-'))).toHaveLength(4)
+    } finally {
+      await factory.stop()
+    }
+  }, 15_000)
+
+  it('bounds a retained releasing row without a local dead-letter marker and stops polling', async () => {
+    const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
+    const fleet = new HostUnavailableReleaseFleetClient()
+    const stateStore = new InMemoryStateStore({ batchSize: 2 })
+    const previous = createFactory(config(), {
+      mount, fleet, stateStore, triage: new StaticTriage(), dispatchLifecycleRetryMs: RETRY_MS,
+    })
+    try {
+      await previous.runOnce()
+      fleet.emitAgentExit('ar-75-impl-pear', 'issue-done')
+      await vi.waitFor(() => expect(previous.status().counters.dispatchLifecycleReleaseAbandoned).toBe(1),
+        { timeout: 10_000, interval: 5 })
+    } finally {
+      await previous.stop()
+    }
+    const [key] = await stuckLifecycle(stateStore, 'AR-75')
+    await mount.writeFile(issuePath(75), issuePayload(75, ready))
+    await mount.writeFile(issuePath(76), issuePayload(76, ready))
+    const nextFleet = new RemoteLifecycleFleetClient()
+    const observer = createFactory(config(), { mount, fleet: nextFleet, stateStore, triage: new StaticTriage() })
+    const reads = vi.spyOn(stateStore, 'getDispatchLifecycle')
+    try {
+      const report = await withDeadline(observer.runOnce(), 6_500, 'retained release outlived reopen budget')
+      expect(observer.status().counters.dispatchReopensDeferredCleanup).toBe(1)
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['AR-76'])
+      expect(report.skipped).toContainEqual(expect.objectContaining({
+        issue: expect.objectContaining({ key: 'AR-75' }), code: 'dispatch-in-flight',
+      }))
+      expect((await stateStore.getDispatchLifecycle(WORKSPACE, key))?.phase).toBe('releasing')
+      expect(await stateStore.getCanonicalState(WORKSPACE, key)).toBe('done')
+      const readsAfterBudget = reads.mock.calls.filter((call) => call[1] === key).length
+      await new Promise((resolve) => setTimeout(resolve, 1_100))
+      expect(reads.mock.calls.filter((call) => call[1] === key)).toHaveLength(readsAfterBudget)
+    } finally {
+      await observer.stop()
+    }
+  }, 20_000)
 
   it('frees the lease once the release budget is exhausted, so another publisher can claim the key', async () => {
     const mount = new FakeMountClient({ [issuePath(75)]: issueFile(75) })
