@@ -200,6 +200,31 @@ export interface FactorySlackCounters {
   slackGateBypassedByObservedEvent: number
 }
 
+/**
+ * Readiness-sweep read budgets and what they deferred (#376). Numbers only.
+ *
+ * The cumulative counts are process-local and reset on daemon restart. The
+ * `lastSweep*` counts describe the most recent sweep that finished reading,
+ * and are absent until one has.
+ */
+export interface FactorySweepReadCounters {
+  /** Reads (a repository listing or an issue read) that exceeded the per-read budget. */
+  readTimeouts: number
+  /** Repositories deferred to the next sweep, counted once per sweep each. */
+  reposDeferred: number
+  /** Issues not read in their sweep because a read budget was spent. */
+  issuesDeferred: number
+  lastSweepReadTimeouts?: number
+  lastSweepReposDeferred?: number
+  lastSweepIssuesDeferred?: number
+  /** Per-read budget in force. */
+  readBudgetMs: number
+  /** Per-repository budget in force. */
+  repoBudgetMs: number
+  /** Read-phase budget in force. */
+  readPhaseBudgetMs: number
+}
+
 export interface FactoryLoopHeartbeat {
   /** Process-wide PR record I/O, including completion probes outside discovery. */
   prProbe?: PrProbeReadCacheStatus
@@ -245,6 +270,8 @@ export interface FactoryLoopHeartbeat {
   eventListener?: FactoryEventListenerStatus
   /** Absent on older producers. Only the writer supplies authoritative zeros. */
   slack?: FactorySlackCounters
+  /** Absent on older producers. Only the writer supplies authoritative zeros (#376). */
+  sweepReads?: FactorySweepReadCounters
   readinessReconcile?: FactoryReadinessReconcileStatus
   /** Batch-slot admission: a full batch is why dispatch stops without failing (#303). */
   dispatchCapacity?: FactoryDispatchCapacityStatus
@@ -876,6 +903,11 @@ export interface FactoryPublicHealth {
    * Missing counters remain absent when reading older or invalid records.
    */
   slack?: Partial<FactorySlackCounters>
+  /**
+   * Readiness-sweep read budgets and deferrals (#376). Diagnostics only, not
+   * a dispatch gate. Missing counters remain absent when reading older records.
+   */
+  sweepReads?: Partial<FactorySweepReadCounters>
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
   /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
   fleetConnect?: FactoryPublicFleetConnectHealth
