@@ -9173,6 +9173,18 @@ export class FactoryLoop implements Factory {
         await this.#abandonDurableResume(record, 'live source issue is already terminal')
         return
       }
+      // A dispatch gate fails closed on resume too. Discovery refuses an open
+      // GitHub issue that is out of scope or no longer carries the configured
+      // safety label, so a durable dispatch persisted before a restart must
+      // not re-spawn agents for it. `#isGithubIssueResumable` also admits an
+      // issue this factory already claimed (safety label + in-progress).
+      if (
+        isGithubIssue(liveIssue) &&
+        (!isInFactoryScope(liveIssue, this.#config.safety) || !this.#isGithubIssueResumable(liveIssue))
+      ) {
+        await this.#abandonDurableResume(record, 'live issue no longer passes the dispatch gate')
+        return
+      }
 
       const persistedPreviewIds = new Set(
         dispatchSpecs(record.decision).map((spec) => spec.preview?.id).filter((id): id is string => Boolean(id)),
