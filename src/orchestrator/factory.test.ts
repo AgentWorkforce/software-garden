@@ -11815,6 +11815,189 @@ describe('FactoryLoop', () => {
     }
   })
 
+  // A resumed durable dispatch must pass the same dispatch gate discovery
+  // applies. An open issue that lost its safety label is refused by
+  // discovery, so a restart must not re-spawn agents for it either.
+  it.each([
+    {
+      kind: 'dispatching lifecycle whose live issue lost the safety label',
+      number: 590,
+      persistedPhase: 'dispatching',
+      liveLabels: [],
+      liveTitle: undefined,
+      safety: undefined,
+      resumes: false,
+    },
+    {
+      kind: 'dispatching lifecycle whose live issue kept only the in-progress label',
+      number: 591,
+      persistedPhase: 'dispatching',
+      liveLabels: ['garden:in-progress'],
+      liveTitle: undefined,
+      safety: undefined,
+      resumes: false,
+    },
+    {
+      kind: 'retryable lifecycle whose live issue kept only the legacy in-progress label',
+      number: 592,
+      persistedPhase: 'retryable',
+      liveLabels: ['factory:in-progress'],
+      liveTitle: undefined,
+      safety: undefined,
+      resumes: false,
+    },
+    {
+      kind: 'dispatching lifecycle whose live issue still carries the safety and in-progress labels',
+      number: 593,
+      persistedPhase: 'dispatching',
+      liveLabels: ['garden', 'garden:in-progress'],
+      liveTitle: undefined,
+      safety: undefined,
+      resumes: true,
+    },
+    {
+      kind: 'dispatching lifecycle whose live issue carries the legacy alias labels',
+      number: 594,
+      persistedPhase: 'dispatching',
+      liveLabels: ['factory', 'factory:in-progress'],
+      liveTitle: undefined,
+      safety: undefined,
+      resumes: true,
+    },
+    {
+      // Discovery admits a GitHub issue by its safety label; the title prefix
+      // is an alternative scope marker, not an extra requirement. Resume
+      // mirrors that, so losing only the prefix does not abandon the run.
+      kind: 'dispatching lifecycle whose live issue lost the title prefix but kept the safety label',
+      number: 595,
+      persistedPhase: 'dispatching',
+      liveLabels: ['garden'],
+      liveTitle: 'Retitled issue 595',
+      safety: { requireTitlePrefix: '[garden]' },
+      resumes: true,
+    },
+  ] as const)('re-checks the dispatch gate before resuming a durable GitHub $kind', async ({
+    number,
+    persistedPhase,
+    liveLabels,
+    liveTitle,
+    safety,
+    resumes,
+  }) => {
+    class AckGapFleet extends RemoteLifecycleFleetClient {
+      failed = false
+
+      override async spawn(input: SpawnInput): Promise<SpawnResult> {
+        const result = await super.spawn(input)
+        if (!this.failed) {
+          this.failed = true
+          throw new Error('owner crashed after remote spawn ack')
+        }
+        return result
+      }
+    }
+
+    class CrashAfterLifecycleClaimStore extends FileStateStore {
+      crashed = false
+
+      override async claimDispatchLifecycle(...args: Parameters<FileStateStore['claimDispatchLifecycle']>) {
+        const claimed = await super.claimDispatchLifecycle(...args)
+        if (!this.crashed) {
+          this.crashed = true
+          throw new Error('owner crashed after durable lifecycle claim')
+        }
+        return claimed
+      }
+    }
+
+    const root = await mkdtemp(join(tmpdir(), `factory-resume-gate-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const path = githubIssueNestedMetaPath('AgentWorkforce', 'pear', number)
+    const title = safety ? `[garden] GitHub factory issue ${number}` : undefined
+    const openIssue = githubIssueFile(number, { state: 'open', labels: ['garden'], title })
+    const mount = new FakeMountClient({ [path]: openIssue })
+    const fleet = persistedPhase === 'retryable' ? new AckGapFleet() : new RemoteLifecycleFleetClient()
+    const clock = new ManualClock()
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const factoryConfig = () => config({
+      issueSource: 'github',
+      dispatch: { agentlessHoldTimeoutMs: 30 * 60_000 },
+      ...(safety ? { safety } : {}),
+    })
+    const first = createFactory(factoryConfig(), {
+      mount,
+      fleet,
+      stateStore: persistedPhase === 'dispatching'
+        ? new CrashAfterLifecycleClaimStore({ batchSize: 2, watchStatePath })
+        : state(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      clock,
+    })
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const decision = await first.triageIssue(parseGithubFactoryIssue(path, openIssue))
+      await expect(first.dispatch(decision)).rejects.toThrow(
+        persistedPhase === 'dispatching'
+          ? 'owner crashed after durable lifecycle claim'
+          : 'owner crashed after remote spawn ack',
+      )
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)))
+        .resolves.toMatchObject({ phase: persistedPhase })
+      await first.stop()
+      clock.advance(5 * 60_000 + 1)
+      const spawnsBeforeRestart = fleet.spawns.map((spawn) => spawn.name)
+
+      mount.files.set(path, {
+        content: githubIssueFile(number, { state: 'open', labels: [...liveLabels], title: liveTitle ?? title }),
+      })
+      restarted = createFactory(factoryConfig(), {
+        mount,
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+        clock,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      if (resumes) {
+        await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
+          'factory-test',
+          dispatchIssueIdentity(decision.issue),
+        )).toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+        expect(fleet.spawns.map((spawn) => spawn.name)).toEqual([
+          `ar-${number}-impl-pear`,
+          `ar-${number}-review-pear`,
+        ])
+        expect(restarted.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBeUndefined()
+        return
+      }
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      )).toMatchObject({
+        phase: 'abandoned',
+        releaseReason: 'live issue no longer passes the dispatch gate',
+      }), { timeout: 4_000 })
+      await vi.waitFor(() => expect(restarted?.status().counters.dispatchLifecycleStaleIssuesAbandoned).toBe(1))
+      // No agent is spawned after the restart.
+      expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(spawnsBeforeRestart)
+      if (persistedPhase === 'retryable') {
+        expect(fleet.releases).toContainEqual({
+          name: `ar-${number}-impl-pear`,
+          reason: 'live dispatch state changed',
+        })
+      }
+      expect(restarted.status().inFlight).toEqual([])
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('recovers a durable GitHub dispatch through the API fallback after a restart loses process-local eligibility', async () => {
     class AckGapFleet extends RemoteLifecycleFleetClient {
       failed = false
