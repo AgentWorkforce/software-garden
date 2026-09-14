@@ -109,7 +109,7 @@
     "@agentworkforce/runtime": "^4.1.23",
     "@relaycast/a2a": "^6.2.0",
     "@relayfile/relay-helpers": "^0.4.6",
-    "@relayfile/sdk": "0.10.34",
+    "@relayfile/sdk": "0.10.58",
     "@relayflows/core": "^1.0.3",
     "agent-relay": "^11.6.9",
     "proper-lockfile": "^4.1.2",
