@@ -147,7 +147,7 @@ type ReadOutcome<T> = { ok: true; value: T } | { ok: false; error: unknown }
 export class SweepReadTracker {
   readonly budgets: SweepReadBudgets
   readonly #now: () => number
-  readonly #deadlineAtMs: number
+  #deadlineAtMs: number
   readonly #repoSpentMs = new Map<string, number>()
   readonly #deferredRepos = new Map<string, SweepReadDeferralReason>()
   readonly #onDefer?: (event: 'read-timeout' | 'repo-deferred' | 'issue-deferred', reason: SweepReadDeferralReason) => void
@@ -172,6 +172,25 @@ export class SweepReadTracker {
       readTimeouts: this.#readTimeouts,
       reposDeferred: this.#deferredRepos.size,
       issuesDeferred: this.#issuesDeferred,
+    }
+  }
+
+  /**
+   * Run sweep work that is not a read, without spending the read phase on it.
+   *
+   * The read phase bounds how long the sweep reads before it dispatches. Work
+   * the sweep does between its listings and its first issue read (building
+   * the orphan-recovery context: a fleet roster and state-store calls) is not
+   * reading. Charging it would let a slow one expire the phase before any
+   * issue is read, deferring every candidate on every sweep. Its own time is
+   * still bounded by the aggregate sweep budget.
+   */
+  async excluding<T>(start: () => Promise<T>): Promise<T> {
+    const startedAtMs = this.#now()
+    try {
+      return await start()
+    } finally {
+      this.#deadlineAtMs += Math.max(0, this.#now() - startedAtMs)
     }
   }
 

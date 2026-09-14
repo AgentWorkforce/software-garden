@@ -161,6 +161,27 @@ describe('SweepReadTracker', () => {
     await expect(reads.run(undefined, async () => 'late')).rejects.toMatchObject({ reason: 'read-deadline' })
   })
 
+  it('does not spend the read phase on excluded work that is not a read', async () => {
+    const { reads, advance } = tracker()
+    // 900 ms of a 1 s phase goes on work that is not reading...
+    await reads.excluding(async () => { advance(900) })
+    // ...and 500 ms of reading later the phase is still open.
+    advance(500)
+    expect(reads.deferral(undefined)).toBeUndefined()
+    await expect(reads.run(undefined, async () => 'read')).resolves.toBe('read')
+    advance(500)
+    expect(reads.deferral(undefined)).toBe('read-deadline')
+  })
+
+  it('still excludes the time when the excluded work fails', async () => {
+    const { reads, advance } = tracker()
+    await expect(reads.excluding(async () => {
+      advance(2_000)
+      throw new Error('roster unavailable')
+    })).rejects.toThrow('roster unavailable')
+    expect(reads.deferral(undefined)).toBeUndefined()
+  })
+
   it('counts a deferred repository once, and a deferred issue every time', () => {
     const { reads, events } = tracker()
     reads.deferIssue('owner/slow', 'repo-budget')

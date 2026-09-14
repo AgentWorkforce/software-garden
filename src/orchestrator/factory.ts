@@ -4074,8 +4074,11 @@ export class FactoryLoop implements Factory {
       })
       this.#lastSweepReadBudgets = reads.budgets
       const paths = await enumerate(() => sweepReadPass.run(reads, () => this.#readyIssuePaths()))
+      // Not a read, so it does not spend the read phase: a slow roster or
+      // state-store call here must not expire the phase before any issue is
+      // read. The aggregate sweep budget still bounds it.
       const orphanRecovery = issueSource === 'github'
-        ? await this.#githubOrphanRecoveryContext(dryRun)
+        ? await reads.excluding(() => this.#githubOrphanRecoveryContext(dryRun))
         : undefined
       // Preserved-not-reconciled is a fact the caller needs either way, but the
       // two causes are not the same event: a dry run skips the context by
