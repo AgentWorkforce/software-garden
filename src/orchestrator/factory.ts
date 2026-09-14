@@ -806,6 +806,17 @@ const DISCOVERY_OVERLOAD_ADVERTISED_BACKOFF_MAX_MS = 30_000
  * ratchet do its job.
  */
 const DISCOVERY_OVERLOAD_PER_SWEEP_LIMIT = 5
+/**
+ * How many repositories' enumerations may time out in one GitHub listing
+ * before the listing is abandoned instead of continued.
+ *
+ * One timeout is a fact about one repository and costs that repository: the
+ * others are still enumerated and their work still dispatches. A second one in
+ * the same listing is the dependency, not the repository, and waiting out a
+ * full per-call deadline on every remaining repository is exactly how a sweep
+ * over a busy workspace comes to sit in flight for most of an hour.
+ */
+const GITHUB_ENUMERATION_TIMEOUT_LIMIT = 2
 // Canonical Software Garden naming (see src/constants/lifecycle-labels.ts).
 // GITHUB_LIFECYCLE_LABELS deliberately contains the legacy factory names too:
 // it filters lifecycle labels out of routing candidates, and an in-flight
@@ -9995,122 +10006,161 @@ export class FactoryLoop implements Factory {
    * a workspace that is dispatching. So only the sink enumeration sets it.
    */
   async #githubIssuePaths(opts: { sinkEnumeration?: boolean } = {}): Promise<string[]> {
-    try {
-      const issuePaths = new Map<string, string>()
-      for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
-        // The source breakdown is another per-enumeration ratio, so it inherits
-        // both load-bearing scopes from #listRelayfileTree. The async-local
-        // context excludes startup/backfill and unrelated callers; comparing
-        // its epoch again after every awaited index/tree operation prevents a
-        // stale continuation from writing into the sweep that replaced it.
-        const issuingPass = discoveryEnumerationPass.getStore()
-        const recordsCurrentPass = (): boolean => issuingPass !== undefined &&
-          issuingPass.epoch === this.#discoverySweepEpoch
-        if (recordsCurrentPass()) this.#discoverySweepSources.configuredRepos += 1
-        const roots = githubIssueRepoRoots(owner, repo)
-        const cachedBatches = roots.map((root) => this.#cachedDiscoveryTree(root))
-        const allRootsCached = cachedBatches.every((paths): paths is string[] => paths !== undefined)
-        // The issue index is the current eligibility authority, while the
-        // durable trees are only an incremental fallback for mounts whose
-        // index is absent or malformed. A checkpoint can legitimately retain
-        // stale membership (for example across an older cache format or a
-        // missed change window); letting two cached roots bypass a healthy
-        // index makes that stale snapshot self-validating forever.
-        const indexedPaths = await this.#githubIssuePathsFromIndex(owner, repo)
-        // Keep the fallback roots as separate batches. Flattening a very large
-        // provider result is synchronous work and can starve the durable loop
-        // heartbeat before the bounded scan below gets a chance to yield.
-        let pathBatches: string[][]
-        if (indexedPaths) {
-          // Do not feed this into the discovery cache: the index only covers
-          // open, labeled issues, so it is a filtered subset of the real
-          // tree (and an empty result for whichever root form the index
-          // doesn't use) — not something a later fresh listTree call may
-          // treat as "the tree", including on the escalation-marker and
-          // comment-replay call sites that share this cache.
-          pathBatches = [indexedPaths]
-          this.#increment('githubIssueIndexReposUsed')
-          if (recordsCurrentPass()) {
-            this.#discoverySweepSources.indexBackedRepos += 1
-            this.#discoverySweepSources.paths += indexedPaths.length
-            if (indexedPaths.length === 0) this.#discoverySweepSources.indexBackedEmptyRepos += 1
-          }
-        } else if (allRootsCached) {
-          pathBatches = cachedBatches
-          this.#increment('githubIssueDiscoveryCacheReposUsed')
-          if (recordsCurrentPass()) {
-            const count = cachedBatches.reduce((sum, paths) => sum + paths.length, 0)
-            this.#discoverySweepSources.cacheBackedRepos += 1
-            this.#discoverySweepSources.paths += count
-            if (count === 0) this.#discoverySweepSources.cacheBackedEmptyRepos += 1
-          }
-        } else {
-          pathBatches = []
-          for (const root of roots) {
-            pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true, enumeration: true }))
-          }
-          this.#increment('githubIssueIndexFallbacks')
-          if (recordsCurrentPass()) {
-            const count = pathBatches.reduce((sum, paths) => sum + paths.length, 0)
-            this.#discoverySweepSources.treeBackedRepos += 1
-            this.#discoverySweepSources.paths += count
-            if (count === 0) this.#discoverySweepSources.treeBackedEmptyRepos += 1
-          }
+    // Each repository is enumerated under its own catch. Repositories are
+    // independent work units exactly as issues are (#292, #297): one repo's
+    // shed index read or hung tree listing is a fact about that repo, so it
+    // costs that repo's candidates and nothing else. It used to be one catch
+    // around the whole loop, so a single 429 on any of the configured repos
+    // failed the entire sweep -- no repo's work dispatched -- and an ordinary
+    // error discarded every repo already listed.
+    //
+    // Fail-closed is structural rather than a check: a repo that did not
+    // enumerate contributes no path, so none of its issues is read, and an
+    // issue whose state was never read can never reach triage or dispatch.
+    const issuePaths = new Map<string, string>()
+    let enumeratedRepos = 0
+    let failedRepos = 0
+    let repoTimeouts = 0
+    let passWideFailure: unknown
+    for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
+      try {
+        const repoPaths = await this.#githubRepoIssuePaths(owner, repo)
+        for (const [identity, path] of repoPaths) issuePaths.set(identity, path)
+        enumeratedRepos += 1
+      } catch (error) {
+        // Sustained shedding is about the sweep, not the repo: past the fuse
+        // relayfile is not serving this sweep at all, and the fence needs the
+        // latched 429 to set the durable backoff.
+        const fuse = this.#discoveryOverloadFuseError()
+        if (fuse) throw fuse
+        if (error instanceof RelayfileOperationTimeoutError) {
+          repoTimeouts += 1
+          if (repoTimeouts >= GITHUB_ENUMERATION_TIMEOUT_LIMIT) throw error
         }
-        for (const paths of pathBatches) {
-          for (let index = 0; index < paths.length; index += 1) {
-            const path = paths[index]!
-            const parts = githubIssuePathParts(path)
-            if (parts) {
-              const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
-              const existing = issuePaths.get(identity)
-              if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
-                if (existing) this.#increment('githubIssueAliasPathsSuppressed')
-                issuePaths.set(identity, path)
-              } else {
-                this.#increment('githubIssueAliasPathsSuppressed')
-              }
-            } else if (githubIssueDirectoryPathParts(path) !== undefined) {
-              // listTree returns the issue directory entry alongside its
-              // meta.json file; githubIssuePathParts() already collected the
-              // file, so skip the directory to avoid reading the same issue
-              // twice in one backfill pass. Directory paths are only meaningful
-              // for live change events, not the tree scan.
-              continue
-            } else if (isGithubIssueTreePath(path)) {
-              this.#increment('githubIssuesIgnoredByPathRegex')
-            }
-            if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
-              await this.#refreshLiveHeartbeatIfDue()
-              await liveEventYield()
-            }
-          }
-          await this.#refreshLiveHeartbeatIfDue()
+        if (isPassWideRelayfileFault(error)) passWideFailure ??= error
+        failedRepos += 1
+        // Absorbing a failure must not erase it: a listing with a skipped
+        // repository is "we could not finish looking", and #406 is what
+        // happened when the readiness accounting read that as "we looked and
+        // found nothing". Recorded under the same epoch guard the source
+        // counters use, so a stale continuation cannot mark the sweep that
+        // replaced it.
+        const failingPass = discoveryEnumerationPass.getStore()
+        if (opts.sinkEnumeration && failingPass !== undefined &&
+          failingPass.epoch === this.#discoverySweepEpoch) {
+          this.#discoverySweepDiscoveryFailed = true
         }
+        this.#increment('githubIssueListFailures')
+        this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
       }
-      for (const [identity, path] of issuePaths) {
-        this.#githubIssuePreferredPaths.set(identity, path)
-      }
-      this.#githubIssuePathIndexReady = true
-      return [...issuePaths.values()].sort()
-    } catch (error) {
-      if (isPassWideRelayfileFault(error)) throw error
-      // The failure is absorbed here so one bad repository cannot abort the
-      // sweep, but absorbing it must not erase it: the empty list below is
-      // "we could not finish looking", and #406 is what happened when the
-      // readiness accounting read it as "we looked and found nothing".
-      // Recorded under the same epoch guard the source counters use, so a
-      // stale continuation cannot mark the sweep that replaced it.
-      const failingPass = discoveryEnumerationPass.getStore()
-      if (opts.sinkEnumeration && failingPass !== undefined &&
-        failingPass.epoch === this.#discoverySweepEpoch) {
-        this.#discoverySweepDiscoveryFailed = true
-      }
-      this.#githubIssuePathIndexReady = false
-      this.#increment('githubIssueListFailures')
-      this.#logger.warn?.('[factory] failed to list GitHub issue source tree', error)
-      return []
     }
+    // No repository enumerated and the dependency itself was at fault: that is
+    // not a partial listing, it is a failed one, and it must surface as the
+    // fault rather than as a clean sweep that found nothing (#297, #351).
+    if (enumeratedRepos === 0 && passWideFailure !== undefined) throw passWideFailure
+    for (const [identity, path] of issuePaths) {
+      this.#githubIssuePreferredPaths.set(identity, path)
+    }
+    // Ready once any repository contributed, so a partial listing does not make
+    // every later preferred-path lookup re-enumerate all repositories. A path
+    // from a skipped repository just keeps the path it was asked about.
+    this.#githubIssuePathIndexReady = enumeratedRepos > 0 || failedRepos === 0
+    return [...issuePaths.values()].sort()
+  }
+
+  /** One repository's issue paths, keyed by issue identity. Throws on any read fault. */
+  async #githubRepoIssuePaths(owner: string, repo: string): Promise<Map<string, string>> {
+    const issuePaths = new Map<string, string>()
+    // The source breakdown is another per-enumeration ratio, so it inherits
+    // both load-bearing scopes from #listRelayfileTree. The async-local
+    // context excludes startup/backfill and unrelated callers; comparing
+    // its epoch again after every awaited index/tree operation prevents a
+    // stale continuation from writing into the sweep that replaced it.
+    const issuingPass = discoveryEnumerationPass.getStore()
+    const recordsCurrentPass = (): boolean => issuingPass !== undefined &&
+      issuingPass.epoch === this.#discoverySweepEpoch
+    if (recordsCurrentPass()) this.#discoverySweepSources.configuredRepos += 1
+    const roots = githubIssueRepoRoots(owner, repo)
+    const cachedBatches = roots.map((root) => this.#cachedDiscoveryTree(root))
+    const allRootsCached = cachedBatches.every((paths): paths is string[] => paths !== undefined)
+    // The issue index is the current eligibility authority, while the
+    // durable trees are only an incremental fallback for mounts whose
+    // index is absent or malformed. A checkpoint can legitimately retain
+    // stale membership (for example across an older cache format or a
+    // missed change window); letting two cached roots bypass a healthy
+    // index makes that stale snapshot self-validating forever.
+    const indexedPaths = await this.#githubIssuePathsFromIndex(owner, repo)
+    // Keep the fallback roots as separate batches. Flattening a very large
+    // provider result is synchronous work and can starve the durable loop
+    // heartbeat before the bounded scan below gets a chance to yield.
+    let pathBatches: string[][]
+    if (indexedPaths) {
+      // Do not feed this into the discovery cache: the index only covers
+      // open, labeled issues, so it is a filtered subset of the real
+      // tree (and an empty result for whichever root form the index
+      // doesn't use) — not something a later fresh listTree call may
+      // treat as "the tree", including on the escalation-marker and
+      // comment-replay call sites that share this cache.
+      pathBatches = [indexedPaths]
+      this.#increment('githubIssueIndexReposUsed')
+      if (recordsCurrentPass()) {
+        this.#discoverySweepSources.indexBackedRepos += 1
+        this.#discoverySweepSources.paths += indexedPaths.length
+        if (indexedPaths.length === 0) this.#discoverySweepSources.indexBackedEmptyRepos += 1
+      }
+    } else if (allRootsCached) {
+      pathBatches = cachedBatches
+      this.#increment('githubIssueDiscoveryCacheReposUsed')
+      if (recordsCurrentPass()) {
+        const count = cachedBatches.reduce((sum, paths) => sum + paths.length, 0)
+        this.#discoverySweepSources.cacheBackedRepos += 1
+        this.#discoverySweepSources.paths += count
+        if (count === 0) this.#discoverySweepSources.cacheBackedEmptyRepos += 1
+      }
+    } else {
+      pathBatches = []
+      for (const root of roots) {
+        pathBatches.push(await this.#listRelayfileTree(root, 'GitHub issue ingestion', { cache: true, enumeration: true }))
+      }
+      this.#increment('githubIssueIndexFallbacks')
+      if (recordsCurrentPass()) {
+        const count = pathBatches.reduce((sum, paths) => sum + paths.length, 0)
+        this.#discoverySweepSources.treeBackedRepos += 1
+        this.#discoverySweepSources.paths += count
+        if (count === 0) this.#discoverySweepSources.treeBackedEmptyRepos += 1
+      }
+    }
+    for (const paths of pathBatches) {
+      for (let index = 0; index < paths.length; index += 1) {
+        const path = paths[index]!
+        const parts = githubIssuePathParts(path)
+        if (parts) {
+          const identity = githubIssueIdentity(parts.owner, parts.repo, parts.number)
+          const existing = issuePaths.get(identity)
+          if (!existing || githubIssuePathPreference(path) < githubIssuePathPreference(existing)) {
+            if (existing) this.#increment('githubIssueAliasPathsSuppressed')
+            issuePaths.set(identity, path)
+          } else {
+            this.#increment('githubIssueAliasPathsSuppressed')
+          }
+        } else if (githubIssueDirectoryPathParts(path) !== undefined) {
+          // listTree returns the issue directory entry alongside its
+          // meta.json file; githubIssuePathParts() already collected the
+          // file, so skip the directory to avoid reading the same issue
+          // twice in one backfill pass. Directory paths are only meaningful
+          // for live change events, not the tree scan.
+          continue
+        } else if (isGithubIssueTreePath(path)) {
+          this.#increment('githubIssuesIgnoredByPathRegex')
+        }
+        if ((index + 1) % LIVE_EVENT_DRAIN_BATCH_SIZE === 0) {
+          await this.#refreshLiveHeartbeatIfDue()
+          await liveEventYield()
+        }
+      }
+      await this.#refreshLiveHeartbeatIfDue()
+    }
+    return issuePaths
   }
 
   async #githubIssuePathsFromIndex(owner: string, repo: string): Promise<string[] | undefined> {
