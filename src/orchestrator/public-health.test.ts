@@ -71,6 +71,50 @@ describe('Slack heartbeat counters', () => {
   })
 })
 
+describe('sweep read budget counters (#376)', () => {
+  const sweepReads = {
+    readTimeouts: 4,
+    reposDeferred: 2,
+    issuesDeferred: 7,
+    lastSweepReadTimeouts: 1,
+    lastSweepReposDeferred: 1,
+    lastSweepIssuesDeferred: 3,
+    readBudgetMs: 60_000,
+    repoBudgetMs: 180_000,
+    readPhaseBudgetMs: 900_000,
+  }
+
+  it('preserves the counters and budgets through projection and normalization without gating dispatch', () => {
+    const health = publicHealthFromHeartbeat(heartbeat({
+      sweepReads: { ...sweepReads, repo: 'must not cross', lastError: 'must not cross' } as typeof sweepReads,
+    }), { nowMs: BOOT_MS })
+    expect(health.sweepReads).toEqual(sweepReads)
+    expect(normalizePublicHealth(health)?.sweepReads).toEqual(sweepReads)
+    expect(health).toMatchObject({ ok: true, status: 'ok', degradedSubsystems: [] })
+  })
+
+  it('keeps older heartbeats and health records uninstrumented', () => {
+    const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
+    expect(Object.hasOwn(health, 'sweepReads')).toBe(false)
+    expect(Object.hasOwn(normalizePublicHealth(health)!, 'sweepReads')).toBe(false)
+  })
+
+  it('publishes numbers only, and drops missing or invalid fields rather than inventing zeros', () => {
+    const health = normalizePublicHealth({
+      sweepReads: {
+        readTimeouts: 0,
+        reposDeferred: -1,
+        issuesDeferred: '2',
+        readBudgetMs: 0,
+        repoBudgetMs: 180_000,
+        reason: 'must not cross',
+      },
+    })
+    expect(health?.sweepReads).toEqual({ readTimeouts: 0, repoBudgetMs: 180_000 })
+    expect(normalizePublicHealth({ sweepReads: null })?.sweepReads).toBeUndefined()
+  })
+})
+
 describe('dispatch capacity health (#303)', () => {
   const capacity = (overrides: Partial<NonNullable<FactoryLoopHeartbeat['dispatchCapacity']>> = {}) => heartbeat({
     dispatchCapacity: {

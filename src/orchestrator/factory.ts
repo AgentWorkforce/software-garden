@@ -96,6 +96,14 @@ import {
   type DiscoverySweepBudget,
 } from './sweep-budget'
 import {
+  SweepReadBudgetExceededError,
+  SweepReadTracker,
+  sweepReadBudgets,
+  type SweepReadBudgets,
+  type SweepReadDeferralReason,
+  type SweepReadOutcome,
+} from './sweep-read-budget'
+import {
   dispatchHandedOffToBabysitters,
   dispatchLifecycleOccupiesSlot,
   dispatchPhaseOccupiesSlot,
@@ -990,6 +998,17 @@ export function createFactory(config: FactoryConfig, ports: FactoryPorts): Facto
  * wrong.
  */
 const discoveryEnumerationPass = new AsyncLocalStorage<{ epoch: number }>()
+/**
+ * The read budgets of the readiness sweep that issued this enumeration (#376).
+ *
+ * Set only around the sweep's own candidate enumeration, so the other callers
+ * of `#githubIssuePaths` (the merge-advance scan, preferred-path lookups, the
+ * live drain) keep reading unbudgeted, exactly as before.
+ */
+const sweepReadPass = new AsyncLocalStorage<SweepReadTracker>()
+
+/** The repository a GitHub issue path belongs to, as a per-sweep budget key. */
+const sweepReadRepoKey = (owner: string, repo: string): string => `${owner}/${repo}`.toLowerCase()
 const ZERO_CANDIDATE_ALARM_THRESHOLD = 3
 
 export class FactoryLoop implements Factory {
@@ -1206,6 +1225,10 @@ export class FactoryLoop implements Factory {
    * exists to remove.
    */
   #discoverySweepBudgetMs = DEFAULT_DISCOVERY_SWEEP_BUDGET_MS
+  /** The read budgets the most recent sweep ran under (#376). */
+  #lastSweepReadBudgets?: SweepReadBudgets
+  /** What the most recent sweep's read phase deferred (#376). */
+  #lastSweepReadOutcome?: SweepReadOutcome
   /**
    * The budgets of every sweep currently in flight.
    *
@@ -4043,7 +4066,14 @@ export class FactoryLoop implements Factory {
       } else {
         await this.#ensureGithubIngestionReady()
       }
-      const paths = await enumerate(() => this.#readyIssuePaths())
+      // #376: the budgets that turn a slow read into a deferral instead of a
+      // held sweep. Dispatch starts only after the read phase, so an
+      // unbounded read phase is an unbounded dispatch delay.
+      const reads = new SweepReadTracker(sweepReadBudgets(budget?.budgetMs), {
+        onDefer: (event, reason) => this.#countSweepReadDeferral(event, reason),
+      })
+      this.#lastSweepReadBudgets = reads.budgets
+      const paths = await enumerate(() => sweepReadPass.run(reads, () => this.#readyIssuePaths()))
       const orphanRecovery = issueSource === 'github'
         ? await this.#githubOrphanRecoveryContext(dryRun)
         : undefined
@@ -4075,6 +4105,24 @@ export class FactoryLoop implements Factory {
 
       let candidateCount = 0
       let candidateReadsIncomplete = false
+      let servedReads = 0
+      let readBudgetFailure: SweepReadBudgetExceededError | undefined
+      const markCandidateReadsIncomplete = (): void => {
+        if (candidateReadsIncomplete) return
+        candidateReadsIncomplete = true
+        this.#increment('dispatchIncompleteCandidateSweeps')
+      }
+      // One issue not read this sweep because a read budget was spent. Its
+      // state is unknown, so it is skipped: fail-closed per issue (#376).
+      const deferRead = (path: string, repo: string | undefined, reason: SweepReadDeferralReason): void => {
+        reads.deferIssue(repo, reason)
+        markCandidateReadsIncomplete()
+        recordSkip({
+          issue: issueRefFromPath(path),
+          reason: `sweep read deferred (${reason})`,
+          code: 'read-failed',
+        })
+      }
       const issueEntries: Array<{ path: string; issue?: LinearIssue }> = []
       for (const path of paths) {
         // A between-await check, worth exactly what #368 said such a check is
@@ -4083,10 +4131,40 @@ export class FactoryLoop implements Factory {
         // its next iteration if it ever regains control, instead of running to
         // completion beside the sweep that replaced it.
         budget?.assertNotExpired('run-once')
+        const pathParts = githubIssuePathParts(path)
+        const readRepo = pathParts ? sweepReadRepoKey(pathParts.owner, pathParts.repo) : undefined
+        // A repository whose budget is spent, or a read phase that has ended,
+        // defers the read without issuing it: no new load on a dependency the
+        // sweep has already decided to stop waiting on.
+        const deferred = reads.deferral(readRepo)
+        if (deferred !== undefined) {
+          deferRead(path, readRepo, deferred)
+          continue
+        }
         let issue: LinearIssue | undefined
         let shed = false
         try {
-          issue = await this.#readIssue(path)
+          const read = await reads.run(readRepo, () => this.#readIssue(path)).then(
+            (value) => ({ issue: value }),
+            (error: unknown) => {
+              if (error instanceof SweepReadBudgetExceededError) return { deferred: error }
+              throw error
+            },
+          )
+          if ('deferred' in read) {
+            // Not served, exactly like a shed read: it cannot establish the
+            // issue's state, so it is neither triaged nor dispatched.
+            shed = true
+            readBudgetFailure ??= read.deferred
+            this.#logger.warn?.('[factory] sweep read budget deferred a ready-issue read; continuing the sweep', {
+              path,
+              reason: read.deferred.reason,
+              budgetMs: read.deferred.budgetMs,
+            })
+            deferRead(path, readRepo, read.deferred.reason)
+          } else {
+            issue = read.issue
+          }
         } catch (error) {
           // #297: `#readIssue` rethrows relayfile overload and swallows every
           // other read fault, so this catch only ever sees the backend
@@ -4118,12 +4196,10 @@ export class FactoryLoop implements Factory {
           // Shed, missing, malformed, and failed reads cannot establish that
           // discovery is empty. Count the sweep once, even if the fuse aborts
           // it, while retaining candidates successfully read from other paths.
-          if (!issue && !candidateReadsIncomplete) {
-            candidateReadsIncomplete = true
-            this.#increment('dispatchIncompleteCandidateSweeps')
-          }
+          if (!issue) markCandidateReadsIncomplete()
         }
         readyIssueReads += 1
+        if (!shed && issue) servedReads += 1
         // Relayfile served this work unit's read: the dependency is shedding
         // but not refusing, which is what decays the ratchet (#297).
         //
@@ -4160,6 +4236,12 @@ export class FactoryLoop implements Factory {
         }
         await this.#refreshLiveHeartbeatIfDue()
       }
+      this.#lastSweepReadOutcome = reads.outcome()
+      // The #351 rule, kept for the new budgets: deferring slow reads is how a
+      // sweep keeps the work that WAS served. A sweep in which reads timed out
+      // and nothing was served accomplished nothing, and committing it would
+      // report a healthy sweep over a dependency that answered none of it.
+      if (readBudgetFailure !== undefined && servedReads === 0) throw readBudgetFailure
       if (!this.#discoverySweepDiscoveryFailed && !candidateReadsIncomplete) {
         this.#increment('dispatchCandidateSweeps')
         if (candidateCount === 0) this.#increment('dispatchNoCandidateSweeps')
@@ -6729,6 +6811,48 @@ export class FactoryLoop implements Factory {
       // enumerated, `lastEnumeratedAtMs` and `lastCompletedAtMs` describe the
       // same instant and must not drift apart by a tick.
       enumeratedAtMs: completedAtMs,
+    }
+  }
+
+  /**
+   * The sweep read budgets and what they deferred (#376). Numbers only.
+   *
+   * Cumulative counts are the writer's authoritative zeros, like `slack`. The
+   * `lastSweep*` counts are absent until a sweep has finished its read phase,
+   * so "no sweep yet" never reads as "a sweep that deferred nothing".
+   */
+  #sweepReadStatus(): NonNullable<FactoryLoopHeartbeat['sweepReads']> {
+    const budgets = this.#lastSweepReadBudgets ?? sweepReadBudgets(this.#discoverySweepBudgetMs)
+    const last = this.#lastSweepReadOutcome
+    return {
+      readTimeouts: this.#counters.sweepReadTimeouts ?? 0,
+      reposDeferred: this.#counters.sweepReposDeferred ?? 0,
+      issuesDeferred: this.#counters.sweepIssuesDeferred ?? 0,
+      ...(last
+        ? {
+            lastSweepReadTimeouts: last.readTimeouts,
+            lastSweepReposDeferred: last.reposDeferred,
+            lastSweepIssuesDeferred: last.issuesDeferred,
+          }
+        : {}),
+      readBudgetMs: budgets.callMs,
+      repoBudgetMs: budgets.repoMs,
+      readPhaseBudgetMs: budgets.readPhaseMs,
+    }
+  }
+
+  #countSweepReadDeferral(
+    event: 'read-timeout' | 'repo-deferred' | 'issue-deferred',
+    reason: SweepReadDeferralReason,
+  ): void {
+    if (event === 'read-timeout') {
+      this.#increment('sweepReadTimeouts')
+    } else if (event === 'repo-deferred') {
+      this.#increment('sweepReposDeferred')
+      this.#increment(`sweepReposDeferred:${reason}`)
+      this.#logger.warn?.('[factory] sweep read budget deferred a repository to the next sweep', { reason })
+    } else {
+      this.#increment('sweepIssuesDeferred')
     }
   }
 
@@ -10022,9 +10146,18 @@ export class FactoryLoop implements Factory {
     let failedRepos = 0
     let repoTimeouts = 0
     let passWideFailure: unknown
+    let readBudgetFailure: SweepReadBudgetExceededError | undefined
+    // #376: the sweep's own enumeration spends the sweep's read budgets. A
+    // repository whose listing exceeds them, or that is reached after the read
+    // phase ended, is deferred to the next sweep exactly like one whose listing
+    // failed: it contributes no paths, so none of its issues can dispatch.
+    const reads = opts.sinkEnumeration ? sweepReadPass.getStore() : undefined
     for (const { owner, repo } of configuredGithubRepoParts(this.#config)) {
+      const repoKey = sweepReadRepoKey(owner, repo)
       try {
-        const repoPaths = await this.#githubRepoIssuePaths(owner, repo)
+        const repoPaths = reads
+          ? await reads.run(repoKey, () => this.#githubRepoIssuePaths(owner, repo))
+          : await this.#githubRepoIssuePaths(owner, repo)
         for (const [identity, path] of repoPaths) issuePaths.set(identity, path)
         enumeratedRepos += 1
       } catch (error) {
@@ -10036,6 +10169,10 @@ export class FactoryLoop implements Factory {
         if (error instanceof RelayfileOperationTimeoutError) {
           repoTimeouts += 1
           if (repoTimeouts >= GITHUB_ENUMERATION_TIMEOUT_LIMIT) throw error
+        }
+        if (error instanceof SweepReadBudgetExceededError) {
+          readBudgetFailure ??= error
+          reads?.deferRepo(repoKey, error.reason)
         }
         if (isPassWideRelayfileFault(error)) passWideFailure ??= error
         failedRepos += 1
@@ -10058,6 +10195,11 @@ export class FactoryLoop implements Factory {
     // not a partial listing, it is a failed one, and it must surface as the
     // fault rather than as a clean sweep that found nothing (#297, #351).
     if (enumeratedRepos === 0 && passWideFailure !== undefined) throw passWideFailure
+    // The same rule for the sweep's own read budgets. Every repository timing
+    // out is a dependency that served nothing, and a sweep that reports it as
+    // an empty listing is the #351 silence: `consecutiveFailures: 0`, nothing
+    // dispatched.
+    if (enumeratedRepos === 0 && readBudgetFailure !== undefined) throw readBudgetFailure
     for (const [identity, path] of issuePaths) {
       this.#githubIssuePreferredPaths.set(identity, path)
     }
@@ -11316,6 +11458,7 @@ export class FactoryLoop implements Factory {
         slackGateBypassedByWebhookHealth: this.#counters.slackGateBypassedByWebhookHealth ?? 0,
         slackGateBypassedByObservedEvent: this.#counters.slackGateBypassedByObservedEvent ?? 0,
       },
+      sweepReads: this.#sweepReadStatus(),
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),

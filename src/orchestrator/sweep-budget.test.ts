@@ -238,13 +238,18 @@ describe('the configured budget', () => {
     expect(live({ reconcileTimeoutMs: 5 * 60_000 }).sweepBudgetMs).toBe(5 * 60_000)
   })
 
-  it('must-not-fire: a config that loosened reconcileTimeoutMs is not silently capped at 90 minutes', () => {
-    expect(live({ reconcileTimeoutMs: 3 * 60 * 60_000 }).sweepBudgetMs).toBe(3 * 60 * 60_000)
+  it('must-fire: a config that loosened reconcileTimeoutMs keeps the default budget unless it sets one (#376)', () => {
+    // A looser wait no longer loosens the sweep: a sweep budget above the
+    // container's own life cannot fire. An explicit budget still can.
+    expect(live({ reconcileTimeoutMs: 3 * 60 * 60_000 }).sweepBudgetMs).toBe(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS)
+    expect(live({ reconcileTimeoutMs: 3 * 60 * 60_000, sweepBudgetMs: 2 * 60 * 60_000 }).sweepBudgetMs)
+      .toBe(2 * 60 * 60_000)
   })
 
-  it('must-not-fire: an omitted budget tracks the default timeout', () => {
+  it('must-fire: an omitted budget is the default, far inside the reconcile timeout (#376)', () => {
     expect(live({}).sweepBudgetMs).toBe(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS)
-    expect(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS).toBe(DEFAULT_READINESS_RECONCILE_TIMEOUT_MS)
+    expect(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS).toBe(30 * 60_000)
+    expect(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS).toBeLessThan(DEFAULT_READINESS_RECONCILE_TIMEOUT_MS)
   })
 
   it('must-fire: an explicit budget looser than the wait is still rejected', () => {
@@ -256,6 +261,7 @@ describe('the configured budget', () => {
 
   it('must-not-fire: resolving is the same rule on both sides of the schema', () => {
     expect(resolvedSweepBudgetMs(undefined, 5 * 60_000)).toBe(5 * 60_000)
+    expect(resolvedSweepBudgetMs(undefined, 90 * 60_000)).toBe(DEFAULT_DISCOVERY_SWEEP_BUDGET_MS)
     expect(resolvedSweepBudgetMs(60_000, 5 * 60_000)).toBe(60_000)
     // `start()` overrides bypass the schema, so the clamp has to hold here too.
     expect(resolvedSweepBudgetMs(10 * 60_000, 5 * 60_000)).toBe(5 * 60_000)
@@ -464,7 +470,55 @@ class LeaseWatchingStateStore extends InMemoryStateStore {
   }
 }
 
+/** A fleet whose spawn never answers: a dispatch-phase await with no bound of its own. */
+class HangingSpawnFleet extends FakeFleetClient {
+  hungSpawns = 0
+
+  override async spawn(): ReturnType<FakeFleetClient['spawn']> {
+    this.hungSpawns += 1
+    return await NEVER()
+  }
+}
+
 describe('a wedged sweep is bounded end to end (#372)', () => {
+  it('must-fire: a dispatch await that never answers is ended by the sweep budget (#376)', async () => {
+    // The dispatch phase has awaits with no deadline of their own (an internal
+    // broker spawn, state-store calls, writeback). Only the aggregate budget
+    // bounds them, which is why that budget has to sit below the container's
+    // own liveness bars to mean anything.
+    const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-spawn-'))
+    const fleet = new HangingSpawnFleet()
+    const stateStore = new LeaseWatchingStateStore({ batchSize: 4 })
+    const factory = createFactory(config(400, root), {
+      mount: new FakeMountClient({ [issuePath(902)]: issueFile(902) }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      logger: {},
+    })
+    try {
+      const aborted = await withDeadline(
+        factory.runOnce().then(() => undefined, (error: unknown) => error),
+        4_000,
+        'sweep never settled',
+      )
+      expect(fleet.hungSpawns).toBeGreaterThan(0)
+      expect(aborted).toMatchObject({ name: 'DiscoverySweepBudgetExceededError', budgetMs: 400, phase: 'run-once' })
+      expect(stateStore.released).toHaveLength(1)
+      // The next cycle starts a new sweep rather than coalescing onto the
+      // abandoned dispatch, and settles on its own.
+      await withDeadline(
+        factory.runOnce().then(() => undefined, () => undefined),
+        4_000,
+        'next cycle coalesced onto the abandoned dispatch',
+      )
+      expect(stateStore.claims).toBe(2)
+    } finally {
+      await factory.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('must-fire: aborts at the budget, releases the lease, and the NEXT cycle runs clean', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-sweep-budget-'))
     const mount = new HangingWatermarkMount({

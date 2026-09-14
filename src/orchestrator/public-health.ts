@@ -216,6 +216,28 @@ const slackHealth = (value: unknown): FactoryPublicHealth['slack'] => {
   }
 }
 
+/**
+ * Readiness-sweep read budgets and deferrals (#376), rebuilt field by field.
+ *
+ * Same discipline as `slackHealth`: named numeric fields only, nothing spread,
+ * and a missing or invalid field stays absent rather than becoming a zero.
+ */
+const sweepReadsHealth = (value: unknown): FactoryPublicHealth['sweepReads'] => {
+  const record = plainRecord(value)
+  if (!record) return undefined
+  return {
+    ...optionalCount('readTimeouts', record.readTimeouts),
+    ...optionalCount('reposDeferred', record.reposDeferred),
+    ...optionalCount('issuesDeferred', record.issuesDeferred),
+    ...optionalCount('lastSweepReadTimeouts', record.lastSweepReadTimeouts),
+    ...optionalCount('lastSweepReposDeferred', record.lastSweepReposDeferred),
+    ...optionalCount('lastSweepIssuesDeferred', record.lastSweepIssuesDeferred),
+    ...optionalPositive('readBudgetMs', record.readBudgetMs),
+    ...optionalPositive('repoBudgetMs', record.repoBudgetMs),
+    ...optionalPositive('readPhaseBudgetMs', record.readPhaseBudgetMs),
+  }
+}
+
 /** Control characters stripped, length bounded: this text can reach a terminal. */
 const boundedText = (value: string): string =>
   // C0 and C1 alike (#300 review, P2, cubic): some terminals interpret the
@@ -929,6 +951,7 @@ export function publicHealthFromHeartbeat(
     ? { state: enumValue(heartbeat.eventListener.state, EVENT_LISTENER_STATES) }
     : undefined
   const slack = slackHealth(heartbeat.slack)
+  const sweepReads = sweepReadsHealth(heartbeat.sweepReads)
 
   // A daemon that is not running a readiness loop is not a live dispatcher —
   // a bounded `factory loop` reports `not-running` here and is not supposed to
@@ -990,6 +1013,7 @@ export function publicHealthFromHeartbeat(
     ...(heartbeat.prProbe ? { prProbe: prProbeHealth(heartbeat.prProbe) } : {}),
     ...(eventListener ? { eventListener } : {}),
     ...(slack ? { slack } : {}),
+    ...(sweepReads ? { sweepReads } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
     ...(fleetConnect ? { fleetConnect } : {}),
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
@@ -1024,6 +1048,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const prProbe = prProbeHealth(record.prProbe)
   const listener = plainRecord(record.eventListener)
   const slack = slackHealth(record.slack)
+  const sweepReads = sweepReadsHealth(record.sweepReads)
   const fleet = plainRecord(record.fleetControlPlane)
   const fleetConnect = plainRecord(record.fleetConnect)
   const capacity = plainRecord(record.dispatchCapacity)
@@ -1083,6 +1108,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     degradedSubsystems: [...degradedSubsystems],
     ...(prProbe ? { prProbe } : {}),
     ...(slack ? { slack } : {}),
+    ...(sweepReads ? { sweepReads } : {}),
     ...(typeof record.reason === 'string'
       ? { reason: boundedText(record.reason) }
       : {}),

@@ -6452,6 +6452,184 @@ describe('FactoryLoop', () => {
     })
   })
 
+  /**
+   * Read budgets inside one readiness sweep (#376).
+   *
+   * Slow is not failed: a dependency that answers every read at just under the
+   * transport deadline used to hold one sweep for most of an hour, and dispatch
+   * only happens after the read phase. Each budget turns a slow unit into a
+   * deferral of that unit, and the sweep dispatches what it did read.
+   *
+   * At a 6 s sweep budget the derived budgets are 200 ms per read, 600 ms per
+   * repository and a 3 s read phase.
+   */
+  describe('readiness sweep read budgets (#376)', () => {
+    const SWEEP_BUDGET_MS = 6_000
+    const NEVER = (): Promise<never> => new Promise<never>(() => undefined)
+    const indexPathFor = (repo: string) => `/github/repos/AgentWorkforce/${repo}/issues/_index.json`
+    const issuePathFor = (repo: string, number: number) => githubIssueCompactPath('AgentWorkforce', repo, number)
+
+    /** A fake mount whose chosen paths never answer. */
+    class HangingReadMount extends FakeMountClient {
+      readonly hanging = new Set<string>()
+
+      constructor(issues: Array<[repo: string, number: number]>) {
+        const files: Record<string, unknown> = {}
+        const byRepo = new Map<string, number[]>()
+        for (const [repo, number] of issues) byRepo.set(repo, [...byRepo.get(repo) ?? [], number])
+        for (const [repo, numbers] of byRepo) {
+          files[indexPathFor(repo)] = numbers.map((number) => (
+            { id: String(number), number, title: `Issue ${number}`, updated: '2026-09-14T00:00:00Z', state: 'open', labels: ['factory'] }
+          ))
+          for (const number of numbers) files[issuePathFor(repo, number)] = githubIssueFile(number, { repo, labels: ['factory'] })
+        }
+        super(files)
+        this.setSubRoot('/linear/issues', 'absent')
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        if (this.hanging.has(path)) {
+          this.reads.push(path)
+          return await NEVER()
+        }
+        return super.readFile(path)
+      }
+    }
+
+    const withFactory = async (
+      mount: HangingReadMount,
+      body: (factory: ReturnType<typeof createFactory>, fleet: FakeFleetClient) => Promise<void>,
+    ): Promise<void> => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-sweep-read-budget-'))
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(multiRepoGithubConfig({
+        loop: { registryPath: join(root, 'registry.json') },
+        // Parsed by `config()`, which fills in and cross-checks the rest.
+        liveSubscription: { sweepBudgetMs: SWEEP_BUDGET_MS } as FactoryConfig['liveSubscription'],
+      }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+      try {
+        await body(factory, fleet)
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+
+    it('defers only the repository whose listing exceeds the per-read budget, and the sweep completes', async () => {
+      const mount = new HangingReadMount([['pear', 70], ['hoopsheet', 71]])
+      mount.hanging.add(indexPathFor('hoopsheet'))
+
+      await withFactory(mount, async (factory) => {
+        const report = await factory.runOnce()
+
+        expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor('pear', 70)])
+        // Fail-closed by construction: the deferred repository's issue was
+        // never read, so it could not have been triaged or dispatched.
+        expect(mount.reads).not.toContain(issuePathFor('hoopsheet', 71))
+        expect(report.discoveryFailed).toBe('issue-listing-failed')
+        const counters = factory.status().counters
+        expect(counters.sweepReadTimeouts).toBe(1)
+        expect(counters.sweepReposDeferred).toBe(1)
+        expect(counters['sweepReposDeferred:read-timeout']).toBe(1)
+      })
+    })
+
+    it('never dispatches an issue whose own read exceeded the per-read budget, and still dispatches its neighbour', async () => {
+      const mount = new HangingReadMount([['pear', 70], ['hoopsheet', 71]])
+      mount.hanging.add(issuePathFor('hoopsheet', 71))
+
+      await withFactory(mount, async (factory, fleet) => {
+        const report = await factory.runOnce()
+
+        expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor('pear', 70)])
+        expect(report.triaged.map((decision) => decision.issue.path)).toEqual([issuePathFor('pear', 70)])
+        expect(report.pulled.map((issue) => issue.path)).not.toContain(issuePathFor('hoopsheet', 71))
+        expect(fleet.spawns.map((spawn) => spawn.name).some((name) => name.includes('71'))).toBe(false)
+        expect(report.skipped).toContainEqual(expect.objectContaining({
+          issue: expect.objectContaining({ path: issuePathFor('hoopsheet', 71) }),
+          reason: 'sweep read deferred (read-timeout)',
+          code: 'read-failed',
+        }))
+        const counters = factory.status().counters
+        expect(counters.sweepReadTimeouts).toBe(1)
+        expect(counters.sweepIssuesDeferred).toBe(1)
+        // One slow issue costs that issue, not its repository.
+        expect(counters.sweepReposDeferred ?? 0).toBe(0)
+      })
+    })
+
+    it('completes inside its deadline when one repository is pathologically slow', async () => {
+      const slowIssues = [71, 72, 73, 74, 75]
+      const mount = new HangingReadMount([['pear', 70], ...slowIssues.map((number): [string, number] => ['hoopsheet', number])])
+      for (const number of slowIssues) mount.hanging.add(issuePathFor('hoopsheet', number))
+
+      await withFactory(mount, async (factory) => {
+        const startedAtMs = Date.now()
+        const report = await factory.runOnce()
+        const elapsedMs = Date.now() - startedAtMs
+
+        expect(elapsedMs).toBeLessThan(SWEEP_BUDGET_MS)
+        expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor('pear', 70)])
+        // Three reads are abandoned in flight and spend the 600 ms repository
+        // budget. (The third is cut short by the per-read budget or by what is
+        // left of the repository's, depending on timer slack; either way it
+        // is abandoned.) The last two are deferred WITHOUT being issued: no new
+        // load on a repository the sweep has already stopped waiting on.
+        const slowReads = mount.reads.filter((path) => slowIssues.some((number) => path === issuePathFor('hoopsheet', number)))
+        expect(slowReads).toHaveLength(3)
+        const counters = factory.status().counters
+        expect(counters.sweepReadTimeouts).toBe(3)
+        expect(counters.sweepIssuesDeferred).toBe(5)
+        expect(counters.sweepReposDeferred).toBe(1)
+        expect(counters['sweepReposDeferred:repo-budget']).toBe(1)
+        expect(report.skipped.filter((entry) => entry.reason === 'sweep read deferred (repo-budget)').length)
+          .toBeGreaterThanOrEqual(2)
+      })
+    })
+
+    it('still fails the sweep when every repository listing times out', async () => {
+      const mount = new HangingReadMount([['pear', 70], ['hoopsheet', 71]])
+      mount.hanging.add(indexPathFor('pear'))
+      mount.hanging.add(indexPathFor('hoopsheet'))
+
+      await withFactory(mount, async (factory, fleet) => {
+        await expect(factory.runOnce()).rejects.toMatchObject({ name: 'SweepReadBudgetExceededError' })
+        expect(fleet.spawns).toEqual([])
+      })
+    })
+
+    it('publishes the read budgets and their counters on the heartbeat and its health projection', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-sweep-read-heartbeat-'))
+      const heartbeatPath = join(root, 'heartbeat.json')
+      const factory = createFactory(config({
+        loop: { heartbeatPath, registryPath: join(root, 'registry.json'), heartbeatStaleMs: 1_000 },
+      }), { mount: new FakeMountClient(), fleet: new FakeFleetClient(), triage: new StaticTriage() })
+      try {
+        await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+        const heartbeat = await readFactoryLoopHeartbeat(heartbeatPath)
+        const expected = {
+          readTimeouts: 0,
+          reposDeferred: 0,
+          issuesDeferred: 0,
+          readBudgetMs: 60_000,
+          repoBudgetMs: 180_000,
+          readPhaseBudgetMs: 900_000,
+        }
+        expect(heartbeat?.sweepReads).toMatchObject(expected)
+        expect(heartbeat?.health?.sweepReads).toMatchObject(expected)
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    })
+  })
+
   it('heals a stale durable GitHub tree cache from the current issue index before remote dispatch', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-github-index-cache-heal-'))
     const indexPath = '/github/repos/AgentWorkforce/pear/issues/_index.json'

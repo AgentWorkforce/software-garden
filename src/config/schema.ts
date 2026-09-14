@@ -70,27 +70,39 @@ export const DEFAULT_READINESS_RECONCILE_TIMEOUT_MS = 90 * 60_000
 /**
  * Aggregate budget for one discovery sweep (#372), when nothing narrows it.
  *
- * Equal to `DEFAULT_READINESS_RECONCILE_TIMEOUT_MS` on purpose — and a config
- * that omits `sweepBudgetMs` tracks whatever `reconcileTimeoutMs` it set, not
- * this constant (see `resolvedSweepBudgetMs`). The two numbers describe the
- * same envelope; what changes is the MECHANISM, and the mechanism is the
- * deliverable. `reconcileTimeoutMs` rejects the caller's wait
- * and leaves `runOnce()` running, so every later cycle coalesces onto the
- * wedged pass and the daemon never recovers. The sweep budget rejects from
- * inside the fence, so the lease is released and the next cycle starts clean.
+ * 30 minutes, and deliberately NOT the 90-minute reconcile timeout any more
+ * (#376). A bound that outlives the process it runs in cannot fire, and fails
+ * silently. The deployment's own bars sit below 90 minutes:
  *
- * Shipping it equal keeps this change free of new timing risk: no sweep that
- * survives today is killed by it. Tightening it is a separate, evidence-driven
- * decision with a real cost — the sweep commits its checkpoint only at the end,
- * so a budget below realistic cold-mirror hydration (#36 measured 61 minutes in
- * production) converts a slow boot into a loop that never makes progress,
- * which is the same trap `reconcileTimeoutMs` documents above. That is why this
- * is a config dial and not a constant.
+ *   - the sweep is reported `stalled` after `READINESS_RECONCILE_STALL_INTERVALS`
+ *     (10) intervals, which is 50 minutes at a 300 s interval;
+ *   - three consecutive container lifetimes were measured at 50.6 and 78.1
+ *     minutes, with the shortest-lived sweep killed 47.3 minutes in;
+ *   - a container's first progress receipt, which only a COMMITTED sweep
+ *     produces, is granted 75 minutes of startup grace.
+ *
+ * No 90-minute sweep ever reached its own deadline in those measurements. 30
+ * minutes sits below every one of those bars. It is also the same value as
+ * `agentlessHoldTimeoutMs`, the bound measured firing reliably on the same
+ * daemon.
+ *
+ * The cold-mirror concern that set 90 minutes (#36, 61 minutes) cuts the other
+ * way now. A sweep longer than the container's life never committed under the
+ * 90-minute budget either. The per-read, per-repository and read-phase budgets
+ * (`sweep-read-budget.ts`) let a slow sweep defer its slow repositories and
+ * commit instead of running until the process dies. A deployment that really
+ * needs a longer sweep still sets `sweepBudgetMs` explicitly, up to
+ * `reconcileTimeoutMs`.
  */
-export const DEFAULT_DISCOVERY_SWEEP_BUDGET_MS = DEFAULT_READINESS_RECONCILE_TIMEOUT_MS
+export const DEFAULT_DISCOVERY_SWEEP_BUDGET_MS = 30 * 60_000
 
 /**
  * The effective budget for a config, given what it did or did not set.
+ *
+ * Never looser than the wait (`reconcileTimeoutMs`): a budget the wait gives
+ * up on first is not a budget. An omitted budget is the default above, capped
+ * by that wait, so a config that tightened `reconcileTimeoutMs` below 30
+ * minutes still parses and gets its own tighter value.
  *
  * Exported so the orchestrator's field initializer and the schema agree on one
  * rule rather than two that happen to match today.
@@ -98,7 +110,7 @@ export const DEFAULT_DISCOVERY_SWEEP_BUDGET_MS = DEFAULT_READINESS_RECONCILE_TIM
 export const resolvedSweepBudgetMs = (
   sweepBudgetMs: number | undefined,
   reconcileTimeoutMs: number,
-): number => Math.min(sweepBudgetMs ?? reconcileTimeoutMs, reconcileTimeoutMs)
+): number => Math.min(sweepBudgetMs ?? DEFAULT_DISCOVERY_SWEEP_BUDGET_MS, reconcileTimeoutMs)
 
 const liveSubscriptionSchema = z.object({
   transport: z.enum(['subscribe-and-poll', 'subscribe', 'poll']).default('subscribe-and-poll'),
@@ -159,12 +171,11 @@ const liveSubscriptionSchema = z.object({
   }
 }).transform((value) => ({
   ...value,
-  // Derived from the SIBLING, never from a constant. A fixed 90-minute default
-  // would reject every config that already tightened `reconcileTimeoutMs`
-  // below it — the schema throws, so Factory would not start — and would
-  // silently cap every config that loosened it above. "Omitted" means "the
-  // same envelope as the wait", whatever that wait is configured to be.
-  sweepBudgetMs: value.sweepBudgetMs ?? value.reconcileTimeoutMs,
+  // Resolved, never copied from a constant: a fixed default above a config's
+  // tightened `reconcileTimeoutMs` would fail the cross-field check and stop
+  // Factory from starting. `resolvedSweepBudgetMs` caps the default by the
+  // wait, so such a config still parses and gets its own tighter value (#376).
+  sweepBudgetMs: resolvedSweepBudgetMs(value.sweepBudgetMs, value.reconcileTimeoutMs),
 })).default({})
 
 export const DEFAULT_AGENT_HOLD_TIMEOUT_MS = 4 * 60 * 60_000
