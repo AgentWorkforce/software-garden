@@ -67,6 +67,7 @@ import type {
 import type {
   BatchSnapshot,
   BabysitterSessionState,
+  DispatchAttemptState,
   DispatchLifecycleAgentUsage,
   DispatchLifecycle,
   DispatchLifecycleClaim,
@@ -1064,6 +1065,8 @@ export class FactoryLoop implements Factory {
   readonly #slackReporterUserIds = new Map<string, string | undefined>()
   readonly #slackReporterUserIdLookups = new Map<string, Promise<string | undefined>>()
   readonly #reconciledGithubInProgress = new Set<string>()
+  /** Work units whose retry-limit park has already been written back by this process. */
+  readonly #dispatchParkAnnounced = new Set<string>()
   #resolvedSlackChannelDir?: string
   #slackChannelDirRefresh?: Promise<string | undefined>
   // Agents we've already logged an ambiguous-PID-lookup warning for, so the
@@ -4194,7 +4197,7 @@ export class FactoryLoop implements Factory {
           Boolean(labels && hasGardenLifecycleLabel(labels, 'in-progress')) &&
           !(labels && hasGardenLifecycleLabel(labels, 'human-review'))
         if (!mayRecoverGithubOrphan) {
-          const dispatchBlock = await this.#dispatchBlockReason(issue)
+          const dispatchBlock = await this.#sweepDispatchBlockReason(issue)
           if (dispatchBlock) {
             recordSkip({ issue: issueRef(issue), ...dispatchBlock })
             continue
@@ -4216,7 +4219,7 @@ export class FactoryLoop implements Factory {
         }
         if (!wasReady && !recoveredOrphan) {
           if (mayRecoverGithubOrphan) {
-            const dispatchBlock = await this.#dispatchBlockReason(issue)
+            const dispatchBlock = await this.#sweepDispatchBlockReason(issue)
             if (dispatchBlock) {
               recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
@@ -4236,7 +4239,7 @@ export class FactoryLoop implements Factory {
         let attemptPhase: DispatchAttemptPhase = 'gate'
         try {
           if (recoveredOrphan) {
-            const dispatchBlock = await this.#dispatchBlockReason(issue)
+            const dispatchBlock = await this.#sweepDispatchBlockReason(issue)
             if (dispatchBlock) {
               recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
@@ -5006,16 +5009,28 @@ export class FactoryLoop implements Factory {
     }
 
     try {
+      // Recovery never refunds the attempt budget. It used to zero `attempts`
+      // whenever the latch was terminal, which made `dispatch.maxAttempts` a
+      // per-recovery limit: a unit whose dispatch kept dying was released to
+      // ready and re-dispatched after every crash, restart or abandon, each
+      // time on freshly placed workers. Only a human reopen
+      // (`#clearTerminalRefusals`) refunds it. A unit that has spent its
+      // budget parks here, with a writeback saying so, instead of re-entering
+      // the dispatch queue.
+      const attemptKey = issueStateKey(issue)
+      const attempt = await this.#state.getDispatchAttempts(this.#workspaceId, attemptKey)
+      if (attempt && this.#dispatchAttemptsExhausted(attempt)) {
+        return await this.#parkExhaustedGithubOrphan(issue, identity, providerStatus, attempt)
+      }
       if (providerStatus === 'in-progress') {
         await this.#githubWriteback.setStatus(issue, 'ready')
       }
       // A crashed dispatch may leave its durable attempt marked in-flight even
       // after every agent and lifecycle disappeared. Only clear that stale bit
       // after all provider, agent, lifecycle, and open-PR safety checks pass.
-      const attempt = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(issue))
       if (attempt?.terminal) {
-        await this.#state.recordDispatchAttempt(this.#workspaceId, issueStateKey(issue), {
-          attempts: 0,
+        await this.#state.recordDispatchAttempt(this.#workspaceId, attemptKey, {
+          attempts: attempt.attempts,
           inFlight: false,
           terminal: false,
           backoffUntilMs: 0,
@@ -6101,7 +6116,10 @@ export class FactoryLoop implements Factory {
       throw error
     }
     if (!durableDispatch) this.#consumePendingDispatchClarifications(dispatchDecision.issue)
-    await this.#recordDispatchAttempt(dispatchDecision.issue)
+    // A dry run places nothing, so it spends nothing. Now that the budget is
+    // durable, charging it here would let `dispatch --dry-run` exhaust a real
+    // work unit's retries from another process.
+    if (!dryRun) await this.#recordDispatchAttempt(dispatchDecision.issue)
     const record = recoveredRecord ?? batch.start(dispatchDecision, dryRun, dependencyAdmission)
     if (!record) {
       if (!dryRun) {
@@ -9201,6 +9219,16 @@ export class FactoryLoop implements Factory {
       }
     }
     const agents: DispatchResult['agents'] = []
+    // A resume re-places every worker it cannot adopt, and its failures re-arm
+    // the lifecycle retry without limit. Without a charge here a unit whose
+    // workers kept dying was re-placed, and its dispatch comment re-posted, on
+    // every retry. One charge per resume that places anything fresh.
+    let placementCharged = false
+    const chargePlacement = async (): Promise<void> => {
+      if (placementCharged) return
+      await this.#chargeResumedPlacement(record.issue)
+      placementCharged = true
+    }
     const specs = dispatchSpecs(record.decision)
     const plannedNames = new Set(specs.map((spec) => spec.name))
     for (const tracked of record.agents.values()) {
@@ -9232,7 +9260,14 @@ export class FactoryLoop implements Factory {
         if (tracked?.result) agents.push({ name: tracked.result.name, role: spec.role })
         continue
       }
-      const spawned = await this.#spawnAgent(record, spec, record.dryRun)
+      let spawned: { name: string }
+      try {
+        spawned = await this.#spawnAgent(record, spec, record.dryRun, { beforeFreshPlacement: chargePlacement })
+      } catch (error) {
+        if (!(error instanceof DispatchRetryLimitReachedError)) throw error
+        await this.#parkExhaustedResume(record, liveIssue, error.attempts)
+        return
+      }
       agents.push({ name: spawned.name, role: spec.role })
     }
     const comment = dispatchComment(record.decision, agents)
@@ -10840,6 +10875,129 @@ export class FactoryLoop implements Factory {
     await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
   }
 
+  #dispatchAttemptsExhausted(state: { attempts: number }): boolean {
+    return state.attempts >= this.#config.dispatch.maxAttempts
+  }
+
+  /**
+   * `#dispatchBlockReason` for the readiness sweep, which holds the full issue
+   * and can therefore tell it why dispatch stopped. The latch fires once, so
+   * `dispatch-retry-limit` is returned on exactly the pass that parks the unit.
+   */
+  async #sweepDispatchBlockReason(
+    issue: LinearIssue,
+  ): Promise<{ reason: string; code: FactorySweepSkipReasonCode } | undefined> {
+    const block = await this.#dispatchBlockReason(issue)
+    if (block?.code === 'dispatch-retry-limit') {
+      const state = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(issue))
+      await this.#announceDispatchParked(issue, state?.attempts ?? this.#config.dispatch.maxAttempts)
+    }
+    return block
+  }
+
+  /**
+   * Park an orphaned in-progress GitHub issue whose dispatch budget is spent.
+   *
+   * Every safety check recovery runs (no live agent, no durable lifecycle, no
+   * open PR) has already passed, so nothing owns the issue and clearing its
+   * stale in-progress label is truthful. The attempt latch is written FIRST:
+   * if it cannot be recorded the park aborts before the label moves, because a
+   * released label over an unlatched budget is exactly the re-dispatch this
+   * prevents.
+   */
+  async #parkExhaustedGithubOrphan(
+    issue: LinearIssue,
+    identity: string,
+    providerStatus: GithubIssueStatus,
+    attempt: DispatchAttemptState,
+  ): Promise<GithubOrphanRecoveryResult> {
+    await this.#state.recordDispatchAttempt(this.#workspaceId, issueStateKey(issue), {
+      attempts: attempt.attempts,
+      inFlight: false,
+      terminal: true,
+      backoffUntilMs: 0,
+    })
+    if (providerStatus === 'in-progress') {
+      await this.#githubWriteback.setStatus(issue, 'ready')
+    }
+    // The mounted snapshot can still show the old label for a pass; let the
+    // sweep read it as ready so the terminal latch, not recovery, refuses it.
+    this.#reconciledGithubInProgress.add(identity)
+    this.#increment('githubOrphanRecoveriesParkedRetryLimit')
+    this.#logger.warn?.('[factory] parked orphaned GitHub in-progress issue: dispatch retry limit reached', {
+      issue: issue.key,
+      attempts: attempt.attempts,
+      maxAttempts: this.#config.dispatch.maxAttempts,
+    })
+    await this.#announceDispatchParked(issue, attempt.attempts)
+    return { recovered: false, reason: 'dispatch retry limit reached; parked instead of redispatching' }
+  }
+
+  /**
+   * Charge the durable budget for a resumed dispatch that is about to place a
+   * fresh worker. A resume that only adopts live workers costs nothing, so an
+   * ordinary restart never burns budget; one that re-places workers is a
+   * re-dispatch and pays like one. Refuses, before any placement, once the
+   * budget is spent.
+   */
+  async #chargeResumedPlacement(issue: IssueRef): Promise<void> {
+    const state = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(issue))
+    if (state && this.#dispatchAttemptsExhausted(state)) {
+      throw new DispatchRetryLimitReachedError(issue.key, state.attempts)
+    }
+    await this.#recordDispatchAttempt(issue)
+  }
+
+  async #parkExhaustedResume(record: InFlightIssue, issue: LinearIssue | undefined, attempts: number): Promise<void> {
+    // Latch before the teardown: if the abandon cannot finish, the retry that
+    // follows is refused again at the same point instead of placing workers.
+    await this.#recordDispatchTerminal(record.issue)
+    this.#increment('dispatchResumesParkedRetryLimit')
+    this.#logger.warn?.('[factory] refused to re-place a resumed dispatch: dispatch retry limit reached', {
+      issue: record.issue.key,
+      attempts,
+      maxAttempts: this.#config.dispatch.maxAttempts,
+    })
+    await this.#abandonDurableResume(record, 'dispatch retry limit reached')
+    if (issue) await this.#announceDispatchParked(issue, attempts)
+  }
+
+  /**
+   * Tell the issue, once, that Factory stopped re-dispatching it.
+   *
+   * Deduplicated per process, and on GitHub also against the provider's own
+   * comments, so neither a sweep that sees the park again nor a restart
+   * repeats it. Best-effort by design: the park is the durable latch, and a
+   * failed comment must never un-park or abort the sweep.
+   */
+  async #announceDispatchParked(issue: LinearIssue, attempts: number): Promise<void> {
+    const key = issueStateKey(issue)
+    if (this.#dispatchParkAnnounced.has(key)) return
+    const github = isGithubIssue(issue)
+    try {
+      if (
+        github &&
+        this.#githubWriteback.hasCommentMarker &&
+        await this.#githubWriteback.hasCommentMarker(issue, DISPATCH_PARKED_COMMENT_MARKER)
+      ) {
+        this.#dispatchParkAnnounced.add(key)
+        return
+      }
+      await this.#postIssueComment(
+        issue,
+        dispatchParkedComment(attempts, this.#config.dispatch.maxAttempts, github),
+      )
+      this.#dispatchParkAnnounced.add(key)
+      this.#increment('dispatchParkedWritebacks')
+    } catch (error) {
+      this.#increment('dispatchParkedWritebackFailures')
+      this.#logger.warn?.('[factory] could not write back a dispatch retry-limit park', {
+        issue: issue.key,
+        error: describeError(error).errorMessage,
+      })
+    }
+  }
+
   /**
    * The lifecycle role a work unit is in, from whichever surface described it.
    *
@@ -11151,6 +11309,8 @@ export class FactoryLoop implements Factory {
       dispatchState.terminal = false
       dispatchState.backoffUntilMs = 0
       await this.#state.recordDispatchAttempt(this.#workspaceId, attemptKey, dispatchState)
+      // A refunded budget can be spent and parked again; that park is news.
+      this.#dispatchParkAnnounced.delete(attemptKey)
       reopened = true
     }
     // Match on the work unit, not the surface key: a completed Linear mirror
@@ -11959,6 +12119,11 @@ export class FactoryLoop implements Factory {
     adoptOnly?: boolean
     /** Roster read shared with the admission pass that follows this one. */
     roster?: RosterHandoff
+    /**
+     * Runs once a live worker could not be adopted and a fresh one is about to
+     * be placed, before any node is chosen or provisioned. May throw to refuse.
+     */
+    beforeFreshPlacement?: () => Promise<void>
   } = {}): Promise<{ name: string }> {
     const { placement, adoptOnly = false } = options
     const batch = await this.#batch()
@@ -12015,6 +12180,8 @@ export class FactoryLoop implements Factory {
     }
 
     if (adoptOnly) return { name: spec.name }
+
+    await options.beforeFreshPlacement?.()
 
     if (this.#fleet.placementLocality === 'remote') {
       const loads = new Map<string, number>()
@@ -22149,6 +22316,31 @@ export function isDispatchableIssue(issue: LinearIssue): boolean {
   const hasStableIdentity = Boolean(sourceId?.trim()) || (Number.isInteger(number) && (number ?? 0) > 0)
   return Boolean(issue.uuid.trim() && issue.key.trim() && hasStableIdentity && url?.trim())
 }
+
+/**
+ * A resumed dispatch was about to place a fresh worker, but the work unit has
+ * already spent its durable `dispatch.maxAttempts` budget. Thrown before any
+ * placement, so nothing is provisioned for the refused attempt.
+ */
+class DispatchRetryLimitReachedError extends Error {
+  constructor(readonly issueKey: string, readonly attempts: number) {
+    super(`Refusing to re-place agents for ${issueKey}: dispatch retry limit reached after ${attempts} attempts`)
+    this.name = 'DispatchRetryLimitReachedError'
+  }
+}
+
+/** Marks the one park writeback per work unit, so a restart can find it instead of repeating it. */
+const DISPATCH_PARKED_COMMENT_MARKER = '<!-- garden:dispatch-parked -->'
+
+const dispatchParkedComment = (attempts: number, maxAttempts: number, github: boolean): string => [
+  ...(github ? [DISPATCH_PARKED_COMMENT_MARKER] : []),
+  `Factory stopped re-dispatching this issue. It has been dispatched ${attempts} ` +
+    `time${attempts === 1 ? '' : 's'} without finishing, which reaches the configured limit ` +
+    `(\`dispatch.maxAttempts\` = ${maxAttempts}).`,
+  '',
+  'Nothing is running for it now. Once the cause is fixed, close and reopen the issue ' +
+    '(or move it through human review and back to ready) to give it a fresh attempt budget.',
+].join('\n')
 
 const isGithubIssue = (issue: LinearIssue): boolean => {
   const wrapper = asRecord(issue.raw)

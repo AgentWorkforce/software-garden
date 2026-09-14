@@ -4,14 +4,31 @@ import type {
   BabysitterSessionState,
   ConversationSessionState,
   DiscoverySweepState,
+  DispatchAttemptState,
   DispatchLifecycle,
   GithubIssueCommentWatchState,
   SlackThreadWatchState,
   WaitingClarification,
 } from '../ports/state'
 
+/**
+ * The durable half of `DispatchAttemptState`. `inFlight` is deliberately
+ * absent: it is one process's "a dispatch of mine is mid-flight" guard, and the
+ * durable lifecycle lease is what fences other instances. Persisted, it would
+ * leak one instance's guard into another, and a crash mid-dispatch would leave
+ * the unit refused as in-flight with no process left to clear it.
+ */
+export type PersistedDispatchAttemptState = Omit<DispatchAttemptState, 'inFlight'>
+
 export type PersistedWorkspaceState = {
   dependencyParks?: Record<string, DependencyParkState>
+  /**
+   * The per-work-unit dispatch attempt budget. Optional so documents written
+   * before it existed still parse, and so a workspace that never dispatched
+   * keeps its exact bytes. It must be durable: kept in process memory, every
+   * restart handed each work unit a fresh `dispatch.maxAttempts`.
+   */
+  dispatchAttempts?: Record<string, PersistedDispatchAttemptState>
   githubIssueCommentWatches: Record<string, GithubIssueCommentWatchState>
   slackThreadWatches: Record<string, SlackThreadWatchState>
   waitingClarifications: Record<string, WaitingClarification>

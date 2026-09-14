@@ -6514,6 +6514,248 @@ describe('FactoryLoop', () => {
     }
   })
 
+  it('keeps the durable attempt count when orphan recovery clears a terminal latch', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-keeps-attempts-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 61)
+      const content = githubIssueFile(61, { labels: ['factory', 'pear', 'factory:in-progress'] })
+      const mount = new FakeMountClient({ [path]: content })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, content)
+      // One attempt spent, latched terminal by an abandon path, budget of two.
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+        attempts: 1,
+        inFlight: false,
+        terminal: true,
+        backoffUntilMs: 0,
+      })
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched.map((result) => result.issue.key)).toEqual(['61'])
+      // Recovery used to zero the count here, so this read 1: a fresh budget.
+      await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toMatchObject({
+        attempts: 2,
+        terminal: false,
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('parks an orphan that spent its dispatch budget before a restart, with one writeback', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-parks-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 62)
+      const content = githubIssueFile(62, { labels: ['factory', 'pear', 'factory:in-progress'] })
+      const mount = new FakeMountClient({ [path]: content })
+      mount.setSubRoot('/linear/issues', 'absent')
+      const fleet = new FakeFleetClient()
+      const githubWriteback = new RecordingGithubWriteback()
+      const watchStatePath = join(root, 'state.json')
+      const issue = parseGithubFactoryIssue(path, content)
+      // The process that spent the budget is gone; only its state file remains.
+      await new FileStateStore({ batchSize: 4, watchStatePath }).recordDispatchAttempt(
+        'factory-test',
+        issueKey(issue),
+        { attempts: 2, inFlight: true, terminal: false, backoffUntilMs: 0 },
+      )
+      const stateStore = new FileStateStore({ batchSize: 4, watchStatePath })
+      const restarted = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath: join(root, 'registry.json') },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrGhRunner: async () => ({ stdout: '[]' }),
+      })
+
+      const report = await restarted.runOnce()
+      await restarted.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(fleet.spawns).toEqual([])
+      // The stale claim is cleared, but nothing re-claims it.
+      expect(githubWriteback.statuses).toEqual([{ key: '62', status: 'ready' }])
+      expect(githubWriteback.comments).toHaveLength(1)
+      expect(githubWriteback.comments[0]).toMatchObject({ key: '62' })
+      expect(githubWriteback.comments[0]!.body).toContain('<!-- garden:dispatch-parked -->')
+      expect(githubWriteback.comments[0]!.body).toContain('`dispatch.maxAttempts` = 2')
+      await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toMatchObject({
+        attempts: 2,
+        terminal: true,
+      })
+      expect(restarted.status().counters.githubOrphanRecoveriesParkedRetryLimit).toBe(1)
+      expect(restarted.status().counters.githubOrphanedInProgressRecovered).toBeUndefined()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('parks a ready issue on the sweep that spends its budget, and writes back once', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 63)
+    const content = githubIssueFile(63, { labels: ['factory', 'pear'] })
+    const mount = new FakeMountClient({ [path]: content })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const issue = parseGithubFactoryIssue(path, content)
+    await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+      attempts: 2,
+      inFlight: false,
+      terminal: false,
+      backoffUntilMs: 0,
+    })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce()
+    await factory.runOnce()
+
+    expect(fleet.spawns).toEqual([])
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]!.body).toContain('Factory stopped re-dispatching this issue')
+    await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toMatchObject({
+      attempts: 2,
+      terminal: true,
+    })
+  })
+
+  it('never re-dispatches a live claim, even with attempt budget left', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-orphan-live-claim-budget-'))
+    try {
+      const path = githubIssuePath('AgentWorkforce', 'pear', 64)
+      const registryPath = join(root, 'registry.json')
+      const ref = { uuid: 'AgentWorkforce/pear#64', key: '64', path }
+      await writeFile(registryPath, JSON.stringify({
+        pid: process.pid,
+        updatedAt: new Date().toISOString(),
+        updatedAtMs: Date.now(),
+        agents: [{ name: 'ar-64-impl-pear', role: 'implementer', issue: ref, pids: [] }],
+      }))
+      const content = githubIssueFile(64, { labels: ['factory', 'pear', 'factory:in-progress'] })
+      const mount = new FakeMountClient({ [path]: content })
+      const fleet = new FakeFleetClient()
+      fleet.hydrateTracked([{ name: 'ar-64-impl-pear' }])
+      const githubWriteback = new RecordingGithubWriteback()
+      const stateStore = new InMemoryStateStore({ batchSize: 4 })
+      const issue = parseGithubFactoryIssue(path, content)
+      const budget = { attempts: 1, inFlight: false, terminal: true, backoffUntilMs: 0 }
+      await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), budget)
+      const factory = createFactory(config({
+        issueSource: 'github',
+        loop: { registryPath },
+      }), {
+        mount,
+        fleet,
+        stateStore,
+        triage: new StaticTriage(),
+        githubWriteback,
+        probePrResolver: async () => undefined,
+      })
+
+      const report = await factory.runOnce()
+
+      expect(report.dispatched).toEqual([])
+      expect(fleet.spawns).toEqual([])
+      expect(githubWriteback.statuses).toEqual([])
+      expect(githubWriteback.comments).toEqual([])
+      expect(factory.status().counters.githubOrphanRecoveriesBlockedActive).toBe(1)
+      // Neither refunded nor spent: the live owner keeps the unit.
+      await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toEqual(budget)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('bounds a resumed dispatch that keeps failing across a restart, then parks it', async () => {
+    const number = 65
+    const path = githubIssuePath('AgentWorkforce', 'pear', number)
+    const content = githubIssueFile(number, { labels: ['factory'] })
+    const mount = new FakeMountClient({ [path]: content })
+    const fleet = new DurableSpawnFailingFleetClient()
+    const root = await mkdtemp(join(tmpdir(), `factory-bounded-resume-${number}-`))
+    const watchStatePath = join(root, 'state.json')
+    const state = () => new FileStateStore({ batchSize: 2, watchStatePath })
+    const dispatchConfig = config({ issueSource: 'github', dispatch: { errorCooldownMs: 0, maxAttempts: 2 } })
+    const first = createFactory(dispatchConfig, {
+      mount,
+      fleet,
+      stateStore: state(),
+      triage: new StaticTriage(),
+      githubWriteback: new RecordingGithubWriteback(),
+      // Keep the first process from retrying; the restart does it.
+      dispatchLifecycleRetryMs: 60_000,
+    })
+    const githubWriteback = new RecordingGithubWriteback()
+    let restarted: ReturnType<typeof createFactory> | undefined
+    try {
+      const issue = parseGithubFactoryIssue(path, content)
+      await first.dispatch(await first.triageIssue(issue)).catch(() => undefined)
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(issue)))
+        .resolves.toMatchObject({ phase: 'retryable' })
+      await expect(state().getDispatchAttempts('factory-test', issueKey(issue)))
+        .resolves.toMatchObject({ attempts: 1, terminal: false })
+      await first.stop()
+
+      restarted = createFactory(dispatchConfig, {
+        mount,
+        fleet,
+        stateStore: state(),
+        triage: new StaticTriage(),
+        githubWriteback,
+        dispatchLifecycleRetryMs: 10,
+      })
+      await restarted.start({ mode: 'dispatch-owner' })
+
+      await vi.waitFor(async () => expect(await state().getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(issue),
+      )).toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+      // Give an unbounded retry loop time to show itself.
+      await new Promise((resolve) => setTimeout(resolve, 200))
+
+      // One placement per attempt: the first dispatch's, then the first
+      // resume's (it adopts what it can and places the rest). The second
+      // resume is refused before it places anything.
+      expect(fleet.spawns).toHaveLength(2)
+      await expect(state().getDispatchLifecycle('factory-test', dispatchIssueIdentity(issue)))
+        .resolves.toMatchObject({ releaseReason: 'dispatch retry limit reached' })
+      await expect(state().getDispatchAttempts('factory-test', issueKey(issue)))
+        .resolves.toMatchObject({ attempts: 2, terminal: true })
+      expect(restarted.status().counters.dispatchResumesParkedRetryLimit).toBe(1)
+      expect(githubWriteback.comments.filter((comment) =>
+        comment.body.includes('<!-- garden:dispatch-parked -->'))).toHaveLength(1)
+    } finally {
+      await restarted?.stop()
+      await first.stop()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('shares historical PR reads across orphan candidates in the discovery sweep', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-probe-cache-'))
     const run = async (watermark: string | undefined) => {
