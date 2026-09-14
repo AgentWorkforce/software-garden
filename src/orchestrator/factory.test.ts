@@ -23140,6 +23140,49 @@ describe('FactoryLoop', () => {
       expect(publishInputs).toEqual([])
       expect(factory.status().counters.sandboxPushesPushed).toBe(1)
     })
+
+    // The connection's publish path posts the late attestation grant, and an
+    // adopted receipt never reaches it — so adoption must post it itself.
+    it('posts the attestation grant for an adopted PR, with the implementer session', async () => {
+      const grants: Array<{ url: string; body: Record<string, unknown> }> = []
+      vi.stubEnv('RELAYAUTH_URL', 'https://auth.example.test')
+      vi.stubEnv('RELAY_ATTEST_API_KEY', 'test-key')
+      vi.stubEnv('RELAY_ATTEST_AGENT_ID', 'agent-test')
+      vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+        grants.push({ url: String(url), body: JSON.parse(String(init.body)) as Record<string, unknown> })
+        return new Response('{}', { status: 200 })
+      }))
+      try {
+        const fleet = new RemoteFleetClient()
+        fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+        const factory = createFactory(config(), {
+          mount: probingMount([]),
+          fleet,
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: {
+            push: async (input) => ({
+              status: 'pushed',
+              branch: input.branch,
+              prUrl: 'https://github.com/AgentWorkforce/pear/pull/1093',
+              commitSha: 'commit-1093',
+            }),
+          },
+        })
+
+        await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+        fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+        await vi.waitFor(() => expect(factory.status().counters.githubPullRequestsPublished).toBe(1))
+
+        expect(grants).toEqual([{
+          url: 'https://auth.example.test/v1/attestations/grants',
+          body: { agentId: 'agent-test', repo: 'AgentWorkforce/pear', late: true, sessionRef: 'session-impl-93' },
+        }])
+      } finally {
+        vi.unstubAllEnvs()
+        vi.unstubAllGlobals()
+      }
+    })
   })
 
   it('does not complete on an implementer exit when only a draft PR exists', async () => {

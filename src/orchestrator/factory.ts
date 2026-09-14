@@ -34,6 +34,7 @@ import {
 } from '../constants/lifecycle-labels'
 import { stateResolutionFromIds, type FactoryStateResolution } from '../linear/state-resolver'
 import { GhCliGithubMergeGate, MountedGithubMergeGate, closeProbePr, type GhRunner, type GithubMergeGate as GithubMergeGatePort } from '../github'
+import { postAttestationGrant } from '../github/attestation-grant'
 import {
   factoryGithubIssueCommentDraftName,
   isFactoryGithubIssueCommentDraftName,
@@ -13086,6 +13087,13 @@ export class FactoryLoop implements Factory {
         headSha: sandboxPush.commitSha,
         author: identity,
       }
+      // The connection's publish path posts the late attestation grant; this
+      // path skips that call, so post it here with the same precedence
+      // (per-agent session first) and the same best-effort semantics.
+      await postAttestationGrant(
+        repo,
+        implementer.sessionRef ?? (process.env.RELAY_ATTEST_SESSION_ID || undefined),
+      ).catch(() => undefined)
       this.#publishedPullRequests.set(key, adopted)
       this.#increment('githubPullRequestsPublished')
       this.#logger.info?.('[factory] published PR through the GitHub App sandbox push', {
