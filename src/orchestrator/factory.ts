@@ -10822,8 +10822,11 @@ export class FactoryLoop implements Factory {
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
       // A dry run places nothing and must change nothing: it reports the limit
       // without latching it, so `dispatch --dry-run` sharing a state file can
-      // never park a real unit.
-      if (opts.dryRun) return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
+      // never park a real unit. Callers without a per-run mode (issue events)
+      // inherit the factory's configured one.
+      if (opts.dryRun ?? this.#config.dryRun) {
+        return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
+      }
       state.terminal = true
       await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
       return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
@@ -10925,12 +10928,24 @@ export class FactoryLoop implements Factory {
     dryRun: boolean,
   ): Promise<{ reason: string; code: FactorySweepSkipReasonCode } | undefined> {
     const block = await this.#dispatchBlockReason(issue, { dryRun })
-    // A dry run reports the limit without latching it, so it has nothing to
-    // announce; and a unit another instance may still be running is not
-    // announced as idle (see `#dispatchMayBeLiveElsewhere`).
-    if (block?.code === 'dispatch-retry-limit' && !dryRun && !await this.#dispatchMayBeLiveElsewhere(issue)) {
+    if (
+      !dryRun &&
+      (block?.code === 'dispatch-retry-limit' || block?.code === 'dispatch-terminal') &&
+      // Only an issue that is asking for work and being refused is parked;
+      // an in-progress or finished one is somebody else's story.
+      this.#isIssueReady(issue)
+    ) {
       const state = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(issue))
-      await this.#announceDispatchParked(issue, state?.attempts ?? this.#config.dispatch.maxAttempts)
+      // Not only on the pass that latches: that pass defers while another
+      // instance may still be running the last attempt, and every later pass
+      // reads `dispatch-terminal`. `#announceDispatchParked` writes back once.
+      if (
+        state &&
+        this.#dispatchAttemptsExhausted(state) &&
+        !await this.#dispatchMayBeLiveElsewhere(issue)
+      ) {
+        await this.#announceDispatchParked(issue, state.attempts)
+      }
     }
     return block
   }
@@ -16138,7 +16153,7 @@ export class FactoryLoop implements Factory {
       this.#increment('githubTriageAnswersIgnoredAlreadyActive')
       return false
     }
-    if (await this.#dispatchBlockReason(record.issue)) {
+    if (await this.#dispatchBlockReason(record.issue, { dryRun: record.dryRun })) {
       this.#increment('githubTriageAnswersIgnoredBlocked')
       return false
     }
@@ -21771,7 +21786,7 @@ export class FactoryLoop implements Factory {
       await this.#state.clearSlackThreadWatch(this.#workspaceId, issueKey(record.issue))
       return
     }
-    if (await this.#dispatchBlockReason(record.issue)) {
+    if (await this.#dispatchBlockReason(record.issue, { dryRun: record.dryRun })) {
       this.#increment('slackTriageAnswersIgnoredBlocked')
       return
     }

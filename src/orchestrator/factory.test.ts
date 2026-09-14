@@ -6678,6 +6678,49 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('never latches a spent budget from an issue event on a dry-run factory', async () => {
+    // The dispatch gate begins by reading the unit's attempts, so that read is
+    // the deterministic signal that the event reached it.
+    class AttemptReadCountingStore extends InMemoryStateStore {
+      readonly readKeys: string[] = []
+      override async getDispatchAttempts(workspaceId: string, key: string) {
+        this.readKeys.push(key)
+        return await super.getDispatchAttempts(workspaceId, key)
+      }
+    }
+    const path = issuePath(68)
+    const mount = new FakeMountClient()
+    const fleet = new FakeFleetClient()
+    const stateStore = new AttemptReadCountingStore({ batchSize: 2 })
+    const issue = parseLinearIssue(path, realIssueFile(68))
+    // A Linear unit's attempt row is keyed by its issue key.
+    const attemptKey = issue.key
+    await stateStore.recordDispatchAttempt('factory-test', attemptKey, {
+      attempts: 2,
+      inFlight: false,
+      terminal: false,
+      backoffUntilMs: 0,
+    })
+    const factory = createFactory(config({ dryRun: true }), { mount, fleet, stateStore, triage: new StaticTriage() })
+
+    await factory.start({ mode: 'live', liveSubscription: { transport: 'subscribe' } })
+    try {
+      mount.files.set(path, { content: realIssueFile(68) })
+      mount.emit(changeEvent(path, 'event-dry-run-68'))
+      await vi.waitFor(() => expect(stateStore.readKeys).toContain(attemptKey), { timeout: 4_000 })
+      // A latch would be the very next write in the same gate; let it land.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(fleet.spawns).toEqual([])
+      await expect(stateStore.getDispatchAttempts('factory-test', attemptKey)).resolves.toMatchObject({
+        attempts: 2,
+        terminal: false,
+      })
+    } finally {
+      await factory.stop()
+    }
+  })
+
   it('refuses a spent budget but does not announce it idle while another instance may run its last attempt', async () => {
     const path = githubIssuePath('AgentWorkforce', 'pear', 67)
     const content = githubIssueFile(67, { labels: ['factory', 'pear'] })
@@ -6732,6 +6775,16 @@ describe('FactoryLoop', () => {
       attempts: 2,
       terminal: true,
     })
+
+    // The other instance's attempt ends and the issue is still asking for
+    // work: the deferred park is written back now, and only once.
+    await stateStore.clearDispatchLifecycle('factory-test', dispatchIssueIdentity(issue))
+    await factory.runOnce()
+    await factory.runOnce()
+
+    expect(fleet.spawns).toEqual([])
+    expect(githubWriteback.comments).toHaveLength(1)
+    expect(githubWriteback.comments[0]!.body).toContain('<!-- garden:dispatch-parked -->')
   })
 
   it('never re-dispatches a live claim, even with attempt budget left', async () => {
@@ -15669,7 +15722,9 @@ describe('FactoryLoop', () => {
         phase: 'abandoned',
         dispatchClaim: expect.not.objectContaining({ cancellationBlocked: true }),
       }), { timeout: 4_000 })
-      expect(factory.status().inFlight).toEqual([])
+      // The in-memory release follows the `abandoned` save and the durable
+      // attempt latch, so it lands a moment after the phase is visible.
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 4_000 })
 
       await factory.stop()
       stopped = true
