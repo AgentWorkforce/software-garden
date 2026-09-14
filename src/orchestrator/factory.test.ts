@@ -6644,6 +6644,96 @@ describe('FactoryLoop', () => {
     })
   })
 
+  it('never latches or announces a spent budget on a dry run', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 66)
+    const content = githubIssueFile(66, { labels: ['factory', 'pear'] })
+    const mount = new FakeMountClient({ [path]: content })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new FakeFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const issue = parseGithubFactoryIssue(path, content)
+    await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+      attempts: 2,
+      inFlight: false,
+      terminal: false,
+      backoffUntilMs: 0,
+    })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+
+    await factory.runOnce({ dryRun: true })
+    await factory.runOnce({ dryRun: true })
+
+    expect(fleet.spawns).toEqual([])
+    expect(githubWriteback.comments).toEqual([])
+    await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toMatchObject({
+      attempts: 2,
+      terminal: false,
+    })
+  })
+
+  it('refuses a spent budget but does not announce it idle while another instance may run its last attempt', async () => {
+    const path = githubIssuePath('AgentWorkforce', 'pear', 67)
+    const content = githubIssueFile(67, { labels: ['factory', 'pear'] })
+    const mount = new FakeMountClient({ [path]: content })
+    mount.setSubRoot('/linear/issues', 'absent')
+    const fleet = new RemoteLifecycleFleetClient()
+    const githubWriteback = new RecordingGithubWriteback()
+    const stateStore = new InMemoryStateStore({ batchSize: 4 })
+    const factory = createFactory(config({ issueSource: 'github' }), {
+      mount,
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+      githubWriteback,
+    })
+    const issue = parseGithubFactoryIssue(path, content)
+    // The shared count is at the limit, but only because another instance is
+    // mid-way through the last attempt: its in-flight bit is not visible here,
+    // its live durable lifecycle is.
+    await stateStore.recordDispatchAttempt('factory-test', issueKey(issue), {
+      attempts: 2,
+      inFlight: false,
+      terminal: false,
+      backoffUntilMs: 0,
+    })
+    await stateStore.claimDispatchLifecycle(
+      'factory-test',
+      dispatchIssueIdentity(issue),
+      {
+        runId: 'other-instance-run-67',
+        issue: { uuid: issue.uuid, key: issue.key, path: issue.path },
+        decision: await factory.triageIssue(issue),
+        dryRun: false,
+        phase: 'running',
+        agents: [],
+        invocationIds: [],
+        updatedAtMs: Date.now(),
+      },
+      'other-instance',
+      Date.now(),
+      60_000,
+    )
+
+    await factory.runOnce()
+
+    expect(fleet.spawns).toEqual([])
+    // "Nothing is running for it now" would be false while the other
+    // instance's lease is live, so the park is not written back here.
+    expect(githubWriteback.comments).toEqual([])
+    // The budget is still spent: nothing new is dispatched either way.
+    await expect(stateStore.getDispatchAttempts('factory-test', issueKey(issue))).resolves.toMatchObject({
+      attempts: 2,
+      terminal: true,
+    })
+  })
+
   it('never re-dispatches a live claim, even with attempt budget left', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-orphan-live-claim-budget-'))
     try {
@@ -14190,7 +14280,9 @@ describe('FactoryLoop', () => {
       await vi.waitFor(async () => expect(
         await stateStore.getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue)),
       ).toMatchObject({ phase: 'abandoned', releaseReason: 'held-past-deadline' }), { timeout: 4_000 })
-      expect(factory.status().heldAgents).toEqual([])
+      // The in-memory release follows the `abandoned` save and the durable
+      // attempt latch, so it lands a moment after the phase is visible.
+      await vi.waitFor(() => expect(factory.status().heldAgents).toEqual([]), { timeout: 4_000 })
       await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith(
         '[factory] released agents held past deadline',
         expect.objectContaining({
@@ -14586,7 +14678,9 @@ describe('FactoryLoop', () => {
         { name: `ar-${number}-impl-pear`, reason: 'held-past-deadline' },
         { name: `ar-${number}-review-pear`, reason: 'held-past-deadline' },
       ]), { timeout: 5_000 })
-      expect(factory.status().inFlight).toEqual([])
+      // The in-memory release follows the durable attempt latch, so it lands a
+      // moment after the releases are observed.
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 4_000 })
 
       await factory.stop()
       stopped = true
@@ -15119,7 +15213,10 @@ describe('FactoryLoop', () => {
         phase: 'abandoned',
         dispatchClaim: expect.not.objectContaining({ cancellationBlocked: true }),
       }), { timeout: 4_000 })
-      expect(factory.status().inFlight).toEqual([])
+      // The `abandoned` save, the durable attempt latch and the in-memory
+      // release are three writes in that order; with a durable attempt store
+      // the release lands a moment after `abandoned` is visible.
+      await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]), { timeout: 4_000 })
 
       await factory.stop()
       stopped = true

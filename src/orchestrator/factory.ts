@@ -4197,7 +4197,7 @@ export class FactoryLoop implements Factory {
           Boolean(labels && hasGardenLifecycleLabel(labels, 'in-progress')) &&
           !(labels && hasGardenLifecycleLabel(labels, 'human-review'))
         if (!mayRecoverGithubOrphan) {
-          const dispatchBlock = await this.#sweepDispatchBlockReason(issue)
+          const dispatchBlock = await this.#sweepDispatchBlockReason(issue, dryRun)
           if (dispatchBlock) {
             recordSkip({ issue: issueRef(issue), ...dispatchBlock })
             continue
@@ -4219,7 +4219,7 @@ export class FactoryLoop implements Factory {
         }
         if (!wasReady && !recoveredOrphan) {
           if (mayRecoverGithubOrphan) {
-            const dispatchBlock = await this.#sweepDispatchBlockReason(issue)
+            const dispatchBlock = await this.#sweepDispatchBlockReason(issue, dryRun)
             if (dispatchBlock) {
               recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
@@ -4239,7 +4239,7 @@ export class FactoryLoop implements Factory {
         let attemptPhase: DispatchAttemptPhase = 'gate'
         try {
           if (recoveredOrphan) {
-            const dispatchBlock = await this.#sweepDispatchBlockReason(issue)
+            const dispatchBlock = await this.#sweepDispatchBlockReason(issue, dryRun)
             if (dispatchBlock) {
               recordSkip({ issue: issueRef(issue), ...dispatchBlock })
               continue
@@ -5921,7 +5921,7 @@ export class FactoryLoop implements Factory {
       }
     }
 
-    const blockReason = await this.#dispatchBlockReason(decision.issue)
+    const blockReason = await this.#dispatchBlockReason(decision.issue, { dryRun })
     if (blockReason) {
       const error = new Error(`Refusing to dispatch ${decision.issue.key}: ${blockReason.reason}`)
       this.#error(error, decision.issue)
@@ -10808,6 +10808,7 @@ export class FactoryLoop implements Factory {
    */
   async #dispatchBlockReason(
     issue: IssueRef,
+    opts: { dryRun?: boolean } = {},
   ): Promise<{ reason: string; code: FactorySweepSkipReasonCode } | undefined> {
     const key = issueStateKey(issue)
     const state = await this.#state.getDispatchAttempts(this.#workspaceId, key)
@@ -10819,11 +10820,46 @@ export class FactoryLoop implements Factory {
       return { reason: 'dispatch backoff active', code: 'dispatch-backoff' }
     }
     if (state.attempts >= this.#config.dispatch.maxAttempts) {
+      // A dry run places nothing and must change nothing: it reports the limit
+      // without latching it, so `dispatch --dry-run` sharing a state file can
+      // never park a real unit.
+      if (opts.dryRun) return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
       state.terminal = true
       await this.#state.recordDispatchAttempt(this.#workspaceId, key, state)
       return { reason: 'dispatch retry limit reached', code: 'dispatch-retry-limit' }
     }
     return undefined
+  }
+
+  /**
+   * Whether ANOTHER instance may still be running this work unit: it holds a
+   * non-terminal durable lifecycle whose lease has not expired. The attempt
+   * count is durable and shared but `inFlight` is process-local, so a unit at
+   * its limit here may be mid-way through its last attempt elsewhere. The
+   * latch is still right then (that attempt ends terminal either way), but
+   * "nothing is running for it now" would be false, so the park writeback
+   * waits: if that attempt dies, orphan recovery parks and announces it after
+   * its own liveness checks. A lifecycle this process leases, or one whose
+   * lease has lapsed, is nobody else's live attempt. Fails closed: an
+   * unkeyable unit or an unreadable lifecycle counts as live. Without durable
+   * lifecycles there is no cross-process claim to consult.
+   */
+  async #dispatchMayBeLiveElsewhere(issue: IssueRef): Promise<boolean> {
+    if (!this.#usesDurableDispatchLifecycle()) return false
+    const key = safeDispatchLifecycleKey(issue)
+    if (key === undefined) return true
+    try {
+      const lifecycle = await this.#state.getDispatchLifecycle(this.#workspaceId, key)
+      if (!lifecycle || isTerminalDispatchLifecycle(lifecycle)) return false
+      const lease = lifecycle.lease
+      return Boolean(
+        lease &&
+        lease.owner !== this.#dispatchLifecycleOwner &&
+        lease.leaseUntilMs > this.#clock.now(),
+      )
+    } catch {
+      return true
+    }
   }
 
   async #recordDispatchAttempt(issue: IssueRef): Promise<void> {
@@ -10886,9 +10922,13 @@ export class FactoryLoop implements Factory {
    */
   async #sweepDispatchBlockReason(
     issue: LinearIssue,
+    dryRun: boolean,
   ): Promise<{ reason: string; code: FactorySweepSkipReasonCode } | undefined> {
-    const block = await this.#dispatchBlockReason(issue)
-    if (block?.code === 'dispatch-retry-limit') {
+    const block = await this.#dispatchBlockReason(issue, { dryRun })
+    // A dry run reports the limit without latching it, so it has nothing to
+    // announce; and a unit another instance may still be running is not
+    // announced as idle (see `#dispatchMayBeLiveElsewhere`).
+    if (block?.code === 'dispatch-retry-limit' && !dryRun && !await this.#dispatchMayBeLiveElsewhere(issue)) {
       const state = await this.#state.getDispatchAttempts(this.#workspaceId, issueStateKey(issue))
       await this.#announceDispatchParked(issue, state?.attempts ?? this.#config.dispatch.maxAttempts)
     }
