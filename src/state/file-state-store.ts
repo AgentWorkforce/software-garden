@@ -8,6 +8,7 @@ import type {
   BabysitterGenerationRecord,
   BabysitterSessionState,
   ClarificationReply,
+  DispatchAttemptState,
   DispatchLifecycle,
   DispatchLifecycleClaim,
   GithubIssueCommentWatchState,
@@ -464,6 +465,40 @@ export class DocumentStateStore extends InMemoryStateStore {
       if (workspaceIsEmpty(workspace)) delete document.workspaces[workspaceId]
       await this.#persist(document)
     }))
+  }
+
+  // The dispatch attempt budget (count, terminal latch, backoff) is durable.
+  // The in-memory base kept it in process memory, so every restart handed each
+  // work unit a fresh `dispatch.maxAttempts` and a unit whose dispatch kept
+  // dying was re-dispatched once more per restart, without bound.
+  //
+  // `inFlight` stays process-local in the base (see
+  // `PersistedDispatchAttemptState`), so `releaseInFlight` is inherited as is.
+  override async recordDispatchAttempt(
+    workspaceId: string,
+    issueKey: string,
+    attempt: DispatchAttemptState,
+  ): Promise<void> {
+    await super.recordDispatchAttempt(workspaceId, issueKey, attempt)
+    await this.#exclusive(async () => this.#withMutationLock(async () => {
+      const document = await this.#loadFromDisk()
+      const workspace = document.workspaces[workspaceId] ??= emptyWorkspaceState()
+      const attempts = workspace.dispatchAttempts ??= {}
+      attempts[issueKey] = {
+        attempts: attempt.attempts,
+        terminal: attempt.terminal,
+        backoffUntilMs: attempt.backoffUntilMs,
+      }
+      await this.#persist(document)
+    }))
+  }
+
+  override async getDispatchAttempts(workspaceId: string, issueKey: string): Promise<DispatchAttemptState | undefined> {
+    const local = await super.getDispatchAttempts(workspaceId, issueKey)
+    const durable = await this.#exclusive(async () =>
+      (await this.#loadFromDisk()).workspaces[workspaceId]?.dispatchAttempts?.[issueKey])
+    if (!durable) return local
+    return { ...durable, inFlight: local?.inFlight ?? false }
   }
 
   override async setSlackThreadWatch(
@@ -1530,6 +1565,7 @@ const emptyWorkspaceState = (): PersistedWorkspaceState => ({
 
 const workspaceIsEmpty = (workspace: PersistedWorkspaceState): boolean =>
   Object.keys(workspace.dependencyParks ?? {}).length === 0 &&
+  Object.keys(workspace.dispatchAttempts ?? {}).length === 0 &&
   Object.keys(workspace.githubIssueCommentWatches).length === 0 &&
   Object.keys(workspace.slackThreadWatches).length === 0 &&
   Object.keys(workspace.waitingClarifications).length === 0 &&
