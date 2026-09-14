@@ -888,6 +888,25 @@ class RemoteAgentRegistrationTimeoutError extends Error {
 }
 
 /**
+ * A remote implementer was adopted from the fleet roster in a sandbox runtime,
+ * and no sandbox id could be recovered for it: the placement answer that
+ * carried the id was never persisted (the spawn ack itself was lost). Its
+ * commits can only reach GitHub by being pushed from that sandbox, so
+ * publication is certain to refuse. Typed so both adoption callers can
+ * terminalize the dispatch immediately instead of retrying the same adoption.
+ */
+class UnpublishablePlacementError extends Error {
+  constructor(readonly issueKey: string, readonly agentName: string) {
+    super(
+      `Dispatch ${issueKey} cannot be published: adopted remote implementer ${agentName} has no recoverable ` +
+      'sandbox id, so its commits could never be pushed through the workspace GitHub App push port. ' +
+      'Abandoning it now rather than running it to a guaranteed publish refusal.',
+    )
+    this.name = 'UnpublishablePlacementError'
+  }
+}
+
+/**
  * The durable dispatch-lifecycle claim was refused for one work unit: its
  * record is already terminal, or another publisher currently holds the lease.
  * Both are facts about that single unit — the rest of the pass is unaffected —
@@ -6433,6 +6452,12 @@ export class FactoryLoop implements Factory {
         throw error
       }
       settlePostSpawnIssueObservation(!(error instanceof LiveDispatchStateChangedError))
+      if (error instanceof UnpublishablePlacementError) {
+        // Not a transient failure: retrying adopts the same worker with the
+        // same missing id. Terminalize now and release its agents durably.
+        await this.#abandonUnpublishablePlacement(record, error)
+        throw error
+      }
       if (
         (error instanceof FleetPlacementUnavailableError ||
           (error instanceof RemoteAgentRegistrationTimeoutError && error.cleanupConfirmed)) &&
@@ -9232,7 +9257,16 @@ export class FactoryLoop implements Factory {
         if (tracked?.result) agents.push({ name: tracked.result.name, role: spec.role })
         continue
       }
-      const spawned = await this.#spawnAgent(record, spec, record.dryRun)
+      let spawned: { name: string }
+      try {
+        spawned = await this.#spawnAgent(record, spec, record.dryRun)
+      } catch (error) {
+        if (!(error instanceof UnpublishablePlacementError)) throw error
+        // Resume is where a successor adopts a worker placed before a
+        // restart. Retrying cannot recover the id, so terminalize here.
+        await this.#abandonUnpublishablePlacement(record, error)
+        return
+      }
       agents.push({ name: spawned.name, role: spec.role })
     }
     const comment = dispatchComment(record.decision, agents)
@@ -9322,6 +9356,23 @@ export class FactoryLoop implements Factory {
       ) return true
     }
     return false
+  }
+
+  /**
+   * Terminalize a dispatch whose adopted implementer can never be published
+   * (see {@link UnpublishablePlacementError}). The adoption was recorded
+   * before the error was thrown, so the worker is tracked and the abandonment
+   * releases it with the rest of the team, durably, under the error's reason.
+   */
+  async #abandonUnpublishablePlacement(record: InFlightIssue, error: UnpublishablePlacementError): Promise<void> {
+    this.#increment('dispatchPlacementsUnpublishable')
+    this.#logger.error?.('[factory] adopted a remote implementer with no sandbox to publish from', {
+      issue: record.issue.key,
+      agent: error.agentName,
+      error: error.message,
+    })
+    this.#error(error, record.issue)
+    await this.#abandonStuckDispatch(record, error.message)
   }
 
   async #abandonDurableResume(record: InFlightIssue, reason: string): Promise<void> {
@@ -11998,15 +12049,29 @@ export class FactoryLoop implements Factory {
         spec = { ...spec, node: host.name }
       }
       const trackedPlacement = this.#fleet.trackedAgents?.().get(spec.name)
+      // The roster names the worker and its node, never the sandbox it was
+      // placed into. That id survives only in the placement answer persisted
+      // before the registration wait, so recover it from there. A released
+      // entry belongs to an earlier generation, whose sandbox is not this one.
+      const placed = existing?.releasedAtMs === undefined ? existing?.placement : undefined
+      const sandboxId = placed?.sandboxId
+      const locality = existing?.result?.locality ?? placed?.locality ?? this.#fleet.placementLocality
       record.heldSinceAtMs ??= this.#clock.now()
       batch.recordSpawn(record, spec, invocationId, {
         name: spec.name,
-        sessionRef: existing?.sessionRef ?? spec.sessionRef,
-        node: existing?.result?.node ?? trackedPlacement?.node ?? rosterAgent.node,
-        locality: existing?.result?.locality ?? this.#fleet.placementLocality,
+        sessionRef: existing?.sessionRef ?? placed?.sessionRef ?? spec.sessionRef,
+        node: existing?.result?.node ?? placed?.node ?? trackedPlacement?.node ?? rosterAgent.node,
+        locality,
+        ...(sandboxId ? { sandboxId } : {}),
       })
       if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
         throw new Error(`Dispatch lifecycle ownership lost after adopting ${spec.name}`)
+      }
+      // A remote implementer in a sandbox runtime can only be published by
+      // pushing from its sandbox. With no id to push from, publication is
+      // already certain to refuse; fail now, not when the agent finishes.
+      if (spec.role === 'implementer' && locality === 'remote' && this.#sandboxPush && !sandboxId) {
+        throw new UnpublishablePlacementError(record.issue.key, spec.name)
       }
       this.#scheduleHeldAgentDeadline(record)
       const adopted = record.agents.get(spec.name)
@@ -12079,6 +12144,14 @@ export class FactoryLoop implements Factory {
       throw new LatePlacementReleasedError(record.issue.key, result.name ?? spec.name)
     }
     if (this.#fleet.placementLocality === 'remote') {
+      // Persist the provisioner's answer before the registration wait. A
+      // process that dies inside that wait leaves a successor that can adopt
+      // the worker from the roster, and the roster does not carry the sandbox
+      // id publication needs. Fail closed exactly as the post-spawn save does.
+      batch.recordPlacement(record, spec, result)
+      if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
+        throw new Error(`Dispatch lifecycle ownership lost after spawning ${spec.name}`)
+      }
       const registered = await this.#awaitRemoteAgentRegistration(result.name, spec.capability, result.node)
       if (!registered) {
         try {
@@ -25432,6 +25505,7 @@ const cloneTrackedAgent = (tracked: TrackedAgent): TrackedAgent => ({
       : undefined,
   },
   result: tracked.result ? { ...tracked.result } : undefined,
+  ...(tracked.placement ? { placement: { ...tracked.placement } } : {}),
   sessionRef: tracked.sessionRef,
   unreachableWakeResumedSessionRef: tracked.unreachableWakeResumedSessionRef,
   releasedAtMs: tracked.releasedAtMs,

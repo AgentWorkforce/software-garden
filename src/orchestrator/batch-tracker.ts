@@ -7,6 +7,16 @@ import { dispatchPhaseOccupiesSlot, dispatchHandedOffToBabysitters } from '../st
 export interface TrackedAgent {
   spec: AgentSpec
   result?: SpawnResult
+  /**
+   * What the provisioner answered when this agent was placed, recorded as soon
+   * as `fleet.spawn` returns and before the remote registration wait.
+   *
+   * It is not evidence of a live worker (only `result` is). It exists because
+   * a successor that finds the worker on the fleet roster can only learn its
+   * name and node from there: the roster does not describe the sandbox the
+   * worker was placed into, and without that id its commits cannot be pushed.
+   */
+  placement?: SpawnResult
   sessionRef?: string
   /** Session lineage already resumed after Relay could not address a babysitter wake. */
   unreachableWakeResumedSessionRef?: string
@@ -314,6 +324,18 @@ export class BatchTracker {
     record.agents.set(spec.name, { spec: { ...spec }, sessionRef: spec.sessionRef })
   }
 
+  /**
+   * Attach the provisioner's placement answer to a planned agent, before its
+   * spawn is recorded. Deliberately leaves `result` and the invocation claim
+   * alone: until the worker registers, the placement is not a live worker, and
+   * the registration-timeout rollback must still see it as unacknowledged.
+   */
+  recordPlacement(record: InFlightIssue, spec: AgentSpec, placement: SpawnResult): void {
+    const planned = record.agents.get(spec.name)
+    if (!planned || planned.result !== undefined || planned.releasedAtMs !== undefined) return
+    planned.placement = { ...placement }
+  }
+
   recordDryRun(record: InFlightIssue, spec: AgentSpec, invocationId: string): void {
     record.invocationIds.add(invocationId)
     this.#invocationIds.add(invocationId)
@@ -336,6 +358,7 @@ export class BatchTracker {
       agents: new Map([...record.agents].map(([name, tracked]) => [name, {
         spec: structuredClone(tracked.spec),
         result: tracked.result ? { ...tracked.result } : undefined,
+        ...(tracked.placement ? { placement: { ...tracked.placement } } : {}),
         sessionRef: tracked.sessionRef,
         releasedAtMs: tracked.releasedAtMs,
       }])),
