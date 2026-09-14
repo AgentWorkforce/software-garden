@@ -12064,15 +12064,41 @@ export class FactoryLoop implements Factory {
         locality,
         ...(sandboxId ? { sandboxId } : {}),
       })
-      if (!await this.#saveDispatchLifecycle(record, 'dispatching')) {
-        throw new Error(`Dispatch lifecycle ownership lost after adopting ${spec.name}`)
-      }
       // A remote implementer in a sandbox runtime can only be published by
       // pushing from its sandbox. With no id to push from, publication is
       // already certain to refuse; fail now, not when the agent finishes.
-      if (spec.role === 'implementer' && locality === 'remote' && this.#sandboxPush && !sandboxId) {
-        throw new UnpublishablePlacementError(record.issue.key, spec.name)
+      const unpublishable = spec.role === 'implementer' && locality === 'remote' && this.#sandboxPush && !sandboxId
+        ? new UnpublishablePlacementError(record.issue.key, spec.name)
+        : undefined
+      // An unpublishable adoption is recorded and durably marked `abandoning`
+      // in ONE save. Recorded as an ordinary `dispatching` placement, a
+      // successor would load it as a live worker, skip this check through the
+      // existing-result return above, and run it on; `abandoning` makes a
+      // restart finish the abandonment instead.
+      let saved = false
+      try {
+        saved = unpublishable
+          ? await this.#saveDispatchLifecycle(
+            record,
+            'abandoning',
+            undefined,
+            unpublishable.message,
+            new Set(),
+            { cancellationReason: 'dispatch_failed' },
+          )
+          : await this.#saveDispatchLifecycle(record, 'dispatching')
+      } finally {
+        // If that mark did not land, forget the adoption in memory too, so a
+        // retry re-adopts and re-evaluates rather than answering from it.
+        if (unpublishable && !saved) {
+          if (existing) record.agents.set(spec.name, existing)
+          else record.agents.delete(spec.name)
+        }
       }
+      if (!saved) {
+        throw new Error(`Dispatch lifecycle ownership lost after adopting ${spec.name}`)
+      }
+      if (unpublishable) throw unpublishable
       this.#scheduleHeldAgentDeadline(record)
       const adopted = record.agents.get(spec.name)
       if (adopted) await this.#reportAgent(record, adopted, 'agent.adopted')

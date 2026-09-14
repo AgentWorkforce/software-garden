@@ -22867,6 +22867,79 @@ describe('FactoryLoop', () => {
         }
       })
 
+      it('still abandons when the process dies after the unpublishable adoption but before its release', async () => {
+        class LostAckFleet extends RemoteFleetClient {
+          failed = false
+
+          override async spawn(input: SpawnInput): Promise<SpawnResult> {
+            const result = await super.spawn(input)
+            if (!this.failed) {
+              this.failed = true
+              throw new Error('owner crashed after remote spawn ack')
+            }
+            return result
+          }
+
+          // A process that dies does not release its workers on the way out.
+          override async release(name: string, reason?: string): Promise<void> {
+            if (reason === 'factory-stopped') return
+            await super.release(name, reason)
+          }
+        }
+        // The first process loses its store at the moment it would mark the
+        // dispatch abandoning, i.e. it dies before releasing anything.
+        class DiesAtAbandonmentStore extends FileStateStore {
+          abandoningSaves = 0
+
+          override async saveDispatchLifecycle(
+            ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+          ): ReturnType<FileStateStore['saveDispatchLifecycle']> {
+            if (args[5].phase === 'abandoning') {
+              this.abandoningSaves += 1
+              throw new Error('owner process died')
+            }
+            return super.saveDispatchLifecycle(...args)
+          }
+        }
+        const root = await mkdtemp(join(tmpdir(), 'factory-placement-abandon-restart-'))
+        const watchStatePath = join(root, 'state.json')
+        const calls: SandboxPushInput[] = []
+        const fleet = new LostAckFleet()
+        const dyingStore = new DiesAtAbandonmentStore({ batchSize: 2, watchStatePath })
+        const deps = (stateStore: FileStateStore) => ({
+          mount: publishingMount([]),
+          fleet,
+          stateStore,
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: { push: async (input: SandboxPushInput) => { calls.push(input); return pushed() } },
+        })
+        const first = createFactory(config(), deps(dyingStore))
+        let restarted: ReturnType<typeof createFactory> | undefined
+        try {
+          const decision = await first.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+          await expect(first.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
+          await vi.waitFor(() => expect(dyingStore.abandoningSaves).toBeGreaterThan(0), { timeout: 4_000 })
+          await first.stop().catch(() => undefined)
+          expect(fleet.releases).toEqual([])
+
+          restarted = createFactory(config(), deps(new FileStateStore({ batchSize: 2, watchStatePath })))
+          await restarted.start({ mode: 'dispatch-owner' })
+          await vi.waitFor(async () => expect(await lifecycleOf(watchStatePath, decision))
+            .toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+          expect((await lifecycleOf(watchStatePath, decision))?.releaseReason)
+            .toMatch(/ar-93-impl-pear has no recoverable sandbox id/u)
+          expect(fleet.releases).toContainEqual({ name: 'ar-93-impl-pear', reason: 'issue-abandoned' })
+          // The successor did not run the team on: nothing else placed or pushed.
+          expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-93-impl-pear'])
+          expect(calls).toEqual([])
+        } finally {
+          await restarted?.stop()
+          await first.stop().catch(() => undefined)
+          await rm(root, { recursive: true, force: true })
+        }
+      }, 15_000)
+
       it('leaves the uninterrupted path unchanged, with the placement durable before the wait', async () => {
         let watchStatePath = ''
         let key = ''
