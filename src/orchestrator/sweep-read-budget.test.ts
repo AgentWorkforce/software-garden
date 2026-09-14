@@ -126,6 +126,18 @@ describe('SweepReadTracker', () => {
     expect(started).toBe(false)
   })
 
+  it('charges an abandoned read its whole wait, so a repository defers after exactly its budget', async () => {
+    // The clock never advances here, as if every timer fired early against
+    // the wall clock: the charge must still add up to the budget.
+    const { reads } = tracker()
+    await expect(reads.run('owner/slow', NEVER)).rejects.toMatchObject({ reason: 'read-timeout' })
+    await expect(reads.run('owner/slow', NEVER)).rejects.toMatchObject({ reason: 'read-timeout' })
+    // 40 ms spent of 50: the third read is capped at the 10 ms left.
+    await expect(reads.run('owner/slow', NEVER)).rejects.toMatchObject({ reason: 'repo-budget' })
+    expect(reads.deferral('owner/slow')).toBe('repo-budget')
+    expect(reads.outcome().readTimeouts).toBe(3)
+  })
+
   it('charges a failed read to its repository too', async () => {
     const { reads, advance } = tracker()
     await expect(reads.run('owner/slow', async () => {

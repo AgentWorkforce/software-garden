@@ -6460,11 +6460,12 @@ describe('FactoryLoop', () => {
    * only happens after the read phase. Each budget turns a slow unit into a
    * deferral of that unit, and the sweep dispatches what it did read.
    *
-   * At a 6 s sweep budget the derived budgets are 200 ms per read, 600 ms per
-   * repository and a 3 s read phase.
+   * At a 15 s sweep budget the derived budgets are 500 ms per read, 1.5 s per
+   * repository and a 7.5 s read phase: two orders of magnitude above a fake
+   * read, so a loaded runner cannot time out the healthy repository.
    */
   describe('readiness sweep read budgets (#376)', () => {
-    const SWEEP_BUDGET_MS = 6_000
+    const SWEEP_BUDGET_MS = 15_000
     const NEVER = (): Promise<never> => new Promise<never>(() => undefined)
     const indexPathFor = (repo: string) => `/github/repos/AgentWorkforce/${repo}/issues/_index.json`
     const issuePathFor = (repo: string, number: number) => githubIssueCompactPath('AgentWorkforce', repo, number)
@@ -6576,11 +6577,11 @@ describe('FactoryLoop', () => {
 
         expect(elapsedMs).toBeLessThan(SWEEP_BUDGET_MS)
         expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor('pear', 70)])
-        // Three reads are abandoned in flight and spend the 600 ms repository
-        // budget. (The third is cut short by the per-read budget or by what is
-        // left of the repository's, depending on timer slack; either way it
-        // is abandoned.) The last two are deferred WITHOUT being issued: no new
-        // load on a repository the sweep has already stopped waiting on.
+        // Three reads are abandoned at 500 ms each and spend the 1.5 s
+        // repository budget; an abandoned read is charged its whole wait, so
+        // timer slack cannot buy a fourth. The last two are deferred WITHOUT
+        // being issued: no new load on a repository the sweep has already
+        // stopped waiting on.
         const slowReads = mount.reads.filter((path) => slowIssues.some((number) => path === issuePathFor('hoopsheet', number)))
         expect(slowReads).toHaveLength(3)
         const counters = factory.status().counters
@@ -6591,7 +6592,7 @@ describe('FactoryLoop', () => {
         expect(report.skipped.filter((entry) => entry.reason === 'sweep read deferred (repo-budget)').length)
           .toBeGreaterThanOrEqual(2)
       })
-    })
+    }, 10_000)
 
     it('still fails the sweep when every repository listing times out', async () => {
       const mount = new HangingReadMount([['pear', 70], ['hoopsheet', 71]])

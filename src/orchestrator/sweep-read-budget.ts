@@ -230,6 +230,7 @@ export class SweepReadTracker {
     ]
     const [binding, waitMs] = bounds.reduce((tightest, bound) => bound[1] < tightest[1] ? bound : tightest)
     let timer: ReturnType<typeof setTimeout> | undefined
+    let abandoned = false
     try {
       // Folded once, so a late rejection from the abandoned read has a handler
       // attached and cannot surface as an unhandled rejection.
@@ -249,6 +250,7 @@ export class SweepReadTracker {
       if (outcome === READ_TIMED_OUT) {
         // Every read abandoned in flight counts as timed out, whichever bound
         // cut it short; the error's reason says which one did.
+        abandoned = true
         this.#readTimeouts += 1
         this.#onDefer?.('read-timeout', binding)
         throw new SweepReadBudgetExceededError(binding, this.#budgetFor(binding))
@@ -258,7 +260,13 @@ export class SweepReadTracker {
     } finally {
       if (timer) clearTimeout(timer)
       if (repo !== undefined) {
-        this.#repoSpentMs.set(repo, (this.#repoSpentMs.get(repo) ?? 0) + Math.max(0, this.#now() - startedAtMs))
+        // An abandoned read is charged the whole wait it was granted. Timers
+        // can fire a millisecond early against the wall clock, and charging
+        // that shortfall would leave a sliver of budget that only buys
+        // another read abandoned at once.
+        const elapsedMs = Math.max(0, this.#now() - startedAtMs)
+        const chargedMs = abandoned ? Math.max(elapsedMs, waitMs) : elapsedMs
+        this.#repoSpentMs.set(repo, (this.#repoSpentMs.get(repo) ?? 0) + chargedMs)
       }
     }
   }
