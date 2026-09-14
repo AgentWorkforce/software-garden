@@ -22748,6 +22748,250 @@ describe('FactoryLoop', () => {
       commitSha: 'commit-274',
     })
 
+    // The sandbox id is the only handle on the box holding the clone, and the
+    // fleet roster does not carry it. A process that dies between the spawn
+    // returning and the spawn being recorded (the remote registration wait
+    // sits in that window) leaves a successor that can only adopt the worker
+    // from the roster. These pin that the id survives that restart.
+    describe('across a restart between the spawn returning and being recorded', () => {
+      const lifecycleOf = async (watchStatePath: string, decision: TriageDecision) =>
+        new FileStateStore({ batchSize: 2, watchStatePath })
+          .getDispatchLifecycle('factory-test', dispatchIssueIdentity(decision.issue))
+
+      it('adopts the worker with its persisted sandbox id and publishes from that sandbox', async () => {
+        class DiesInRegistrationWaitFleet extends RemoteFleetClient {
+          /** While set, the owning process never returns from the registration wait. */
+          dieInRegistrationWait = true
+          registrationProbes = 0
+
+          override async isAgentRegistered(): Promise<boolean> {
+            this.registrationProbes += 1
+            if (this.dieInRegistrationWait) return new Promise<boolean>(() => undefined)
+            return true
+          }
+        }
+        const root = await mkdtemp(join(tmpdir(), 'factory-placement-restart-'))
+        const watchStatePath = join(root, 'state.json')
+        const calls: SandboxPushInput[] = []
+        const fleet = new DiesInRegistrationWaitFleet()
+        fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+        const mount = publishingMount([])
+        const deps = () => ({
+          mount,
+          fleet,
+          stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: { push: async (input: SandboxPushInput) => { calls.push(input); return pushed() } },
+        })
+        const first = createFactory(config(), deps())
+        let restarted: ReturnType<typeof createFactory> | undefined
+        try {
+          const decision = await first.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+          void first.dispatch(decision).catch(() => undefined)
+          // The spawn has returned and the first process is inside the wait.
+          await vi.waitFor(() => expect(fleet.registrationProbes).toBe(1))
+          expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-93-impl-pear'])
+          // The process goes away without ever recording the spawn. Shutdown
+          // hands its lease back, so a successor can take the row over at once.
+          await first.stop()
+
+          fleet.dieInRegistrationWait = false
+          restarted = createFactory(config(), deps())
+          await restarted.start({ mode: 'dispatch-owner' })
+          await vi.waitFor(async () => expect(await lifecycleOf(watchStatePath, decision))
+            .toMatchObject({ phase: 'running' }), { timeout: 4_000 })
+
+          // Adopted, not placed a second time, and adopted WITH its sandbox.
+          expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-93-impl-pear')).toHaveLength(1)
+          expect((await lifecycleOf(watchStatePath, decision))?.agents
+            .find((agent) => agent.name === 'ar-93-impl-pear')?.tracked.result?.sandboxId).toBe('sandbox-abc')
+
+          fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+          await vi.waitFor(() => expect(calls).toHaveLength(1))
+          expect(calls[0]).toMatchObject({ sandboxId: 'sandbox-abc', repoPath: '/work/pear', repo: 'AgentWorkforce/pear' })
+        } finally {
+          await restarted?.stop()
+          await first.stop()
+          await rm(root, { recursive: true, force: true })
+        }
+      })
+
+      it('fails an adoption with no recoverable sandbox id at once, and releases it durably', async () => {
+        // The spawn ack is lost outright, so no placement answer was ever
+        // persisted: the worker exists on the roster and nowhere else.
+        class LostAckFleet extends RemoteFleetClient {
+          failed = false
+
+          override async spawn(input: SpawnInput): Promise<SpawnResult> {
+            const result = await super.spawn(input)
+            if (!this.failed) {
+              this.failed = true
+              throw new Error('owner crashed after remote spawn ack')
+            }
+            return result
+          }
+        }
+        const root = await mkdtemp(join(tmpdir(), 'factory-placement-unrecoverable-'))
+        const watchStatePath = join(root, 'state.json')
+        const calls: SandboxPushInput[] = []
+        const publishInputs: GithubPublishPullRequestInput[] = []
+        const fleet = new LostAckFleet()
+        const factory = createFactory(config(), {
+          mount: publishingMount(publishInputs),
+          fleet,
+          stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+        })
+        try {
+          const decision = await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+          await expect(factory.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
+
+          await vi.waitFor(async () => expect(await lifecycleOf(watchStatePath, decision))
+            .toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+          expect((await lifecycleOf(watchStatePath, decision))?.releaseReason)
+            .toMatch(/ar-93-impl-pear has no recoverable sandbox id/u)
+          expect(fleet.releases).toContainEqual({ name: 'ar-93-impl-pear', reason: 'issue-abandoned' })
+          // Terminal on the first adoption: never re-placed, the rest of the
+          // team never placed, and nothing pushed or published.
+          expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-93-impl-pear'])
+          expect(factory.status().counters.dispatchPlacementsUnpublishable).toBe(1)
+          expect(calls).toEqual([])
+          expect(publishInputs).toEqual([])
+          // The terminal save lands a few awaits before the slot is freed.
+          await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
+        } finally {
+          await factory.stop()
+          await rm(root, { recursive: true, force: true })
+        }
+      })
+
+      it('still abandons when the process dies after the unpublishable adoption but before its release', async () => {
+        class LostAckFleet extends RemoteFleetClient {
+          failed = false
+
+          override async spawn(input: SpawnInput): Promise<SpawnResult> {
+            const result = await super.spawn(input)
+            if (!this.failed) {
+              this.failed = true
+              throw new Error('owner crashed after remote spawn ack')
+            }
+            return result
+          }
+
+          // A process that dies does not release its workers on the way out.
+          override async release(name: string, reason?: string): Promise<void> {
+            if (reason === 'factory-stopped') return
+            await super.release(name, reason)
+          }
+        }
+        // The first process loses its store at the moment it would mark the
+        // dispatch abandoning, i.e. it dies before releasing anything.
+        class DiesAtAbandonmentStore extends FileStateStore {
+          abandoningSaves = 0
+
+          override async saveDispatchLifecycle(
+            ...args: Parameters<FileStateStore['saveDispatchLifecycle']>
+          ): ReturnType<FileStateStore['saveDispatchLifecycle']> {
+            if (args[5].phase === 'abandoning') {
+              this.abandoningSaves += 1
+              throw new Error('owner process died')
+            }
+            return super.saveDispatchLifecycle(...args)
+          }
+        }
+        const root = await mkdtemp(join(tmpdir(), 'factory-placement-abandon-restart-'))
+        const watchStatePath = join(root, 'state.json')
+        const calls: SandboxPushInput[] = []
+        const fleet = new LostAckFleet()
+        const dyingStore = new DiesAtAbandonmentStore({ batchSize: 2, watchStatePath })
+        const deps = (stateStore: FileStateStore) => ({
+          mount: publishingMount([]),
+          fleet,
+          stateStore,
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: { push: async (input: SandboxPushInput) => { calls.push(input); return pushed() } },
+        })
+        const first = createFactory(config(), deps(dyingStore))
+        let restarted: ReturnType<typeof createFactory> | undefined
+        try {
+          const decision = await first.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+          await expect(first.dispatch(decision)).rejects.toThrow('owner crashed after remote spawn ack')
+          await vi.waitFor(() => expect(dyingStore.abandoningSaves).toBeGreaterThan(0), { timeout: 4_000 })
+          await first.stop().catch(() => undefined)
+          expect(fleet.releases).toEqual([])
+
+          restarted = createFactory(config(), deps(new FileStateStore({ batchSize: 2, watchStatePath })))
+          await restarted.start({ mode: 'dispatch-owner' })
+          await vi.waitFor(async () => expect(await lifecycleOf(watchStatePath, decision))
+            .toMatchObject({ phase: 'abandoned' }), { timeout: 4_000 })
+          expect((await lifecycleOf(watchStatePath, decision))?.releaseReason)
+            .toMatch(/ar-93-impl-pear has no recoverable sandbox id/u)
+          expect(fleet.releases).toContainEqual({ name: 'ar-93-impl-pear', reason: 'issue-abandoned' })
+          // The successor did not run the team on: nothing else placed or pushed.
+          expect(fleet.spawns.map((spawn) => spawn.name)).toEqual(['ar-93-impl-pear'])
+          expect(calls).toEqual([])
+        } finally {
+          await restarted?.stop()
+          await first.stop().catch(() => undefined)
+          await rm(root, { recursive: true, force: true })
+        }
+      }, 15_000)
+
+      it('leaves the uninterrupted path unchanged, with the placement durable before the wait', async () => {
+        let watchStatePath = ''
+        let key = ''
+        class ProbingFleet extends RemoteFleetClient {
+          placementDuringWait: SpawnResult | undefined
+
+          override async isAgentRegistered(input?: { name: string }): Promise<boolean> {
+            if (input?.name === 'ar-93-impl-pear') {
+              const durable = await new FileStateStore({ batchSize: 2, watchStatePath })
+                .getDispatchLifecycle('factory-test', key)
+              this.placementDuringWait ??= durable?.agents
+                .find((agent) => agent.name === 'ar-93-impl-pear')?.tracked.placement
+            }
+            return true
+          }
+        }
+        const root = await mkdtemp(join(tmpdir(), 'factory-placement-uninterrupted-'))
+        watchStatePath = join(root, 'state.json')
+        const calls: SandboxPushInput[] = []
+        const fleet = new ProbingFleet()
+        fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+        const factory = createFactory(config(), {
+          mount: publishingMount([]),
+          fleet,
+          stateStore: new FileStateStore({ batchSize: 2, watchStatePath }),
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+        })
+        try {
+          const decision = await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93)))
+          key = dispatchIssueIdentity(decision.issue)
+          await factory.dispatch(decision)
+
+          expect(fleet.placementDuringWait).toMatchObject({ name: 'ar-93-impl-pear', sandboxId: 'sandbox-abc' })
+          expect(fleet.spawns.filter((spawn) => spawn.name === 'ar-93-impl-pear')).toHaveLength(1)
+          expect((await lifecycleOf(watchStatePath, decision))?.agents
+            .find((agent) => agent.name === 'ar-93-impl-pear')?.tracked.result)
+            .toMatchObject({ sandboxId: 'sandbox-abc', locality: 'remote' })
+          expect(factory.status().counters.dispatchPlacementsUnpublishable).toBeUndefined()
+
+          fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+          await vi.waitFor(() => expect(calls).toHaveLength(1))
+          expect(calls[0]).toMatchObject({ sandboxId: 'sandbox-abc', repoPath: '/work/pear' })
+        } finally {
+          await factory.stop()
+          await rm(root, { recursive: true, force: true })
+        }
+      })
+    })
+
     it('pushes the sandbox changes before publishing, naming the sandbox and its clone path', async () => {
       const calls: SandboxPushInput[] = []
       const publishInputs: GithubPublishPullRequestInput[] = []

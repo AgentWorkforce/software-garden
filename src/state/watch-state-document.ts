@@ -437,13 +437,14 @@ const validDispatchLifecycleAgent = (value: unknown): value is DispatchLifecycle
 
 const validTrackedAgent = (value: unknown): value is TrackedAgent => isRecord(value) &&
   validAgentSpec(value.spec) && (value.result === undefined || validSpawnResult(value.result)) &&
+  (value.placement === undefined || validSpawnResult(value.placement)) &&
   validOptionalString(value.sessionRef) && validOptionalString(value.unreachableWakeResumedSessionRef) &&
   validOptionalNumber(value.releasedAtMs)
 
 const validSpawnResult = (value: unknown): value is SpawnResult => isRecord(value) &&
   typeof value.name === 'string' && validOptionalString(value.sessionRef) && validOptionalNumber(value.pid) &&
   (value.pids === undefined || (Array.isArray(value.pids) && value.pids.every(validNumber))) &&
-  validOptionalString(value.node) &&
+  validOptionalString(value.node) && validOptionalString(value.sandboxId) &&
   (value.locality === undefined || value.locality === 'local' || value.locality === 'remote')
 
 const validAgentSpec = (value: unknown): value is AgentSpec => isRecord(value) &&

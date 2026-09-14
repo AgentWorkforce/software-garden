@@ -405,6 +405,8 @@ export interface BatchSnapshot {
     result: SpawnResult,
   ): void
   recordPlanned(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer']): void
+  /** Persist the provisioner's placement answer on a planned agent, before its spawn is recorded. */
+  recordPlacement(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer'], placement: SpawnResult): void
   recordRelease(record: InFlightIssue, agentName: string, releasedAtMs: number): string | undefined
   recordDryRun(record: InFlightIssue, spec: InFlightIssue['decision']['reviewer'], invocationId: string): void
   restore(record: InFlightIssue): InFlightIssue
