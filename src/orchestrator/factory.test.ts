@@ -22860,7 +22860,8 @@ describe('FactoryLoop', () => {
           expect(factory.status().counters.dispatchPlacementsUnpublishable).toBe(1)
           expect(calls).toEqual([])
           expect(publishInputs).toEqual([])
-          expect(factory.status().inFlight).toEqual([])
+          // The terminal save lands a few awaits before the slot is freed.
+          await vi.waitFor(() => expect(factory.status().inFlight).toEqual([]))
         } finally {
           await factory.stop()
           await rm(root, { recursive: true, force: true })
