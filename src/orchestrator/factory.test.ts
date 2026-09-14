@@ -12518,6 +12518,15 @@ describe('FactoryLoop', () => {
       }
       expect(initial?.slack).toEqual(zeros)
       expect(initial?.health?.slack).toEqual(zeros)
+      const pushZeros = {
+        sandboxPushesPushed: 0,
+        sandboxPushesFailed: 0,
+        sandboxPushesEmpty: 0,
+        sandboxPushesUnavailable: 0,
+        sandboxPushesSkipped: 0,
+      }
+      expect(initial?.sandboxPush).toEqual(pushZeros)
+      expect(initial?.health?.sandboxPush).toEqual(pushZeros)
       await factory.stop()
       const stopped = await readFactoryLoopHeartbeat(heartbeatPath)
       expect(stopped?.health?.slack).toEqual(zeros)
@@ -22774,7 +22783,7 @@ describe('FactoryLoop', () => {
         repo: 'AgentWorkforce/pear',
       })
       expect(calls[0]?.title).toContain('93')
-      expect(factory.status().counters.sandboxPushesPublished).toBe(1)
+      expect(factory.status().counters.sandboxPushesPushed).toBe(1)
     })
 
     // The credential-isolation property, asserted rather than described.
@@ -22819,28 +22828,81 @@ describe('FactoryLoop', () => {
       await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
       expect(calls).toEqual([])
-      expect(factory.status().counters.sandboxPushesPublished ?? 0).toBe(0)
+      expect(factory.status().counters.sandboxPushesPushed ?? 0).toBe(0)
     })
 
-    it('still publishes when the placement reports no sandbox id', async () => {
+    /**
+     * The connection's contract, faithfully: with a `headSha` it points the
+     * ref at that commit itself; without one it can only probe for a branch
+     * it assumes someone else pushed, and refuses with "never pushed". A
+     * publish that reaches this probe after a failed push has lost the push's
+     * own reason, which is the defect these tests fence.
+     */
+    const probingMount = (publishInputs: GithubPublishPullRequestInput[]) => {
+      const githubWrite: GithubConnectionWrite = {
+        publishPullRequest: async (input) => {
+          publishInputs.push(input)
+          if (!input.headSha) {
+            throw new Error(
+              `Refusing to publish GitHub PR: implementer branch ${input.headRef} was never pushed to ${input.repo}`,
+            )
+          }
+          return {
+            repo: input.repo,
+            number: 274,
+            url: 'https://github.com/AgentWorkforce/pear/pull/274',
+            headRef: input.headRef ?? input.expectedHeadRef!,
+            headSha: input.headSha,
+          }
+        },
+        closePullRequest: async () => undefined,
+      }
+      return new FakeMountClient({
+        [issuePath(93)]: issueFile(93),
+        '/github/repos/AgentWorkforce/pear/meta.json': { default_branch: 'main' },
+      }, githubWrite)
+    }
+
+    const capturingLogger = (lines: unknown[][], errors: unknown[][] = lines) => ({
+      info: () => undefined,
+      warn: (...args: unknown[]) => lines.push(args),
+      error: (...args: unknown[]) => { lines.push(args); if (errors !== lines) errors.push(args) },
+    })
+
+    // Previously 'still publishes when the placement reports no sandbox id',
+    // which encoded the silent skip: a remote implementer's commits are in its
+    // sandbox, so with no sandbox id nothing can push them and the publish
+    // could only ever reach the "never pushed" probe.
+    it('refuses loudly, at error, when a remote implementer reports no sandbox id', async () => {
       const calls: SandboxPushInput[] = []
       const publishInputs: GithubPublishPullRequestInput[] = []
+      const logs: unknown[][] = []
+      const errors: unknown[][] = []
       const fleet = new RemoteFleetClient()
       fleet.sandboxId = undefined
       fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
       const factory = createFactory(config(), {
-        mount: publishingMount(publishInputs),
+        mount: probingMount(publishInputs),
         fleet,
         triage: new StaticTriage(),
         probePrResolver: async () => undefined,
         sandboxPush: { push: async (input) => { calls.push(input); return pushed() } },
+        logger: capturingLogger(logs, errors),
       })
 
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
       fleet.emitAgentExit('ar-93-impl-pear', 'crash')
-      await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
+      await vi.waitFor(() => expect(JSON.stringify(logs)).toContain(
+        'Refusing to publish AR-93: the remote implementer reported no sandbox id',
+      ))
+      expect(factory.status().counters.sandboxPushesSkipped).toBe(1)
+      expect(JSON.stringify(errors)).toContain(
+        '[factory] remote implementer cannot be pushed through the GitHub App push port',
+      )
       expect(calls).toEqual([])
+      expect(publishInputs).toEqual([])
+      expect(JSON.stringify(logs)).not.toContain('was never pushed')
     })
 
     /**
@@ -22945,13 +23007,12 @@ describe('FactoryLoop', () => {
       expect(factory.status().counters.sandboxPushesEmpty).toBe(1)
     })
 
-    // A push that does not land must not fail the dispatch: the existing
-    // publish path runs behind it and owns that decision.
-    it.each([
-      ['a failure', { status: 'failed', reason: 'base_branch_moved' } as SandboxPushResult, 'sandboxPushesFailed'],
-      ['an empty sandbox', { status: 'no-changes' } as SandboxPushResult, 'sandboxPushesEmpty'],
-      ['a throw', 'throw' as const, 'sandboxPushesFailed'],
-    ])('falls through to the normal publish path on %s', async (_label, outcome, counter) => {
+    // An empty sandbox is not a failure: the agent committed nothing, or an
+    // earlier attempt already pushed it, so the normal publish path runs.
+    // (This used to be one row of a table that also let a FAILED push and a
+    // THROWN push fall through; those two rows encoded the defect and are
+    // replaced by the refusal tests below.)
+    it('falls through to the normal publish path on an empty sandbox', async () => {
       const publishInputs: GithubPublishPullRequestInput[] = []
       const fleet = new RemoteFleetClient()
       fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
@@ -22960,20 +23021,167 @@ describe('FactoryLoop', () => {
         fleet,
         triage: new StaticTriage(),
         probePrResolver: async () => undefined,
-        sandboxPush: {
-          push: async () => {
-            if (outcome === 'throw') throw new Error('daytona unreachable')
-            return outcome
-          },
-        },
+        sandboxPush: { push: async () => ({ status: 'no-changes' }) as SandboxPushResult },
       })
 
       await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
       fleet.emitAgentExit('ar-93-impl-pear', 'crash')
       await vi.waitFor(() => expect(publishInputs).toHaveLength(1))
 
-      expect(factory.status().counters[counter]).toBe(1)
+      expect(publishInputs[0]?.headSha).toBeUndefined()
+      expect(factory.status().counters.sandboxPushesEmpty).toBe(1)
       expect(factory.status().counters.errors ?? 0).toBe(0)
+    })
+
+    it('surfaces a failed push\'s own reason and never reaches the head-ref probe', async () => {
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const logs: unknown[][] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: probingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: { push: async () => ({ status: 'failed', reason: 'base_branch_moved' }) },
+        logger: capturingLogger(logs),
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+
+      // The refusal the publish path throws, not merely this method's own log.
+      await vi.waitFor(() => expect(JSON.stringify(logs)).toContain(
+        'Refusing to publish AR-93: the workspace GitHub App push of sandbox sandbox-abc',
+      ))
+      expect(JSON.stringify(logs)).toContain('base_branch_moved')
+      expect(JSON.stringify(logs)).not.toContain('was never pushed')
+      expect(publishInputs).toEqual([])
+      expect(factory.status().counters.sandboxPushesFailed).toBe(1)
+    })
+
+    it('surfaces a thrown push\'s reason as a retryable failure, not a "never pushed" refusal', async () => {
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const logs: unknown[][] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: probingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: { push: async () => { throw new Error('sandbox host unreachable') } },
+        logger: capturingLogger(logs),
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+
+      await vi.waitFor(() => expect(JSON.stringify(logs)).toContain(
+        'GitHub App push of sandbox sandbox-abc for AR-93',
+      ))
+      expect(JSON.stringify(logs)).toContain('sandbox host unreachable')
+      expect(JSON.stringify(logs)).not.toContain('was never pushed')
+      expect(publishInputs).toEqual([])
+      // Indeterminate, so not abandoned on the first attempt.
+      expect(factory.status().counters.dispatchPublishNonRetryable ?? 0).toBe(0)
+    })
+
+    it('publishes from the pushed commit sha, so the connection creates the ref instead of probing', async () => {
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const logs: unknown[][] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: probingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        // A push port that pushed but did not report a PR it opened.
+        sandboxPush: {
+          push: async (input) => ({ status: 'pushed', branch: input.branch, prUrl: '', commitSha: 'commit-274' }),
+        },
+        logger: capturingLogger(logs),
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(factory.status().counters.githubPullRequestsPublished).toBe(1))
+
+      expect(publishInputs).toHaveLength(1)
+      expect(publishInputs[0]).toMatchObject({ headSha: 'commit-274', headRef: publishInputs[0]?.expectedHeadRef })
+      expect(factory.status().counters.sandboxPushesPushed).toBe(1)
+      expect(JSON.stringify(logs)).not.toContain('was never pushed')
+    })
+
+    it('adopts the PR the push port already opened instead of opening a second one', async () => {
+      const publishInputs: GithubPublishPullRequestInput[] = []
+      const fleet = new RemoteFleetClient()
+      fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+      const factory = createFactory(config(), {
+        mount: probingMount(publishInputs),
+        fleet,
+        triage: new StaticTriage(),
+        probePrResolver: async () => undefined,
+        sandboxPush: {
+          push: async (input) => ({
+            status: 'pushed',
+            branch: input.branch,
+            prUrl: 'https://github.com/AgentWorkforce/pear/pull/1093',
+            commitSha: 'commit-1093',
+          }),
+        },
+      })
+
+      await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+      fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+      await vi.waitFor(() => expect(factory.status().counters.githubPullRequestsPublished).toBe(1))
+
+      expect(publishInputs).toEqual([])
+      expect(factory.status().counters.sandboxPushesPushed).toBe(1)
+    })
+
+    // The connection's publish path posts the late attestation grant, and an
+    // adopted receipt never reaches it — so adoption must post it itself.
+    it('posts the attestation grant for an adopted PR, with the implementer session', async () => {
+      const grants: Array<{ url: string; body: Record<string, unknown> }> = []
+      vi.stubEnv('RELAYAUTH_URL', 'https://auth.example.test')
+      vi.stubEnv('RELAY_ATTEST_API_KEY', 'test-key')
+      vi.stubEnv('RELAY_ATTEST_AGENT_ID', 'agent-test')
+      vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
+        grants.push({ url: String(url), body: JSON.parse(String(init.body)) as Record<string, unknown> })
+        return new Response('{}', { status: 200 })
+      }))
+      try {
+        const fleet = new RemoteFleetClient()
+        fleet.setSessionRef('ar-93-impl-pear', 'session-impl-93')
+        const factory = createFactory(config(), {
+          mount: probingMount([]),
+          fleet,
+          triage: new StaticTriage(),
+          probePrResolver: async () => undefined,
+          sandboxPush: {
+            push: async (input) => ({
+              status: 'pushed',
+              branch: input.branch,
+              prUrl: 'https://github.com/AgentWorkforce/pear/pull/1093',
+              commitSha: 'commit-1093',
+            }),
+          },
+        })
+
+        await factory.dispatch(await factory.triageIssue(parseLinearIssue(issuePath(93), issueFile(93))))
+        fleet.emitAgentExit('ar-93-impl-pear', 'crash')
+        await vi.waitFor(() => expect(factory.status().counters.githubPullRequestsPublished).toBe(1))
+
+        expect(grants).toEqual([{
+          url: 'https://auth.example.test/v1/attestations/grants',
+          body: { agentId: 'agent-test', repo: 'AgentWorkforce/pear', late: true, sessionRef: 'session-impl-93' },
+        }])
+      } finally {
+        vi.unstubAllEnvs()
+        vi.unstubAllGlobals()
+      }
     })
   })
 
