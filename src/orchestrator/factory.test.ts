@@ -6292,6 +6292,166 @@ describe('FactoryLoop', () => {
     }
   })
 
+  /**
+   * One repository's listing fault costs that repository, not the sweep.
+   *
+   * Enumeration used to sit under one catch for every configured repository,
+   * so a single shed index read -- the workspace durable object answering 429
+   * for one of many repos -- failed the whole readiness sweep and nothing
+   * dispatched anywhere. The fail-closed half is pinned beside it: an issue
+   * whose own state could not be read is never triaged or dispatched.
+   */
+  describe('per-repository GitHub enumeration isolation', () => {
+    const shed = (): Error => Object.assign(
+      new Error('workspace durable object is busy; retry after the advertised delay'),
+      { status: 429, details: { reason: 'inflight_limit', retryAfterSeconds: 5 } },
+    )
+    const timedOut = (): Error => new RelayfileOperationTimeoutError('readFile', 300_000)
+    const indexPathFor = (repo: string) => `/github/repos/AgentWorkforce/${repo}/issues/_index.json`
+    const issuePathFor = (repo: string, number: number) => githubIssueCompactPath('AgentWorkforce', repo, number)
+
+    /** An ordinary fake mount that fails reads of the chosen paths. */
+    class FaultInjectingMount extends FakeMountClient {
+      readonly faults = new Map<string, () => Error>()
+
+      constructor(repos: Array<[repo: string, number: number]>) {
+        const files: Record<string, unknown> = {}
+        for (const [repo, number] of repos) {
+          files[indexPathFor(repo)] = [
+            { id: String(number), number, title: `Issue ${number}`, updated: '2026-09-14T00:00:00Z', state: 'open', labels: ['factory'] },
+          ]
+          files[issuePathFor(repo, number)] = githubIssueFile(number, { repo, labels: ['factory'] })
+        }
+        super(files)
+        this.setSubRoot('/linear/issues', 'absent')
+      }
+
+      override async readFile(path: string): Promise<{ content: unknown; revision?: string }> {
+        const fault = this.faults.get(path)
+        if (fault) {
+          this.reads.push(path)
+          throw fault()
+        }
+        return super.readFile(path)
+      }
+    }
+
+    const threeRepoGithubConfig = (overrides: FactoryConfigOverrides = {}): FactoryConfig => multiRepoGithubConfig({
+      repos: {
+        byLabel: {
+          pear: 'AgentWorkforce/pear',
+          hoopsheet: 'AgentWorkforce/hoopsheet',
+          relay: 'AgentWorkforce/relay',
+        },
+        byProject: {},
+        keywordRules: [],
+        clonePaths: {
+          'AgentWorkforce/pear': '/work/pear',
+          'AgentWorkforce/hoopsheet': '/work/hoopsheet',
+          'AgentWorkforce/relay': '/work/relay',
+        },
+        default: 'AgentWorkforce/pear',
+      },
+      ...overrides,
+    })
+
+    const withFactory = async (
+      mount: FaultInjectingMount,
+      body: (factory: ReturnType<typeof createFactory>, fleet: FakeFleetClient) => Promise<void>,
+      configure: (overrides: FactoryConfigOverrides) => FactoryConfig = multiRepoGithubConfig,
+    ): Promise<void> => {
+      const root = await mkdtemp(join(tmpdir(), 'factory-github-repo-isolation-'))
+      const fleet = new FakeFleetClient()
+      const factory = createFactory(configure({ loop: { registryPath: join(root, 'registry.json') } }), {
+        mount,
+        fleet,
+        stateStore: new InMemoryStateStore({ batchSize: 4 }),
+        triage: new StaticTriage(),
+        githubWriteback: new RecordingGithubWriteback(),
+      })
+      try {
+        await body(factory, fleet)
+      } finally {
+        await factory.stop()
+        await rm(root, { recursive: true, force: true })
+      }
+    }
+
+    it.each([
+      ['pear', 'hoopsheet'],
+      ['hoopsheet', 'pear'],
+    ])('dispatches the other repository when %s has its listing shed', async (failing, healthy) => {
+      const numbers: Record<string, number> = { pear: 70, hoopsheet: 71 }
+      const mount = new FaultInjectingMount([['pear', 70], ['hoopsheet', 71]])
+      mount.faults.set(indexPathFor(failing), shed)
+
+      await withFactory(mount, async (factory) => {
+        const report = await factory.runOnce()
+
+        expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor(healthy, numbers[healthy]!)])
+        // Fail-closed by construction: the skipped repository's issue was
+        // never read, so it could not have been triaged or dispatched.
+        expect(mount.reads).not.toContain(issuePathFor(failing, numbers[failing]!))
+        expect(report.triaged.map((decision) => decision.issue.path)).toEqual([issuePathFor(healthy, numbers[healthy]!)])
+        // A partial listing is still reported as an incomplete look, never as
+        // an empty one (#406).
+        expect(report.discoveryFailed).toBe('issue-listing-failed')
+        expect(factory.status().counters.githubIssueListFailures).toBe(1)
+      })
+    })
+
+    it('dispatches past one repository whose listing timed out', async () => {
+      const mount = new FaultInjectingMount([['pear', 70], ['hoopsheet', 71]])
+      mount.faults.set(indexPathFor('hoopsheet'), timedOut)
+
+      await withFactory(mount, async (factory) => {
+        const report = await factory.runOnce()
+
+        expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor('pear', 70)])
+        expect(mount.reads).not.toContain(issuePathFor('hoopsheet', 71))
+        expect(report.discoveryFailed).toBe('issue-listing-failed')
+      })
+    })
+
+    it.each([
+      ['shed', shed],
+      ['failed with a backend error', () => new Error('500 Internal Server Error')],
+    ] as const)('never dispatches an issue whose own read %s, and still dispatches its neighbour', async (_label, fault) => {
+      const mount = new FaultInjectingMount([['pear', 70], ['hoopsheet', 71]])
+      mount.faults.set(issuePathFor('hoopsheet', 71), fault)
+
+      await withFactory(mount, async (factory) => {
+        const report = await factory.runOnce()
+
+        expect(report.dispatched.map((result) => result.issue.path)).toEqual([issuePathFor('pear', 70)])
+        expect(report.triaged.map((decision) => decision.issue.path)).toEqual([issuePathFor('pear', 70)])
+        expect(report.pulled.map((issue) => issue.path)).not.toContain(issuePathFor('hoopsheet', 71))
+      })
+    })
+
+    it('still fails the sweep when every repository has its listing shed', async () => {
+      const mount = new FaultInjectingMount([['pear', 70], ['hoopsheet', 71]])
+      mount.faults.set(indexPathFor('pear'), shed)
+      mount.faults.set(indexPathFor('hoopsheet'), shed)
+
+      await withFactory(mount, async (_factory, fleet) => {
+        await expect(_factory.runOnce()).rejects.toMatchObject({ status: 429 })
+        expect(fleet.spawns).toEqual([])
+      })
+    })
+
+    it('abandons the listing at the second repository timeout instead of waiting out every repository', async () => {
+      const mount = new FaultInjectingMount([['pear', 70], ['hoopsheet', 71], ['relay', 72]])
+      mount.faults.set(indexPathFor('pear'), timedOut)
+      mount.faults.set(indexPathFor('hoopsheet'), timedOut)
+
+      await withFactory(mount, async (factory, fleet) => {
+        await expect(factory.runOnce()).rejects.toBeInstanceOf(RelayfileOperationTimeoutError)
+        expect(fleet.spawns).toEqual([])
+      }, threeRepoGithubConfig)
+    })
+  })
+
   it('heals a stale durable GitHub tree cache from the current issue index before remote dispatch', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-github-index-cache-heal-'))
     const indexPath = '/github/repos/AgentWorkforce/pear/issues/_index.json'
