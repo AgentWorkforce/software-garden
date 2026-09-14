@@ -680,6 +680,59 @@ const APP_PUBLISH_UNAVAILABLE =
   'GitHub pull request publication requires the workspace GitHub App. Software Garden publishes agent work only through the ' +
   'Nango-backed workspace GitHub connection, and no connected App write path is available on this mount; ' +
   'refusing to publish rather than falling back to the local gh CLI or to an operator credential.'
+
+/**
+ * What the workspace GitHub App sandbox push did for one publish attempt.
+ *
+ * It used to be a boolean ("was the push path applicable"), and that boolean
+ * was `true` for a push that FAILED as well as one that landed. The caller
+ * then carried on without a head sha, so the Relayfile adapter fell back to
+ * probing `refs/heads/<branch>` and refused with "implementer branch … was
+ * never pushed" — true, but it replaced the push's own reason, which reached
+ * only container stderr. Every outcome is now distinct, and each one that must
+ * stop publication carries the message to stop it with (`refusal`).
+ *
+ * - `pushed`: the App created the commit (`commitSha`) and, when the port
+ *   reports one, already opened the PR (`prUrl`).
+ * - `no-changes`: nothing new to push. Not a failure: it is also what an
+ *   idempotent retry after an earlier successful push answers.
+ * - `failed`: the push was attempted and did not land.
+ * - `skipped`: this path does not apply (a local placement, or a remote node
+ *   that is not a sandbox in a runtime with no push port), or it applies and
+ *   a field it needs is missing — which is a refusal, not a quiet skip.
+ * - `unavailable`: a remote implementer, and no push port wired (relay#1654).
+ */
+type ImplementerSandboxPushOutcome =
+  | { status: 'pushed'; branch: string; commitSha: string; prUrl?: string }
+  | { status: 'no-changes' }
+  | { status: 'failed'; reason: string; refusal: string }
+  | { status: 'skipped'; reason: 'local-placement' | 'not-sandboxed' }
+  | {
+      status: 'skipped'
+      reason: 'missing-sandbox-id' | 'missing-branch' | 'missing-clone-path'
+      refusal: string
+    }
+  | { status: 'unavailable'; refusal: string }
+
+/**
+ * The PR number from a push port's `prUrl`, or `undefined` when the URL is not
+ * a canonical pull request of `repo`. A receipt is only adopted when it names
+ * exactly the repository this publish is for.
+ */
+const pullRequestNumberFromUrl = (prUrl: string | undefined, repo: string): number | undefined => {
+  if (!prUrl) return undefined
+  let url: URL
+  try {
+    url = new URL(prUrl)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com') return undefined
+  const match = url.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/([1-9]\d*)\/?$/u)
+  if (!match || `${match[1]}/${match[2]}`.toLowerCase() !== repo.toLowerCase()) return undefined
+  const number = Number(match[3])
+  return Number.isSafeInteger(number) ? number : undefined
+}
 /**
  * Separator for the per-repository publish budget key. `::` cannot appear in a
  * dispatch lifecycle key (`github:owner/repo#n` or `linear:uuid`), so the
@@ -11266,6 +11319,15 @@ export class FactoryLoop implements Factory {
         slackGateBypassedByWebhookHealth: this.#counters.slackGateBypassedByWebhookHealth ?? 0,
         slackGateBypassedByObservedEvent: this.#counters.slackGateBypassedByObservedEvent ?? 0,
       },
+      // Same discipline as `slack`: named, numbers only, authoritative zeros
+      // from the writer. No push reason crosses; that stays in the logs.
+      sandboxPush: {
+        sandboxPushesPushed: this.#counters.sandboxPushesPushed ?? 0,
+        sandboxPushesFailed: this.#counters.sandboxPushesFailed ?? 0,
+        sandboxPushesEmpty: this.#counters.sandboxPushesEmpty ?? 0,
+        sandboxPushesUnavailable: this.#counters.sandboxPushesUnavailable ?? 0,
+        sandboxPushesSkipped: this.#counters.sandboxPushesSkipped ?? 0,
+      },
       readinessReconcile: this.#readinessReconcileStatus(),
       dispatchCapacity: this.#dispatchCapacityStatus(),
       fleetControlPlane: this.#fleetControlPlane.status(),
@@ -12768,16 +12830,15 @@ export class FactoryLoop implements Factory {
    * Publish a remote implementer's sandbox commits as a branch and a PR,
    * through the workspace GitHub App.
    *
-   * Returns whether this path was APPLICABLE — a remote implementer with a
-   * sandbox to push from — rather than whether this particular attempt pushed.
-   * That is what the caller needs: once a push has been attempted for a head,
-   * a PR may exist for it, and a later retry that answers `no-changes` because
-   * the sandbox was already pushed must still reconcile rather than try to
-   * create a duplicate.
-   *
-   * A push that was ATTEMPTED and failed stays best-effort and non-throwing:
-   * the existing publish path still runs behind this, and its own error
-   * handling decides the record's fate.
+   * Returns a typed {@link ImplementerSandboxPushOutcome}, never a bare
+   * "applicable" flag. A push that was ATTEMPTED and failed used to report
+   * `true` here, and publication then fell through to a head-ref probe that
+   * could only ever answer "never pushed" — hiding the push's own reason. Now
+   * a failure, a missing field on a remote implementer and a missing port each
+   * come back with a `refusal` the caller throws, and a success comes back
+   * with the commit sha (and PR url) the caller publishes from. A retry that
+   * answers `no-changes` because an earlier attempt already pushed still
+   * reconciles rather than creating a duplicate.
    *
    * A missing `sandboxPush` port is a different thing entirely, and is the
    * relay#1654 defect. `sandboxPush` is optional and is injected by
@@ -12807,18 +12868,43 @@ export class FactoryLoop implements Factory {
     implementer: TrackedAgent,
     repo: string,
     issue: LinearIssue,
-  ): Promise<boolean> {
-    const sandboxId = implementer.result?.sandboxId
+  ): Promise<ImplementerSandboxPushOutcome> {
+    if (implementer.result?.locality !== 'remote') return { status: 'skipped', reason: 'local-placement' }
+    const sandboxId = implementer.result.sandboxId
     const branch = implementer.spec.branch
-    if (
-      !sandboxId ||
-      !branch ||
-      implementer.result?.locality !== 'remote' ||
-      !implementer.spec.clonePath
-    ) {
-      return false
-    }
+    const clonePath = implementer.spec.clonePath
     const push = this.#sandboxPush
+    // A remote node that is not a sandbox (`placementSandboxOnly: false`) in a
+    // runtime with no push port holds its own checkout and pushes its own
+    // branch; the connection's head-ref check is the right gate there. Only a
+    // SANDBOX runtime — a push port wired, or a sandbox id reported — can
+    // reach the refusals below.
+    if (!sandboxId && !push) return { status: 'skipped', reason: 'not-sandboxed' }
+    if (!sandboxId || !branch || !clonePath) {
+      // A remote implementer's commits are inside its sandbox, so a missing
+      // field here does not mean "nothing to push" — it means this factory
+      // cannot push them. Continuing would reach a head-ref probe that can
+      // only refuse, with a reason that names the wrong cause.
+      const reason = !sandboxId ? 'missing-sandbox-id' as const
+        : !branch ? 'missing-branch' as const
+        : 'missing-clone-path' as const
+      const field = !sandboxId ? 'sandbox id' : !branch ? 'branch' : 'clone path'
+      this.#increment('sandboxPushesSkipped')
+      this.#logger.error?.('[factory] remote implementer cannot be pushed through the GitHub App push port', {
+        issue: record.issue.key,
+        repo,
+        reason,
+        ...(branch ? { branch } : {}),
+        ...(sandboxId ? { sandboxId } : {}),
+      })
+      return {
+        status: 'skipped',
+        reason,
+        refusal: `Refusing to publish ${record.issue.key}: the remote implementer reported no ${field}, so its ` +
+          'commits cannot be pushed through the workspace GitHub App push port. Software Garden will not publish ' +
+          'a pull request from a branch it did not push.',
+      }
+    }
     if (!push) {
       this.#increment('sandboxPushesUnavailable')
       const message = `Refusing to publish ${record.issue.key} from sandbox ${sandboxId}: ` +
@@ -12832,54 +12918,85 @@ export class FactoryLoop implements Factory {
         sandboxId,
         error: message,
       })
-      throw new Error(message)
+      return { status: 'unavailable', refusal: message }
     }
-    try {
-      const result = await push.push({
-        sandboxId,
-        repoPath: implementer.spec.clonePath,
-        repo,
-        branch,
-        title: `${issue.key}: ${issue.title}`,
-        body: githubPullRequestBody(
-          issue,
-          implementer.spec.preview,
-          canonicalTrajectorySessionRef(implementer.sessionRef),
-          trajectorySessionSourceForCapability(implementer.spec.capability),
-        ),
-      })
-      if (result.status === 'pushed') {
-        this.#increment('sandboxPushesPublished')
-        this.#logger.info?.('[factory] pushed implementer sandbox changes', {
-          issue: record.issue.key,
-          repo,
-          branch: result.branch,
-          prUrl: result.prUrl,
-          commitSha: result.commitSha,
-        })
-        return true
-      }
-      // `no-changes` is not a failure and must not be counted as one: the
-      // agent committed nothing, and the publish path below will reach the
-      // same conclusion on its own.
-      this.#increment(result.status === 'no-changes' ? 'sandboxPushesEmpty' : 'sandboxPushesFailed')
-      this.#logger.warn?.('[factory] implementer sandbox changes were not pushed', {
-        issue: record.issue.key,
-        repo,
-        branch,
-        status: result.status,
-        ...(result.status === 'failed' ? { reason: result.reason } : {}),
-      })
-      return true
-    } catch (error) {
+    const result = await push.push({
+      sandboxId,
+      repoPath: clonePath,
+      repo,
+      branch,
+      title: `${issue.key}: ${issue.title}`,
+      body: githubPullRequestBody(
+        issue,
+        implementer.spec.preview,
+        canonicalTrajectorySessionRef(implementer.sessionRef),
+        trajectorySessionSourceForCapability(implementer.spec.capability),
+      ),
+    }).catch((error: unknown) => ({ status: 'threw' as const, reason: describeError(error).errorMessage }))
+    if (result.status === 'threw') {
       this.#increment('sandboxPushesFailed')
-      this.#logger.warn?.('[factory] implementer sandbox push threw', {
+      this.#logger.error?.('[factory] implementer sandbox push threw', {
         issue: record.issue.key,
         repo,
         branch,
-        error: describeError(error).errorMessage,
+        error: result.reason,
       })
-      return true
+      // Deliberately NOT a `Refusing to publish` refusal: a throw is
+      // indeterminate (a transport blip, a host restart), so it stays
+      // retryable and the publish budget re-attempts the push, then
+      // terminalizes it with this reason once the retries are spent.
+      return {
+        status: 'failed',
+        reason: result.reason,
+        refusal: `GitHub App push of sandbox ${sandboxId} for ${record.issue.key} to ${repo} branch ${branch} ` +
+          `did not complete: ${result.reason}`,
+      }
+    }
+    if (result.status === 'pushed' && result.commitSha) {
+      this.#increment('sandboxPushesPushed')
+      this.#logger.info?.('[factory] pushed implementer sandbox changes', {
+        issue: record.issue.key,
+        repo,
+        branch: result.branch,
+        prUrl: result.prUrl,
+        commitSha: result.commitSha,
+      })
+      return {
+        status: 'pushed',
+        branch: result.branch,
+        commitSha: result.commitSha,
+        ...(result.prUrl ? { prUrl: result.prUrl } : {}),
+      }
+    }
+    if (result.status === 'no-changes') {
+      // Not a failure and not counted as one: the agent committed nothing, or
+      // an earlier attempt already pushed it. The publish path reconciles.
+      this.#increment('sandboxPushesEmpty')
+      this.#logger.info?.('[factory] implementer sandbox had no changes to push', {
+        issue: record.issue.key,
+        repo,
+        branch,
+      })
+      return { status: 'no-changes' }
+    }
+    // A push the host attempted and rejected. Deterministic, so it opens with
+    // `Refusing to publish` and is abandoned on the first attempt, exactly as
+    // the "never pushed" probe it replaces was — but with the push's reason.
+    const reason = result.status === 'failed'
+      ? result.reason
+      : 'the push port reported a push with no commit sha'
+    this.#increment('sandboxPushesFailed')
+    this.#logger.error?.('[factory] implementer sandbox changes were not pushed', {
+      issue: record.issue.key,
+      repo,
+      branch,
+      reason,
+    })
+    return {
+      status: 'failed',
+      reason,
+      refusal: `Refusing to publish ${record.issue.key}: the workspace GitHub App push of sandbox ${sandboxId} ` +
+        `to ${repo} branch ${branch} failed: ${reason}`,
     }
   }
 
@@ -12950,7 +13067,37 @@ export class FactoryLoop implements Factory {
     // branch we are about to open a PR from does not exist yet. Push it as the
     // App first. Runs here, on the single publish chokepoint, so the
     // completion path gets it as well as exit recovery.
-    const sandboxPushApplicable = await this.#tryPushImplementerSandbox(record, implementer, repo, issue)
+    const sandboxPush = await this.#tryPushImplementerSandbox(record, implementer, repo, issue)
+    // A failed push, a remote implementer missing a field, or no push port:
+    // stop here with that reason. Falling through reached a head-ref probe
+    // that could only answer "never pushed", which hid the real cause.
+    if ('refusal' in sandboxPush) throw new Error(sandboxPush.refusal)
+    // The push port opens the PR on its way through. Adopt that receipt
+    // instead of asking the connection to open a second PR on the same head.
+    const pushedPullRequestNumber = sandboxPush.status === 'pushed' && sandboxPush.branch === expectedHeadRef
+      ? pullRequestNumberFromUrl(sandboxPush.prUrl, repo)
+      : undefined
+    if (sandboxPush.status === 'pushed' && sandboxPush.prUrl && pushedPullRequestNumber !== undefined) {
+      const adopted: GithubPublishPullRequestResult = {
+        repo,
+        number: pushedPullRequestNumber,
+        url: sandboxPush.prUrl,
+        headRef: expectedHeadRef,
+        headSha: sandboxPush.commitSha,
+        author: identity,
+      }
+      this.#publishedPullRequests.set(key, adopted)
+      this.#increment('githubPullRequestsPublished')
+      this.#logger.info?.('[factory] published PR through the GitHub App sandbox push', {
+        issue: issue.key,
+        repo,
+        prNumber: adopted.number,
+        url: adopted.url,
+        identity,
+      })
+      return adopted
+    }
+    const sandboxPushApplicable = sandboxPush.status === 'pushed' || sandboxPush.status === 'no-changes'
     // Reconcile whenever the push path was APPLICABLE, not only when this
     // attempt pushed. A push opens the PR on its way through, and under
     // relayfile-cloud the mounted snapshot can lag that creation — so a
@@ -12978,6 +13125,10 @@ export class FactoryLoop implements Factory {
     const result = await publisher.publishPullRequest({
       repo,
       ...(remoteBranch ? { headRef: remoteBranch } : { clonePath: implementer.spec.clonePath }),
+      // The commit the App just pushed. With a sha the connection points the
+      // ref at it itself; without one it can only probe for a branch it
+      // assumes someone else pushed.
+      ...(sandboxPush.status === 'pushed' ? { headSha: sandboxPush.commitSha } : {}),
       expectedHeadRef,
       baseRef,
       title: `${issue.key}: ${issue.title}`,

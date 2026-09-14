@@ -200,6 +200,18 @@ export interface FactorySlackCounters {
   slackGateBypassedByObservedEvent: number
 }
 
+/**
+ * Process-local GitHub App sandbox push outcomes; reset on daemon restart.
+ * Numbers only: a push's failure reason stays in the logs.
+ */
+export interface FactorySandboxPushCounters {
+  sandboxPushesPushed: number
+  sandboxPushesFailed: number
+  sandboxPushesEmpty: number
+  sandboxPushesUnavailable: number
+  sandboxPushesSkipped: number
+}
+
 export interface FactoryLoopHeartbeat {
   /** Process-wide PR record I/O, including completion probes outside discovery. */
   prProbe?: PrProbeReadCacheStatus
@@ -245,6 +257,8 @@ export interface FactoryLoopHeartbeat {
   eventListener?: FactoryEventListenerStatus
   /** Absent on older producers. Only the writer supplies authoritative zeros. */
   slack?: FactorySlackCounters
+  /** Absent on older producers. Only the writer supplies authoritative zeros. */
+  sandboxPush?: FactorySandboxPushCounters
   readinessReconcile?: FactoryReadinessReconcileStatus
   /** Batch-slot admission: a full batch is why dispatch stops without failing (#303). */
   dispatchCapacity?: FactoryDispatchCapacityStatus
@@ -876,6 +890,12 @@ export interface FactoryPublicHealth {
    * Missing counters remain absent when reading older or invalid records.
    */
   slack?: Partial<FactorySlackCounters>
+  /**
+   * GitHub App sandbox push outcomes, not a dispatch or liveness gate. A
+   * rising `sandboxPushesFailed` with no `sandboxPushesPushed` is a garden
+   * that dispatches work and publishes none of it.
+   */
+  sandboxPush?: Partial<FactorySandboxPushCounters>
   fleetControlPlane?: FactoryPublicFleetControlPlaneHealth
   /** Fleet event socket. NOT dispatch-gating: see DISPATCH_GATING_SUBSYSTEMS. */
   fleetConnect?: FactoryPublicFleetConnectHealth
