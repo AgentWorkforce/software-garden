@@ -257,6 +257,7 @@ describe('RelayFleetClient', () => {
     const messaging = new FakeMessaging()
     const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-abc' }))
     const fleet = createClient(messaging, { provisionSandbox })
+    expect(fleet.canProvision('workflow:run')).toBe(true)
 
     await fleet.spawn({
       name: 'ar-3-impl',
@@ -337,6 +338,7 @@ describe('RelayFleetClient', () => {
   it('refuses to place workflow:run when placementSandboxOnly has no provisioner', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging, { placementSandboxOnly: true })
+    expect(fleet.canProvision('workflow:run')).toBe(false)
 
     await expect(fleet.spawn({
       name: 'wf-no-sandbox',

@@ -340,6 +340,13 @@ export class RelayFleetClient implements FleetClient {
     return this.#tracked
   }
 
+  canProvision(capability: Capability): boolean {
+    return Boolean(
+      this.#options.provisionSandbox &&
+      (capability.startsWith('spawn:') || capability === 'workflow:run'),
+    )
+  }
+
   /** Re-adopt agents recorded in the in-flight registry after a restart. */
   hydrateTracked(agents: Array<{ name: string; invocationId?: string; node?: string }>): void {
     for (const agent of agents) {
@@ -404,7 +411,10 @@ export class RelayFleetClient implements FleetClient {
     // filesystem cannot honor factory-cloud's dispatch cloneRoot.
     let sandboxTargetNode: string | undefined
     let sandboxTargetId: string | undefined
-    if (input.capability.startsWith('spawn:') || input.capability === 'workflow:run') {
+    if (
+      input.capability.startsWith('spawn:') ||
+      input.capability === 'workflow:run'
+    ) {
       if (this.#options.provisionSandbox) {
         const provisioned = await this.#withinDeadline(
           'sandbox provision',

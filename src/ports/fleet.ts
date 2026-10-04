@@ -370,6 +370,8 @@ export interface FleetClient {
   onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
   onAgentUsage?(listener: (usage: AgentUsage) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
+  /** Whether this backend can create placement capacity before dispatch. */
+  canProvision?(capability: Capability): boolean
   // Durable backends track spawned-and-not-exited agents so the orchestrator
   // can persist them for crash recovery and re-adopt them after a restart.
   trackedAgents?(): ReadonlyMap<string, FleetTrackedAgent>

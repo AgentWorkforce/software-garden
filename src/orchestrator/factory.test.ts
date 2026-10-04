@@ -1181,6 +1181,11 @@ class NodeDiscoveryRemoteFleetClient extends RemoteLifecycleFleetClient {
     { name: 'sf-mini', capabilities: ['spawn:codex', 'spawn:claude'], live: true },
   ]
   readonly unregistered = new Set<string>()
+  readonly provisionable = new Set<SpawnInput['capability']>()
+
+  canProvision(capability: SpawnInput['capability']): boolean {
+    return this.provisionable.has(capability)
+  }
 
   override async spawn(input: SpawnInput): Promise<SpawnResult> {
     const result = await super.spawn(input)
@@ -3374,6 +3379,44 @@ describe('remote fleet node discovery and registration admission', () => {
 
       expect(fleet.spawns).toEqual([])
       await expect(stateStore.listDispatchLifecycles('factory-test')).resolves.toEqual([])
+    } finally {
+      await factory.stop()
+    }
+  })
+
+  it('admits a cold provisionable workflow and does not wait for agent registration', async () => {
+    const path = issuePath(394)
+    const issue = realIssueFile(394, ready, {
+      labels: [{ name: 'pear' }, { name: 'agent:workflow' }],
+    })
+    const fleet = new NodeDiscoveryRemoteFleetClient()
+    fleet.nodes = [
+      { name: 'chief-broker', capabilities: ['spawn:codex'], live: true },
+    ]
+    fleet.provisionable.add('workflow:run')
+    fleet.unregistered.add('ar-394-workflow')
+    const stateStore = new InMemoryStateStore({ batchSize: 1 })
+    const factory = createFactory(config({ batchSize: 1 }), {
+      mount: new FakeMountClient({ [path]: issue }),
+      fleet,
+      stateStore,
+      triage: new StaticTriage(),
+    })
+
+    try {
+      const decision = await factory.triageIssue(parseLinearIssue(path, issue))
+      await expect(factory.dispatch(decision)).resolves.toMatchObject({
+        agents: [{ name: 'ar-394-workflow', role: 'workflow' }],
+      })
+      expect(fleet.spawns).toHaveLength(1)
+      expect(fleet.spawns[0]).toMatchObject({
+        capability: 'workflow:run',
+        node: 'self',
+      })
+      await expect(stateStore.getDispatchLifecycle(
+        'factory-test',
+        dispatchIssueIdentity(decision.issue),
+      )).resolves.toMatchObject({ phase: 'running' })
     } finally {
       await factory.stop()
     }
