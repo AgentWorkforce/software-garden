@@ -120,13 +120,20 @@ export interface RelayFleetClientOptions {
    * `worker_cwd`, so placing on any other node would silently degrade to
    * the same failure this hook exists to prevent.
    *
-   * Returning an empty `nodeName` behaves the same as throwing.
+   * Returning an empty `nodeName` behaves the same as throwing. A successful
+   * result should also expose `release` so the client can compensate if the
+   * provision finishes after the shared spawn deadline. Without that callback
+   * a late success creates a sandbox that placement never had a chance to use.
    */
   provisionSandbox?: (input: {
     repo?: string
     capability: Capability
     name: string
-  }) => Promise<{ nodeName: string; sandboxId?: string }>
+  }) => Promise<{
+    nodeName: string
+    sandboxId?: string
+    release?: (reason: string) => void | Promise<void>
+  }>
   /**
    * Refuse to place a `spawn:*` or `workflow:run` invocation that has no JIT sandbox behind
    * it. Requires {@link provisionSandbox}. Turns "landed on a laptop and
@@ -153,9 +160,8 @@ export interface RelayFleetClientOptions {
    * excludes the case production actually hit. Set this to `false` to allow
    * a deliberate fall-through.
    *
-   * Ignored for non-`spawn:*` capabilities (workflow runs and preview
-   * placements do not need /srv/agent-workforce and often want to land on
-   * whatever fleet node has the capability).
+   * Ignored for capabilities other than `spawn:*` and `workflow:run` (preview
+   * placements remain on their existing fleet node and never JIT-provision).
    */
   placementSandboxOnly?: boolean
 }
@@ -424,6 +430,31 @@ export class RelayFleetClient implements FleetClient {
             capability: input.capability,
             name: input.name,
           }),
+          (inFlight) => {
+            void inFlight.then(async (outcome) => {
+              if (!outcome.ok) return
+              const late = outcome.value
+              if (typeof late.release !== 'function') {
+                this.#log(
+                  `Late sandbox provision for ${input.name} returned without a release callback; ` +
+                  `sandboxId=${late.sandboxId ?? '(none)'}`,
+                )
+                return
+              }
+              try {
+                await late.release('sandbox provision completed after the placement deadline')
+                this.#log(
+                  `Released late sandbox provision for ${input.name}; ` +
+                  `sandboxId=${late.sandboxId ?? '(none)'}`,
+                )
+              } catch (error) {
+                this.#log(
+                  `Failed to release late sandbox provision for ${input.name}; ` +
+                  `sandboxId=${late.sandboxId ?? '(none)'} error=${errorMessage(error)}`,
+                )
+              }
+            })
+          },
         )
         const proposedName = provisioned?.nodeName?.trim()
         if (!proposedName) {

@@ -321,6 +321,21 @@ describe('RelayFleetClient', () => {
     expect(result.sandboxId).toBe('sbx-workflow-1')
   })
 
+  it('places workflow:run on an explicit node without provisioning when the hook is absent', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { placementSandboxOnly: false })
+
+    await fleet.spawn({
+      name: 'wf-explicit',
+      capability: 'workflow:run',
+      node: 'garden-daytona-node',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })
+
+    expect(messaging.placements[0]?.node).toBe('garden-daytona-node')
+  })
+
   it('refuses to place spawn:* when placementSandboxOnly is set but no hook is configured', async () => {
     const messaging = new FakeMessaging()
     const fleet = createClient(messaging, { placementSandboxOnly: true })
@@ -440,8 +455,12 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements).toHaveLength(0)
   })
 
-  it('creates and removes previews on the owning node', async () => {
+  it('creates and removes previews on the owning node without provisioning a sandbox', async () => {
     const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'must-not-be-used',
+      sandboxId: 'must-not-be-created',
+    }))
     const preview = {
       id: 'preview-1',
       provider: 'tailscale-serve',
@@ -471,7 +490,7 @@ describe('RelayFleetClient', () => {
       status: 'completed',
       output: { preview },
     }])
-    const fleet = createClient(messaging)
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
 
     const reference = await fleet.createPreview({
       namespace: preview.namespace,
@@ -487,6 +506,7 @@ describe('RelayFleetClient', () => {
     })
 
     expect(reference).toEqual({ ...preview, node: 'mac-mini' })
+    expect(provisionSandbox).not.toHaveBeenCalled()
     expect(messaging.placements[0]).toMatchObject({
       capability: 'preview:tailscale-serve',
       repo: preview.repo,
@@ -2210,6 +2230,46 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
     node: 'self',
     repo: 'AgentWorkforce/factory',
     task: 'do work',
+  })
+
+  it('releases a sandbox that finishes provisioning after the shared deadline', async () => {
+    const messaging = new FakeMessaging()
+    const release = vi.fn(async () => {})
+    let finishProvisioning!: (value: {
+      nodeName: string
+      sandboxId: string
+      release: (reason: string) => Promise<void>
+    }) => void
+    const provisionSandbox = vi.fn(() => new Promise<{
+      nodeName: string
+      sandboxId: string
+      release: (reason: string) => Promise<void>
+    }>((resolve) => {
+      finishProvisioning = resolve
+    }))
+    const fleet = createClient(messaging, {
+      provisionSandbox,
+      placementSandboxOnly: true,
+      spawnAckTimeoutMs: 30,
+    })
+
+    await expect(fleet.spawn({
+      ...spawnInput(),
+      capability: 'workflow:run',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/timed out.*sandbox provision/i)
+
+    finishProvisioning({
+      nodeName: 'jit-daytona-late',
+      sandboxId: 'sbx-late',
+      release,
+    })
+    await vi.waitFor(() => {
+      expect(release).toHaveBeenCalledWith(
+        'sandbox provision completed after the placement deadline',
+      )
+    })
+    expect(messaging.placements).toHaveLength(0)
   })
 
   const pending = (invocationId: string): RelayActionInvocation =>
