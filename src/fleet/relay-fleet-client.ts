@@ -349,7 +349,10 @@ export class RelayFleetClient implements FleetClient {
   canProvision(capability: Capability): boolean {
     return Boolean(
       this.#options.provisionSandbox &&
-      (capability.startsWith('spawn:') || capability === 'workflow:run'),
+      // Only workflow actions may bypass a cold roster. Agent spawns keep the
+      // pre-existing fail-closed admission rule: at least one live node must
+      // advertise the harness before Factory writes a lifecycle claim.
+      capability === 'workflow:run',
     )
   }
 

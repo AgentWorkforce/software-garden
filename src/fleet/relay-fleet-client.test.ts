@@ -258,6 +258,7 @@ describe('RelayFleetClient', () => {
     const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-abc' }))
     const fleet = createClient(messaging, { provisionSandbox })
     expect(fleet.canProvision('workflow:run')).toBe(true)
+    expect(fleet.canProvision('spawn:codex')).toBe(false)
 
     await fleet.spawn({
       name: 'ar-3-impl',
