@@ -38,6 +38,7 @@ class FakeMessaging {
   readonly handlers = new Map<string, Set<EventHandler>>()
   invocations = new Map<string, RelayActionInvocation[]>()
   placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
+  placementError: Error | undefined
   agentRows: Array<{ name: string; status?: string; node?: string }> = []
   agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
@@ -121,6 +122,7 @@ class FakeMessaging {
 
   readonly placement = {
     spawn: async (input: RelaySpawnPlacementInput) => {
+      if (this.placementError) throw this.placementError
       this.placements.push(input)
       const invocationId = this.placementAck.invocationId ?? `inv-${++this.nextInvocationId}`
       const acknowledgedNode = Object.prototype.hasOwnProperty.call(this.placementAck, 'placement')
@@ -370,7 +372,8 @@ describe('RelayFleetClient', () => {
     // Empty string is the same failure mode as a hook that never came back:
     // we would fall through and let the engine pick a laptop.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: '   ' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({ nodeName: '   ', sandboxId: 'sbx-empty', release }))
     const fleet = createClient(messaging, { provisionSandbox })
 
     await expect(fleet.spawn({
@@ -380,6 +383,7 @@ describe('RelayFleetClient', () => {
     })).rejects.toBeInstanceOf(FleetSpawnNotCreatedError)
 
     expect(messaging.placements).toHaveLength(0)
+    expect(release).toHaveBeenCalledWith('sandbox provision returned no placement node')
   })
 
   it('refuses to place under placementSandboxOnly when the hook names no sandbox', async () => {
@@ -394,7 +398,8 @@ describe('RelayFleetClient', () => {
     // behind it". A node name alone cannot show there is one; the sandbox id
     // can, because a hook only knows it for a sandbox it provisioned.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: 'mac-mini' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'mac-mini', release }))
     const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
 
     await expect(fleet.spawn({
@@ -404,6 +409,7 @@ describe('RelayFleetClient', () => {
     })).rejects.toThrow(/placementSandboxOnly.*mac-mini.*no sandbox id/s)
 
     expect(messaging.placements).toHaveLength(0)
+    expect(release).toHaveBeenCalledWith('sandbox-only placement rejected an unproven provision')
   })
 
   it('places under placementSandboxOnly when the hook names a sandbox', async () => {
@@ -421,6 +427,27 @@ describe('RelayFleetClient', () => {
 
     expect(messaging.placements[0]?.node).toBe('fleet-ensure-abc12345')
     expect(result.sandboxId).toBe('sbx_1')
+  })
+
+  it('releases a timely sandbox when placement definitively rejects it', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementError = new Error('placement refused')
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'fleet-ensure-refused',
+      sandboxId: 'sbx-refused',
+      release,
+    }))
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
+
+    await expect(fleet.spawn({
+      name: 'wf-refused',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/placement refused/)
+
+    expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
   })
 
   it('still places a sandbox-less hook result when placementSandboxOnly is off', async () => {
@@ -2251,7 +2278,7 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
     const fleet = createClient(messaging, {
       provisionSandbox,
       placementSandboxOnly: true,
-      spawnAckTimeoutMs: 30,
+      spawnAckTimeoutMs: 200,
     })
 
     await expect(fleet.spawn({

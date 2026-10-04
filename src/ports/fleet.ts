@@ -370,7 +370,11 @@ export interface FleetClient {
   onAgentLifecycleSignal?(listener: (signal: AgentLifecycleSignal) => void | Promise<void>): () => void
   onAgentUsage?(listener: (usage: AgentUsage) => void | Promise<void>): () => void
   onAgentExit(listener: (name: string, reason?: string) => void): () => void
-  /** Whether this backend can create placement capacity before dispatch. */
+  /**
+   * Whether this backend may admit the capability without a live matching
+   * roster node. A backend can still provision other capabilities after the
+   * normal live-roster admission gate has selected them.
+   */
   canProvision?(capability: Capability): boolean
   // Durable backends track spawned-and-not-exited agents so the orchestrator
   // can persist them for crash recovery and re-adopt them after a restart.

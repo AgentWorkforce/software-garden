@@ -420,6 +420,7 @@ export class RelayFleetClient implements FleetClient {
     // filesystem cannot honor factory-cloud's dispatch cloneRoot.
     let sandboxTargetNode: string | undefined
     let sandboxTargetId: string | undefined
+    let releaseUnusedProvision: ((reason: string) => Promise<void>) | undefined
     if (
       input.capability.startsWith('spawn:') ||
       input.capability === 'workflow:run'
@@ -437,10 +438,10 @@ export class RelayFleetClient implements FleetClient {
             void inFlight.then(async (outcome) => {
               if (!outcome.ok) return
               const late = outcome.value
-              if (typeof late.release !== 'function') {
+              if (!late || typeof late.release !== 'function') {
                 this.#log(
                   `Late sandbox provision for ${input.name} returned without a release callback; ` +
-                  `sandboxId=${late.sandboxId ?? '(none)'}`,
+                  `sandboxId=${late?.sandboxId ?? '(none)'}`,
                 )
                 return
               }
@@ -456,11 +457,31 @@ export class RelayFleetClient implements FleetClient {
                   `sandboxId=${late.sandboxId ?? '(none)'} error=${errorMessage(error)}`,
                 )
               }
+            }).catch((error) => {
+              this.#log(
+                `Late sandbox provision cleanup failed unexpectedly for ${input.name}: ${errorMessage(error)}`,
+              )
             })
           },
         )
+        releaseUnusedProvision = async (reason: string): Promise<void> => {
+          if (!provisioned || typeof provisioned.release !== 'function') return
+          try {
+            await provisioned.release(reason)
+            this.#log(
+              `Released unused sandbox provision for ${input.name}; ` +
+              `sandboxId=${provisioned.sandboxId ?? '(none)'}`,
+            )
+          } catch (error) {
+            this.#log(
+              `Failed to release unused sandbox provision for ${input.name}; ` +
+              `sandboxId=${provisioned.sandboxId ?? '(none)'} error=${errorMessage(error)}`,
+            )
+          }
+        }
         const proposedName = provisioned?.nodeName?.trim()
         if (!proposedName) {
+          await releaseUnusedProvision('sandbox provision returned no placement node')
           throw new Error(
             'provisionSandbox returned no nodeName; refusing to place on an unbounded node',
           )
@@ -470,6 +491,7 @@ export class RelayFleetClient implements FleetClient {
         // hook actually stood a sandbox up rather than naming a node it found.
         sandboxTargetId = provisioned?.sandboxId?.trim() || undefined
         if (this.#options.placementSandboxOnly && !sandboxTargetId) {
+          await releaseUnusedProvision('sandbox-only placement rejected an unproven provision')
           throw new Error(
             `placementSandboxOnly is set but provisionSandbox named "${proposedName}" with no sandbox id; ` +
             'refusing to place work on a node it cannot show is a JIT sandbox',
@@ -488,29 +510,40 @@ export class RelayFleetClient implements FleetClient {
     // means "no placement preference".
     const resolvedNode = sandboxTargetNode
       ?? (input.node && input.node !== 'self' ? input.node : undefined)
-    const ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => {
-      onPlacementAttempt()
-      return messaging.placement.spawn({
-        capability: input.capability,
-        ...(resolvedNode ? { node: resolvedNode } : {}),
-        ...(input.repo ? { repo: input.repo } : {}),
-        input: spawnActionInput(input),
-        ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
-        // An ack proves the engine accepted the dispatch, not that the node
-        // launched anything: a node advertising `spawn:<harness>` on an obsolete
-        // broker acks and launches nothing, and that is indistinguishable from a
-        // real spawn until someone reads the invocation back. `confirm` makes the
-        // SDK do that read, bounded, and fail as `spawn_unconfirmed` instead of
-        // handing us an ack we would wait on forever (#306).
-        confirm: true,
-        confirmTimeoutMs: Math.max(1, deadlineAtMs - this.#now()),
-        confirmPollIntervalMs: this.#pollIntervalMs,
-        log: this.#log,
-        // Giving up on the wait does not cancel the placement. If Relay accepts
-        // it after we have already reported failure, a worker is live that
-        // nothing is tracking — so release it (#307 review, cubic).
-      })
-    }, (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
+    let ack: Awaited<ReturnType<typeof messaging.placement.spawn>>
+    try {
+      ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => {
+        onPlacementAttempt()
+        return messaging.placement.spawn({
+          capability: input.capability,
+          ...(resolvedNode ? { node: resolvedNode } : {}),
+          ...(input.repo ? { repo: input.repo } : {}),
+          input: spawnActionInput(input),
+          ...(this.#options.placementTtlMs !== undefined ? { ttlMs: this.#options.placementTtlMs } : {}),
+          // An ack proves the engine accepted the dispatch, not that the node
+          // launched anything: a node advertising `spawn:<harness>` on an obsolete
+          // broker acks and launches nothing, and that is indistinguishable from a
+          // real spawn until someone reads the invocation back. `confirm` makes the
+          // SDK do that read, bounded, and fail as `spawn_unconfirmed` instead of
+          // handing us an ack we would wait on forever (#306).
+          confirm: true,
+          confirmTimeoutMs: Math.max(1, deadlineAtMs - this.#now()),
+          confirmPollIntervalMs: this.#pollIntervalMs,
+          log: this.#log,
+          // Giving up on the wait does not cancel the placement. If Relay accepts
+          // it after we have already reported failure, a worker is live that
+          // nothing is tracking — so release it (#307 review, cubic).
+        })
+      }, (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
+    } catch (error) {
+      // A deadline does not cancel placement, so its compensator owns cleanup.
+      // A definitive refusal/rejection cannot create a worker; release the
+      // provision immediately instead of leaking unused capacity.
+      if (!(error instanceof RelaySpawnAckTimeoutError)) {
+        await releaseUnusedProvision?.('placement rejected before sandbox adoption')
+      }
+      throw error
+    }
     // A confirmed placement already carries the terminal invocation. Polling
     // for it again would spend the same budget twice over on a spawn that has
     // already proven it launched.
