@@ -293,21 +293,31 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements[0]?.node).toBe('jit-daytona-def')
   })
 
-  it('does not invoke provisionSandbox for non-spawn capabilities', async () => {
-    // Workflow and preview placements don't need /srv/agent-workforce; forcing
-    // JIT sandbox provisioning there would waste sandboxes and rate-limit budget.
+  it('provisions workflow:run before placement and pins it to the returned sandbox node', async () => {
+    // Workflow execution reads the workflow source from the cloned checkout,
+    // so it needs the same bounded JIT placement as a harness spawn.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-ghi' }))
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'jit-daytona-ghi',
+      sandboxId: 'sbx-workflow-1',
+    }))
     const fleet = createClient(messaging, { provisionSandbox })
 
-    await fleet.spawn({
+    const result = await fleet.spawn({
       name: 'wf-1',
       capability: 'workflow:run',
       node: 'mac-mini',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
     })
 
-    expect(provisionSandbox).not.toHaveBeenCalled()
-    expect(messaging.placements[0]?.node).toBe('mac-mini')
+    expect(provisionSandbox).toHaveBeenCalledWith({
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      name: 'wf-1',
+    })
+    expect(messaging.placements[0]?.node).toBe('jit-daytona-ghi')
+    expect(result.sandboxId).toBe('sbx-workflow-1')
   })
 
   it('refuses to place spawn:* when placementSandboxOnly is set but no hook is configured', async () => {
@@ -320,6 +330,20 @@ describe('RelayFleetClient', () => {
       node: 'self',
       repo: 'AgentWorkforce/factory',
     })).rejects.toThrow(/placementSandboxOnly is set but no provisionSandbox hook/)
+
+    expect(messaging.placements).toHaveLength(0)
+  })
+
+  it('refuses to place workflow:run when placementSandboxOnly has no provisioner', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { placementSandboxOnly: true })
+
+    await expect(fleet.spawn({
+      name: 'wf-no-sandbox',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toBeInstanceOf(FleetSpawnNotCreatedError)
 
     expect(messaging.placements).toHaveLength(0)
   })

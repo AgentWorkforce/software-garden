@@ -107,9 +107,9 @@ export interface RelayFleetClientOptions {
    */
   readOnly?: boolean
   /**
-   * Bring a JIT sandbox online before placing a spawn.
+   * Bring a JIT sandbox online before placing an agent or workflow run.
    *
-   * When set and this is a `spawn:*` invocation, `spawn()` calls this hook
+   * When set and this is a `spawn:*` or `workflow:run` invocation, `spawn()` calls this hook
    * before `messaging.placement.spawn` and threads the returned `nodeName`
    * into placement as the target node. That is how factory-cloud gets a
    * fresh Daytona sandbox provisioned per dispatch — the caller wires this
@@ -128,7 +128,7 @@ export interface RelayFleetClientOptions {
     name: string
   }) => Promise<{ nodeName: string; sandboxId?: string }>
   /**
-   * Refuse to place a `spawn:*` invocation that has no JIT sandbox behind
+   * Refuse to place a `spawn:*` or `workflow:run` invocation that has no JIT sandbox behind
    * it. Requires {@link provisionSandbox}. Turns "landed on a laptop and
    * spawn_failed on worker_cwd" into a clear placement refusal at the
    * client boundary, so a factory sweep cannot silently fall back to a
@@ -396,14 +396,15 @@ export class RelayFleetClient implements FleetClient {
       // the invocation cannot be accepted without a live Factory consumer.
       this.#ensureEventSubscription()
     }
-    // Ensure a JIT sandbox is up before placement. Only applies to `spawn:*`
-    // invocations (workflow/preview placements do not need /srv/agent-workforce)
-    // and only when the caller opted in via `provisionSandbox`. Fail-closed on
+    // Ensure a JIT sandbox is up before placement. Agent spawns and workflow
+    // runs both execute against the requested repo checkout; preview placement
+    // remains outside this API. Only applies when the caller opted in via
+    // `provisionSandbox`. Fail-closed on
     // `placementSandboxOnly` prevents a silent fall-back to a laptop node whose
     // filesystem cannot honor factory-cloud's dispatch cloneRoot.
     let sandboxTargetNode: string | undefined
     let sandboxTargetId: string | undefined
-    if (input.capability.startsWith('spawn:')) {
+    if (input.capability.startsWith('spawn:') || input.capability === 'workflow:run') {
       if (this.#options.provisionSandbox) {
         const provisioned = await this.#withinDeadline(
           'sandbox provision',
@@ -427,14 +428,14 @@ export class RelayFleetClient implements FleetClient {
         if (this.#options.placementSandboxOnly && !sandboxTargetId) {
           throw new Error(
             `placementSandboxOnly is set but provisionSandbox named "${proposedName}" with no sandbox id; ` +
-            'refusing to place a spawn on a node it cannot show is a JIT sandbox',
+            'refusing to place work on a node it cannot show is a JIT sandbox',
           )
         }
         sandboxTargetNode = proposedName
       } else if (this.#options.placementSandboxOnly) {
         throw new Error(
           'placementSandboxOnly is set but no provisionSandbox hook is configured; ' +
-          'refusing to place a spawn without a JIT sandbox',
+          'refusing to place work without a JIT sandbox',
         )
       }
     }
