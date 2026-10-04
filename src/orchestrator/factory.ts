@@ -5998,7 +5998,11 @@ export class FactoryLoop implements Factory {
     // closed.
     const admissionRoster = !dryRun ? await this.#assertFleetControlPlaneAvailable() : undefined
     if (admissionRoster && this.#fleet.placementLocality === 'remote') {
-      dispatchDecision = decisionWithVerifiedRemotePlacements(dispatchDecision, admissionRoster)
+      dispatchDecision = decisionWithVerifiedRemotePlacements(
+        dispatchDecision,
+        admissionRoster,
+        (capability) => this.#fleet.canProvision?.(capability) === true,
+      )
     }
     const durableDispatch = !dryRun && this.#usesDurableDispatchLifecycle()
     // Local dispatches need the same deterministic branch identity as remote
@@ -12021,7 +12025,14 @@ export class FactoryLoop implements Factory {
       for (const agent of roster.agents) {
         if (agent.node) loads.set(agent.node, (loads.get(agent.node) ?? 0) + 1)
       }
-      spec = { ...spec, node: liveFleetNodeForSpec(spec, roster, loads) }
+      const node = liveFleetNodeForSpec(
+        spec,
+        roster,
+        loads,
+        this.#fleet.canProvision?.(spec.capability) === true,
+      )
+      const { node: _staleNode, ...unplacedSpec } = spec
+      spec = node ? { ...unplacedSpec, node } : unplacedSpec
     }
 
     // Persist intent before the remote side effect. If the owner crashes after
@@ -12078,7 +12089,10 @@ export class FactoryLoop implements Factory {
       await this.#releaseOrphanedLatePlacement(record, spec, result)
       throw new LatePlacementReleasedError(record.issue.key, result.name ?? spec.name)
     }
-    if (this.#fleet.placementLocality === 'remote') {
+    if (
+      this.#fleet.placementLocality === 'remote' &&
+      spec.capability.startsWith('spawn:')
+    ) {
       const registered = await this.#awaitRemoteAgentRegistration(result.name, spec.capability, result.node)
       if (!registered) {
         try {
@@ -22374,9 +22388,13 @@ function liveFleetNodeForSpec(
   spec: AgentSpec,
   roster: RosterEntry,
   assignedLoads: Map<string, number>,
-): string {
+  canProvision = false,
+): string | undefined {
   const eligible = roster.nodes.filter((node) => node.live && node.capabilities.includes(spec.capability))
-  if (eligible.length === 0) throw new FleetPlacementUnavailableError(spec.capability)
+  if (eligible.length === 0) {
+    if (canProvision) return undefined
+    throw new FleetPlacementUnavailableError(spec.capability)
+  }
 
   const explicitlyRequested = spec.node && spec.node !== 'self'
     ? eligible.find((node) => node.name === spec.node)
@@ -22400,15 +22418,22 @@ function liveFleetNodeForSpec(
 function decisionWithVerifiedRemotePlacements(
   decision: TriageDecision,
   roster: RosterEntry,
+  canProvision: (capability: Capability) => boolean = () => false,
 ): TriageDecision {
   const assignedLoads = new Map<string, number>()
   for (const agent of roster.agents) {
     if (agent.node) assignedLoads.set(agent.node, (assignedLoads.get(agent.node) ?? 0) + 1)
   }
-  const place = (spec: AgentSpec): AgentSpec => ({
-    ...spec,
-    node: liveFleetNodeForSpec(spec, roster, assignedLoads),
-  })
+  const place = (spec: AgentSpec): AgentSpec => {
+    const node = liveFleetNodeForSpec(
+      spec,
+      roster,
+      assignedLoads,
+      canProvision(spec.capability),
+    )
+    const { node: _staleNode, ...unplacedSpec } = spec
+    return node ? { ...unplacedSpec, node } : unplacedSpec
+  }
   if (decision.scope === 'workflow') {
     return {
       ...structuredClone(decision),

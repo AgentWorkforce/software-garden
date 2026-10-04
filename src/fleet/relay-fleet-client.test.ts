@@ -38,6 +38,7 @@ class FakeMessaging {
   readonly handlers = new Map<string, Set<EventHandler>>()
   invocations = new Map<string, RelayActionInvocation[]>()
   placementAck: Partial<RelayActionInvocationAck> & { placement?: { node?: string } } = {}
+  placementError: Error | undefined
   agentRows: Array<{ name: string; status?: string; node?: string }> = []
   agentPresenceRows: Array<{ agentId: string; agentName: string; status: 'online' | 'offline' }> | undefined
   nodeRows: Array<Partial<RelayNode> & { name: string }> = []
@@ -121,6 +122,7 @@ class FakeMessaging {
 
   readonly placement = {
     spawn: async (input: RelaySpawnPlacementInput) => {
+      if (this.placementError) throw this.placementError
       this.placements.push(input)
       const invocationId = this.placementAck.invocationId ?? `inv-${++this.nextInvocationId}`
       const acknowledgedNode = Object.prototype.hasOwnProperty.call(this.placementAck, 'placement')
@@ -257,6 +259,8 @@ describe('RelayFleetClient', () => {
     const messaging = new FakeMessaging()
     const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-abc' }))
     const fleet = createClient(messaging, { provisionSandbox })
+    expect(fleet.canProvision('workflow:run')).toBe(true)
+    expect(fleet.canProvision('spawn:codex')).toBe(false)
 
     await fleet.spawn({
       name: 'ar-3-impl',
@@ -293,21 +297,49 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements[0]?.node).toBe('jit-daytona-def')
   })
 
-  it('does not invoke provisionSandbox for non-spawn capabilities', async () => {
-    // Workflow and preview placements don't need /srv/agent-workforce; forcing
-    // JIT sandbox provisioning there would waste sandboxes and rate-limit budget.
+  it('provisions workflow:run before placement and pins it to the returned sandbox node', async () => {
+    // Workflow execution reads the workflow source from the cloned checkout,
+    // so it needs the same bounded JIT placement as a harness spawn.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: 'jit-daytona-ghi' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'jit-daytona-ghi',
+      sandboxId: 'sbx-workflow-1',
+      release,
+    }))
     const fleet = createClient(messaging, { provisionSandbox })
 
-    await fleet.spawn({
+    const result = await fleet.spawn({
       name: 'wf-1',
       capability: 'workflow:run',
       node: 'mac-mini',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
     })
 
-    expect(provisionSandbox).not.toHaveBeenCalled()
-    expect(messaging.placements[0]?.node).toBe('mac-mini')
+    expect(provisionSandbox).toHaveBeenCalledWith({
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      name: 'wf-1',
+    })
+    expect(messaging.placements[0]?.node).toBe('jit-daytona-ghi')
+    expect(result.sandboxId).toBe('sbx-workflow-1')
+    expect(release).not.toHaveBeenCalled()
+  })
+
+  it('places workflow:run on an explicit node without provisioning when the hook is absent', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { placementSandboxOnly: false })
+
+    await fleet.spawn({
+      name: 'wf-explicit',
+      capability: 'workflow:run',
+      node: 'garden-daytona-node',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })
+
+    expect(messaging.placements[0]?.node).toBe('garden-daytona-node')
   })
 
   it('refuses to place spawn:* when placementSandboxOnly is set but no hook is configured', async () => {
@@ -324,11 +356,27 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements).toHaveLength(0)
   })
 
+  it('refuses to place workflow:run when placementSandboxOnly has no provisioner', async () => {
+    const messaging = new FakeMessaging()
+    const fleet = createClient(messaging, { placementSandboxOnly: true })
+    expect(fleet.canProvision('workflow:run')).toBe(false)
+
+    await expect(fleet.spawn({
+      name: 'wf-no-sandbox',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toBeInstanceOf(FleetSpawnNotCreatedError)
+
+    expect(messaging.placements).toHaveLength(0)
+  })
+
   it('refuses to place when provisionSandbox returns an empty nodeName', async () => {
     // Empty string is the same failure mode as a hook that never came back:
     // we would fall through and let the engine pick a laptop.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: '   ' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({ nodeName: '   ', sandboxId: 'sbx-empty', release }))
     const fleet = createClient(messaging, { provisionSandbox })
 
     await expect(fleet.spawn({
@@ -338,6 +386,7 @@ describe('RelayFleetClient', () => {
     })).rejects.toBeInstanceOf(FleetSpawnNotCreatedError)
 
     expect(messaging.placements).toHaveLength(0)
+    expect(release).toHaveBeenCalledWith('sandbox provision returned no placement node')
   })
 
   it('refuses to place under placementSandboxOnly when the hook names no sandbox', async () => {
@@ -352,7 +401,8 @@ describe('RelayFleetClient', () => {
     // behind it". A node name alone cannot show there is one; the sandbox id
     // can, because a hook only knows it for a sandbox it provisioned.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: 'mac-mini' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({ nodeName: 'mac-mini', release }))
     const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
 
     await expect(fleet.spawn({
@@ -362,13 +412,19 @@ describe('RelayFleetClient', () => {
     })).rejects.toThrow(/placementSandboxOnly.*mac-mini.*no sandbox id/s)
 
     expect(messaging.placements).toHaveLength(0)
+    expect(release).toHaveBeenCalledWith('sandbox-only placement rejected an unproven provision')
   })
 
   it('places under placementSandboxOnly when the hook names a sandbox', async () => {
     // must-not-fire: the guard keys on the sandbox id, not on the hook being
     // configured, so a real JIT sandbox still dispatches.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: 'fleet-ensure-abc12345', sandboxId: 'sbx_1' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'fleet-ensure-abc12345',
+      sandboxId: 'sbx_1',
+      release,
+    }))
     const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
 
     const result = await fleet.spawn({
@@ -379,6 +435,53 @@ describe('RelayFleetClient', () => {
 
     expect(messaging.placements[0]?.node).toBe('fleet-ensure-abc12345')
     expect(result.sandboxId).toBe('sbx_1')
+    expect(release).not.toHaveBeenCalled()
+  })
+
+  it('releases a timely sandbox when placement definitively rejects it', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementError = new Error('placement refused')
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'fleet-ensure-refused',
+      sandboxId: 'sbx-refused',
+      release,
+    }))
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
+
+    await expect(fleet.spawn({
+      name: 'wf-refused',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/placement refused/)
+
+    expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
+  })
+
+  it('does not let a hung provider release replace the placement failure', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementError = new Error('placement refused')
+    const release = vi.fn(async () => await new Promise<void>(() => {}))
+    const fleet = createClient(messaging, {
+      placementSandboxOnly: true,
+      provisionSandbox: async () => ({
+        nodeName: 'fleet-ensure-hung-release',
+        sandboxId: 'sbx-hung-release',
+        release,
+      }),
+    })
+
+    const startedAt = Date.now()
+    await expect(fleet.spawn({
+      name: 'wf-hung-release',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/placement refused/)
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+    expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
   })
 
   it('still places a sandbox-less hook result when placementSandboxOnly is off', async () => {
@@ -414,8 +517,12 @@ describe('RelayFleetClient', () => {
     expect(messaging.placements).toHaveLength(0)
   })
 
-  it('creates and removes previews on the owning node', async () => {
+  it('creates and removes previews on the owning node without provisioning a sandbox', async () => {
     const messaging = new FakeMessaging()
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'must-not-be-used',
+      sandboxId: 'must-not-be-created',
+    }))
     const preview = {
       id: 'preview-1',
       provider: 'tailscale-serve',
@@ -445,7 +552,7 @@ describe('RelayFleetClient', () => {
       status: 'completed',
       output: { preview },
     }])
-    const fleet = createClient(messaging)
+    const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
 
     const reference = await fleet.createPreview({
       namespace: preview.namespace,
@@ -461,6 +568,7 @@ describe('RelayFleetClient', () => {
     })
 
     expect(reference).toEqual({ ...preview, node: 'mac-mini' })
+    expect(provisionSandbox).not.toHaveBeenCalled()
     expect(messaging.placements[0]).toMatchObject({
       capability: 'preview:tailscale-serve',
       repo: preview.repo,
@@ -2186,6 +2294,46 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
     task: 'do work',
   })
 
+  it('releases a sandbox that finishes provisioning after the shared deadline', async () => {
+    const messaging = new FakeMessaging()
+    const release = vi.fn(async () => {})
+    let finishProvisioning!: (value: {
+      nodeName: string
+      sandboxId: string
+      release: (reason: string) => Promise<void>
+    }) => void
+    const provisionSandbox = vi.fn(() => new Promise<{
+      nodeName: string
+      sandboxId: string
+      release: (reason: string) => Promise<void>
+    }>((resolve) => {
+      finishProvisioning = resolve
+    }))
+    const fleet = createClient(messaging, {
+      provisionSandbox,
+      placementSandboxOnly: true,
+      spawnAckTimeoutMs: 200,
+    })
+
+    await expect(fleet.spawn({
+      ...spawnInput(),
+      capability: 'workflow:run',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/timed out.*sandbox provision/i)
+
+    finishProvisioning({
+      nodeName: 'jit-daytona-late',
+      sandboxId: 'sbx-late',
+      release,
+    })
+    await vi.waitFor(() => {
+      expect(release).toHaveBeenCalledWith(
+        'sandbox provision completed after the placement deadline',
+      )
+    })
+    expect(messaging.placements).toHaveLength(0)
+  })
+
   const pending = (invocationId: string): RelayActionInvocation =>
     ({ invocationId, actionName: 'spawn', status: 'dispatched' }) as RelayActionInvocation
 
@@ -2433,6 +2581,29 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
   })
 
+  it('releases the provision when an abandoned placement later rejects', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placement.spawn = async () => {
+      await after(120, undefined)
+      throw new Error('placement rejected')
+    }
+    const release = vi.fn(async () => {})
+    const fleet = createClient(messaging, {
+      spawnAckTimeoutMs: 60,
+      provisionSandbox: async () => ({
+        nodeName: 'jit-daytona-late-reject',
+        sandboxId: 'sbx-late-reject',
+        release,
+      }),
+    })
+
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    await vi.waitFor(() => {
+      expect(release).toHaveBeenCalledWith('placement abandoned and rejected')
+    })
+    expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toEqual([])
+  })
+
   /**
    * #307 review (cubic). The budget must be checked *before* the request is
    * made, not after. Taking an already-started promise meant an exhausted
@@ -2455,6 +2626,34 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
 
     // The mutating call was never made, so there is no remote spawn to orphan.
     expect(messaging.placements).toEqual([])
+  })
+
+  it('releases a provision when the placement budget expires before the call starts', async () => {
+    const messaging = new FakeMessaging()
+    const release = vi.fn(async () => {})
+    let budgetExpired = false
+    const fleet = createClient(messaging, {
+      spawnAckTimeoutMs: 1_000,
+      now: () => budgetExpired ? 10_000 : 0,
+      provisionSandbox: async () => {
+        budgetExpired = true
+        return {
+          nodeName: 'jit-daytona-no-placement',
+          sandboxId: 'sbx-no-placement',
+          release,
+        }
+      },
+    })
+
+    await expect(fleet.spawn({
+      name: 'wf-no-placement-budget',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/timed out/i)
+
+    expect(messaging.placements).toEqual([])
+    expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
   })
 
   /**

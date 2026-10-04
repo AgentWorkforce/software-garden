@@ -43,14 +43,14 @@ export interface CreateFleetDeps {
   /** Hermetic relay engine transport for the relay backend (tests). */
   createRelay?: (options: RelayClientFactoryOptions) => RelayClientLike
   /**
-   * Bring a JIT sandbox online before each `spawn:*` placement. Forwarded
+   * Bring a JIT sandbox online before each `spawn:*` or `workflow:run` placement. Forwarded
    * to {@link RelayFleetClient} on the `relay` backend. Ignored on the
    * `internal` backend, which does not do cloud placement. See
    * `RelayFleetClientOptions.provisionSandbox` (factory#412).
    */
   provisionSandbox?: import('./relay-fleet-client').RelayFleetClientOptions['provisionSandbox']
   /**
-   * Refuse to place `spawn:*` invocations that have no JIT sandbox behind
+   * Refuse to place `spawn:*` or `workflow:run` invocations that have no JIT sandbox behind
    * them. Forwarded to {@link RelayFleetClient}; requires
    * {@link provisionSandbox} to be set. Ignored on the `internal` backend.
    */

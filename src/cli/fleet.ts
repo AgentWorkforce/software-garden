@@ -175,14 +175,14 @@ export interface FleetCliDeps {
    */
   createRelay?: (options: RelayClientFactoryOptions) => RelayClientLike
   /**
-   * Bring a JIT sandbox online before each `spawn:*` placement. Injected by
+   * Bring a JIT sandbox online before each `spawn:*` or `workflow:run` placement. Injected by
    * factory-cloud's container so the relay backend can call cloud's ensure
    * route per dispatch (factory#412). Forwarded through `buildFleet` →
    * `createFleet` to `RelayFleetClient`.
    */
   provisionSandbox?: import('../fleet/create-fleet').CreateFleetDeps['provisionSandbox']
   /**
-   * Refuse to place `spawn:*` invocations that have no JIT sandbox behind
+   * Refuse to place `spawn:*` or `workflow:run` invocations that have no JIT sandbox behind
    * them. Forwarded to `RelayFleetClient` alongside {@link provisionSandbox}.
    */
   placementSandboxOnly?: boolean
