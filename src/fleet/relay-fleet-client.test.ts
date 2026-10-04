@@ -301,9 +301,11 @@ describe('RelayFleetClient', () => {
     // Workflow execution reads the workflow source from the cloned checkout,
     // so it needs the same bounded JIT placement as a harness spawn.
     const messaging = new FakeMessaging()
+    const release = vi.fn(async () => {})
     const provisionSandbox = vi.fn(async () => ({
       nodeName: 'jit-daytona-ghi',
       sandboxId: 'sbx-workflow-1',
+      release,
     }))
     const fleet = createClient(messaging, { provisionSandbox })
 
@@ -322,6 +324,7 @@ describe('RelayFleetClient', () => {
     })
     expect(messaging.placements[0]?.node).toBe('jit-daytona-ghi')
     expect(result.sandboxId).toBe('sbx-workflow-1')
+    expect(release).not.toHaveBeenCalled()
   })
 
   it('places workflow:run on an explicit node without provisioning when the hook is absent', async () => {
@@ -416,7 +419,12 @@ describe('RelayFleetClient', () => {
     // must-not-fire: the guard keys on the sandbox id, not on the hook being
     // configured, so a real JIT sandbox still dispatches.
     const messaging = new FakeMessaging()
-    const provisionSandbox = vi.fn(async () => ({ nodeName: 'fleet-ensure-abc12345', sandboxId: 'sbx_1' }))
+    const release = vi.fn(async () => {})
+    const provisionSandbox = vi.fn(async () => ({
+      nodeName: 'fleet-ensure-abc12345',
+      sandboxId: 'sbx_1',
+      release,
+    }))
     const fleet = createClient(messaging, { provisionSandbox, placementSandboxOnly: true })
 
     const result = await fleet.spawn({
@@ -427,6 +435,7 @@ describe('RelayFleetClient', () => {
 
     expect(messaging.placements[0]?.node).toBe('fleet-ensure-abc12345')
     expect(result.sandboxId).toBe('sbx_1')
+    expect(release).not.toHaveBeenCalled()
   })
 
   it('releases a timely sandbox when placement definitively rejects it', async () => {
@@ -447,6 +456,31 @@ describe('RelayFleetClient', () => {
       workflow: 'workflows/factory/linear-issue.ts',
     })).rejects.toThrow(/placement refused/)
 
+    expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
+  })
+
+  it('does not let a hung provider release replace the placement failure', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placementError = new Error('placement refused')
+    const release = vi.fn(async () => await new Promise<void>(() => {}))
+    const fleet = createClient(messaging, {
+      placementSandboxOnly: true,
+      provisionSandbox: async () => ({
+        nodeName: 'fleet-ensure-hung-release',
+        sandboxId: 'sbx-hung-release',
+        release,
+      }),
+    })
+
+    const startedAt = Date.now()
+    await expect(fleet.spawn({
+      name: 'wf-hung-release',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/placement refused/)
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
     expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
   })
 
@@ -2547,6 +2581,29 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
     expect(fleet.trackedAgents().has('ar-1-impl')).toBe(false)
   })
 
+  it('releases the provision when an abandoned placement later rejects', async () => {
+    const messaging = new FakeMessaging()
+    messaging.placement.spawn = async () => {
+      await after(120, undefined)
+      throw new Error('placement rejected')
+    }
+    const release = vi.fn(async () => {})
+    const fleet = createClient(messaging, {
+      spawnAckTimeoutMs: 60,
+      provisionSandbox: async () => ({
+        nodeName: 'jit-daytona-late-reject',
+        sandboxId: 'sbx-late-reject',
+        release,
+      }),
+    })
+
+    await expect(fleet.spawn(spawnInput())).rejects.toThrow(/timed out/i)
+    await vi.waitFor(() => {
+      expect(release).toHaveBeenCalledWith('placement abandoned and rejected')
+    })
+    expect(messaging.invokes.filter((invoke) => invoke.name === 'release')).toEqual([])
+  })
+
   /**
    * #307 review (cubic). The budget must be checked *before* the request is
    * made, not after. Taking an already-started promise meant an exhausted
@@ -2569,6 +2626,34 @@ describe('RelayFleetClient placement deadlines (#306)', () => {
 
     // The mutating call was never made, so there is no remote spawn to orphan.
     expect(messaging.placements).toEqual([])
+  })
+
+  it('releases a provision when the placement budget expires before the call starts', async () => {
+    const messaging = new FakeMessaging()
+    const release = vi.fn(async () => {})
+    let budgetExpired = false
+    const fleet = createClient(messaging, {
+      spawnAckTimeoutMs: 1_000,
+      now: () => budgetExpired ? 10_000 : 0,
+      provisionSandbox: async () => {
+        budgetExpired = true
+        return {
+          nodeName: 'jit-daytona-no-placement',
+          sandboxId: 'sbx-no-placement',
+          release,
+        }
+      },
+    })
+
+    await expect(fleet.spawn({
+      name: 'wf-no-placement-budget',
+      capability: 'workflow:run',
+      repo: 'AgentWorkforce/software-garden',
+      workflow: 'workflows/factory/linear-issue.ts',
+    })).rejects.toThrow(/timed out/i)
+
+    expect(messaging.placements).toEqual([])
+    expect(release).toHaveBeenCalledWith('placement rejected before sandbox adoption')
   })
 
   /**

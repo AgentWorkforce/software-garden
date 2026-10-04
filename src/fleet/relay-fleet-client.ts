@@ -467,10 +467,19 @@ export class RelayFleetClient implements FleetClient {
         releaseUnusedProvision = async (reason: string): Promise<void> => {
           if (!provisioned || typeof provisioned.release !== 'function') return
           try {
-            await provisioned.release(reason)
-            this.#log(
-              `Released unused sandbox provision for ${input.name}; ` +
-              `sandboxId=${provisioned.sandboxId ?? '(none)'}`,
+            // Provider cleanup must never replace an authoritative spawn
+            // failure with a second hang. Start it immediately, then detach
+            // the wait while retaining explicit rejection handling.
+            const release = provisioned.release(reason)
+            void Promise.resolve(release).then(
+              () => this.#log(
+                `Released unused sandbox provision for ${input.name}; ` +
+                `sandboxId=${provisioned.sandboxId ?? '(none)'}`,
+              ),
+              (error) => this.#log(
+                `Failed to release unused sandbox provision for ${input.name}; ` +
+                `sandboxId=${provisioned.sandboxId ?? '(none)'} error=${errorMessage(error)}`,
+              ),
             )
           } catch (error) {
             this.#log(
@@ -510,9 +519,11 @@ export class RelayFleetClient implements FleetClient {
     // means "no placement preference".
     const resolvedNode = sandboxTargetNode
       ?? (input.node && input.node !== 'self' ? input.node : undefined)
+    let placementAttemptedLocally = false
     let ack: Awaited<ReturnType<typeof messaging.placement.spawn>>
     try {
       ack = await this.#withinDeadline('placement.spawn', deadlineAtMs, () => {
+        placementAttemptedLocally = true
         onPlacementAttempt()
         return messaging.placement.spawn({
           capability: input.capability,
@@ -534,12 +545,16 @@ export class RelayFleetClient implements FleetClient {
           // it after we have already reported failure, a worker is live that
           // nothing is tracking — so release it (#307 review, cubic).
         })
-      }, (inFlight) => this.#releaseAbandonedPlacement(input.name, inFlight))
+      }, (inFlight) => this.#releaseAbandonedPlacement(
+        input.name,
+        inFlight,
+        () => releaseUnusedProvision?.('placement abandoned and rejected') ?? Promise.resolve(),
+      ))
     } catch (error) {
       // A deadline does not cancel placement, so its compensator owns cleanup.
       // A definitive refusal/rejection cannot create a worker; release the
       // provision immediately instead of leaking unused capacity.
-      if (!(error instanceof RelaySpawnAckTimeoutError)) {
+      if (!(error instanceof RelaySpawnAckTimeoutError) || !placementAttemptedLocally) {
         await releaseUnusedProvision?.('placement rejected before sandbox adoption')
       }
       throw error
@@ -1228,10 +1243,16 @@ export class RelayFleetClient implements FleetClient {
   #releaseAbandonedPlacement(
     name: string,
     inFlight: Promise<CallOutcome<RelayActionInvocationAck & { placement?: { node?: string } }>>,
+    releaseRejectedProvision?: () => Promise<void>,
   ): void {
     void inFlight.then(async (outcome) => {
-      if (!outcome.ok) return
+      if (!outcome.ok) {
+        await releaseRejectedProvision?.()
+        return
+      }
       await this.#releaseLatePlacement(name, outcome.value)
+    }).catch((error) => {
+      this.#log(`Abandoned placement cleanup failed unexpectedly for ${name}: ${errorMessage(error)}`)
     })
   }
 
