@@ -14,7 +14,7 @@ import type {
 import type { AgentSpec, SpawnResult } from '../ports/fleet'
 import type { TrackedAgent } from '../orchestrator/batch-tracker'
 import type { TriageDecision } from '../types'
-import type { PersistedWorkspaceState, WatchStateDocument } from './document-store'
+import type { PersistedDispatchAttemptState, PersistedWorkspaceState, WatchStateDocument } from './document-store'
 
 export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
   if (!isRecord(value) || !isRecord(value.workspaces)) {
@@ -45,6 +45,9 @@ export const parseWatchStateDocument = (value: unknown): WatchStateDocument => {
       workspaces[workspaceId] = {
         ...(rawWorkspace.dependencyParks === undefined ? {} : {
           dependencyParks: parseDependencyParks(rawWorkspace.dependencyParks),
+        }),
+        ...(rawWorkspace.dispatchAttempts === undefined ? {} : {
+          dispatchAttempts: parseDispatchAttempts(rawWorkspace.dispatchAttempts),
         }),
         githubIssueCommentWatches: parseGithubIssueCommentWatches(watches),
         slackThreadWatches: parseSlackThreadWatches(slackWatches ?? {}),
@@ -106,6 +109,25 @@ const parseDependencyParks = (value: unknown): Record<string, DependencyParkStat
     isRecord(park) && Number.isSafeInteger(park.epoch) && (park.epoch as number) >= 0 &&
     typeof park.active === 'boolean')) throw invalidDocument()
   return structuredClone(value) as Record<string, DependencyParkState>
+}
+
+// A malformed budget fails the whole document closed rather than parsing as
+// "no attempts yet": reading a corrupt row as zero would hand the work unit a
+// fresh retry budget, which is the unbounded re-dispatch this row prevents.
+const parseDispatchAttempts = (value: unknown): Record<string, PersistedDispatchAttemptState> => {
+  if (!isRecord(value) || !Object.values(value).every((attempt) =>
+    isRecord(attempt) &&
+    Number.isSafeInteger(attempt.attempts) && (attempt.attempts as number) >= 0 &&
+    typeof attempt.terminal === 'boolean' &&
+    typeof attempt.backoffUntilMs === 'number' && Number.isFinite(attempt.backoffUntilMs))) throw invalidDocument()
+  return Object.fromEntries(Object.entries(value).map(([key, attempt]) => {
+    const row = attempt as PersistedDispatchAttemptState
+    return [key, {
+      attempts: row.attempts,
+      terminal: row.terminal,
+      backoffUntilMs: row.backoffUntilMs,
+    }]
+  }))
 }
 
 export const emptyDiscoverySweepState = (): DiscoverySweepState => ({

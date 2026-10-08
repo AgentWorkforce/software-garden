@@ -34,6 +34,69 @@ describe('FileStateStore', () => {
     }
   })
 
+  it('persists the dispatch attempt budget across store instances but keeps in-flight process-local', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-attempts-'))
+    try {
+      const options = { batchSize: 2, watchStatePath: join(root, 'state.json') }
+      const first = new FileStateStore(options)
+      await first.recordDispatchAttempt('workspace-1', 'AR-1', {
+        attempts: 2,
+        inFlight: true,
+        terminal: true,
+        backoffUntilMs: 5_000,
+      })
+      expect(await first.getDispatchAttempts('workspace-1', 'AR-1')).toEqual({
+        attempts: 2,
+        inFlight: true,
+        terminal: true,
+        backoffUntilMs: 5_000,
+      })
+
+      // A restart must not refund the budget, and must not inherit the dead
+      // process's in-flight guard: nothing is left to clear it.
+      const restarted = new FileStateStore(options)
+      expect(await restarted.getDispatchAttempts('workspace-1', 'AR-1')).toEqual({
+        attempts: 2,
+        inFlight: false,
+        terminal: true,
+        backoffUntilMs: 5_000,
+      })
+      expect(await restarted.getDispatchAttempts('workspace-1', 'AR-2')).toBeUndefined()
+      expect(await restarted.getDispatchAttempts('workspace-2', 'AR-1')).toBeUndefined()
+
+      await first.releaseInFlight('workspace-1', 'AR-1')
+      expect(await first.getDispatchAttempts('workspace-1', 'AR-1')).toMatchObject({ attempts: 2, inFlight: false })
+      const persisted = JSON.parse(await readFile(options.watchStatePath, 'utf8'))
+      expect(persisted.workspaces['workspace-1'].dispatchAttempts).toEqual({
+        'AR-1': { attempts: 2, terminal: true, backoffUntilMs: 5_000 },
+      })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('fails closed on a malformed persisted dispatch attempt row', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'factory-dispatch-attempts-invalid-'))
+    try {
+      const watchStatePath = join(root, 'state.json')
+      await writeFile(watchStatePath, JSON.stringify({
+        version: 3,
+        workspaces: {
+          'workspace-1': {
+            githubIssueCommentWatches: {},
+            waitingClarifications: {},
+            dispatchAttempts: { 'AR-1': { attempts: -1, terminal: false, backoffUntilMs: 0 } },
+          },
+        },
+      }))
+      const store = new FileStateStore({ batchSize: 2, watchStatePath })
+      // Reading a corrupt budget as "no attempts yet" would refund it.
+      await expect(store.getDispatchAttempts('workspace-1', 'AR-1')).rejects.toThrow()
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('forwards the configured agent-question dedupe limit', async () => {
     const root = await mkdtemp(join(tmpdir(), 'factory-file-state-question-limit-'))
     try {
