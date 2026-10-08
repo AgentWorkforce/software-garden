@@ -75,9 +75,7 @@ concurrency:
 jobs:
   # Advisory. Runs the PR's own copy of the predicate — never require this.
   advisory:
-    if: >-
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
-      (inputs.pr_number || !github.event.pull_request.draft)
+    if: ${{ inputs.pr_number || !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

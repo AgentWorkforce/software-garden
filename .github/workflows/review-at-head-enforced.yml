@@ -34,7 +34,6 @@ permissions: {}
 
 jobs:
   targets:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
@@ -76,9 +75,7 @@ jobs:
     needs: targets
     # A skipped orchestration job is never the enforced check. Only the
     # explicit check run below carries that name and attaches to the PR head.
-    if: >-
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
-      (needs.targets.outputs.pulls != '[]')
+    if: ${{ needs.targets.outputs.pulls != '[]' }}
     strategy:
       fail-fast: false
       matrix:
