@@ -12,6 +12,7 @@ concurrency:
 
 jobs:
   package:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -60,6 +61,7 @@ jobs:
         run: npm pack --dry-run
 
   kubernetes-provider-e2e:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -106,6 +108,7 @@ jobs:
           if-no-files-found: error
 
   load-e2e:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -150,6 +153,7 @@ jobs:
           if-no-files-found: error
 
   verification-gate-e2e:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -195,6 +199,7 @@ jobs:
           if-no-files-found: error
 
   verification-stack-e2e:
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -18,7 +18,9 @@ concurrency:
 
 jobs:
   request:
-    if: ${{ !github.event.pull_request.draft }}
+    if: >-
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.head_ref == 'trunk') &&
+      (!github.event.pull_request.draft)
     runs-on: ubuntu-latest
     permissions:
       issues: write
