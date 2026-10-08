@@ -216,6 +216,19 @@ const slackHealth = (value: unknown): FactoryPublicHealth['slack'] => {
   }
 }
 
+const sandboxPushHealth = (value: unknown): FactoryPublicHealth['sandboxPush'] => {
+  const record = plainRecord(value)
+  if (!record) return undefined
+  // Same discipline as `slackHealth`: each counter named, missing stays absent.
+  return {
+    ...optionalCount('sandboxPushesPushed', record.sandboxPushesPushed),
+    ...optionalCount('sandboxPushesFailed', record.sandboxPushesFailed),
+    ...optionalCount('sandboxPushesEmpty', record.sandboxPushesEmpty),
+    ...optionalCount('sandboxPushesUnavailable', record.sandboxPushesUnavailable),
+    ...optionalCount('sandboxPushesSkipped', record.sandboxPushesSkipped),
+  }
+}
+
 /** Control characters stripped, length bounded: this text can reach a terminal. */
 const boundedText = (value: string): string =>
   // C0 and C1 alike (#300 review, P2, cubic): some terminals interpret the
@@ -929,6 +942,7 @@ export function publicHealthFromHeartbeat(
     ? { state: enumValue(heartbeat.eventListener.state, EVENT_LISTENER_STATES) }
     : undefined
   const slack = slackHealth(heartbeat.slack)
+  const sandboxPush = sandboxPushHealth(heartbeat.sandboxPush)
 
   // A daemon that is not running a readiness loop is not a live dispatcher —
   // a bounded `factory loop` reports `not-running` here and is not supposed to
@@ -990,6 +1004,7 @@ export function publicHealthFromHeartbeat(
     ...(heartbeat.prProbe ? { prProbe: prProbeHealth(heartbeat.prProbe) } : {}),
     ...(eventListener ? { eventListener } : {}),
     ...(slack ? { slack } : {}),
+    ...(sandboxPush ? { sandboxPush } : {}),
     ...(fleetControlPlane ? { fleetControlPlane } : {}),
     ...(fleetConnect ? { fleetConnect } : {}),
     ...(dispatchCapacity ? { dispatchCapacity } : {}),
@@ -1024,6 +1039,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
   const prProbe = prProbeHealth(record.prProbe)
   const listener = plainRecord(record.eventListener)
   const slack = slackHealth(record.slack)
+  const sandboxPush = sandboxPushHealth(record.sandboxPush)
   const fleet = plainRecord(record.fleetControlPlane)
   const fleetConnect = plainRecord(record.fleetConnect)
   const capacity = plainRecord(record.dispatchCapacity)
@@ -1083,6 +1099,7 @@ export function normalizePublicHealth(value: unknown): FactoryPublicHealth | und
     degradedSubsystems: [...degradedSubsystems],
     ...(prProbe ? { prProbe } : {}),
     ...(slack ? { slack } : {}),
+    ...(sandboxPush ? { sandboxPush } : {}),
     ...(typeof record.reason === 'string'
       ? { reason: boundedText(record.reason) }
       : {}),

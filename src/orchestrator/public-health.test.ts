@@ -71,6 +71,34 @@ describe('Slack heartbeat counters', () => {
   })
 })
 
+describe('sandbox push heartbeat counters', () => {
+  const sandboxPush = {
+    sandboxPushesPushed: 2,
+    sandboxPushesFailed: 5,
+    sandboxPushesEmpty: 1,
+    sandboxPushesUnavailable: 0,
+    sandboxPushesSkipped: 3,
+  }
+
+  it('publishes the five counters as numbers through projection and normalization', () => {
+    const health = publicHealthFromHeartbeat(heartbeat({
+      sandboxPush: { ...sandboxPush, reason: 'must not cross', lastError: 'nor this' } as typeof sandboxPush,
+    }), { nowMs: BOOT_MS })
+    expect(health.sandboxPush).toEqual(sandboxPush)
+    expect(normalizePublicHealth(health)?.sandboxPush).toEqual(sandboxPush)
+    // Diagnostics, not a gate.
+    expect(health).toMatchObject({ ok: true, status: 'ok', degradedSubsystems: [] })
+  })
+
+  it('keeps older records uninstrumented and drops invalid counters', () => {
+    const health = publicHealthFromHeartbeat(heartbeat(), { nowMs: BOOT_MS })
+    expect(Object.hasOwn(health, 'sandboxPush')).toBe(false)
+    expect(normalizePublicHealth({
+      sandboxPush: { sandboxPushesFailed: 4, sandboxPushesPushed: -1, sandboxPushesSkipped: '2' },
+    })?.sandboxPush).toEqual({ sandboxPushesFailed: 4 })
+  })
+})
+
 describe('dispatch capacity health (#303)', () => {
   const capacity = (overrides: Partial<NonNullable<FactoryLoopHeartbeat['dispatchCapacity']>> = {}) => heartbeat({
     dispatchCapacity: {
